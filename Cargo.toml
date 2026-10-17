@@ -1,0 +1,11 @@
+[package]
+name = "tailbench"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Open-loop, coordinated-omission-safe latency harness"
+
+[dependencies]
+# Default features (serialization, sync) are not needed: we only record and query.
+hdrhistogram = { version = "7.6.0", default-features = false }
+tokio = { version = "1.53.3", features = ["rt", "time", "macros", "test-util"] }
