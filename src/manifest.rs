@@ -12,6 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Serialize, Serializer};
 
+use crate::git::{self, is_full_hex_sha};
 use crate::{RunConfig, RunnerKind};
 
 const UNKNOWN: &str = "UNKNOWN";
@@ -43,11 +44,27 @@ impl<T: Serialize> Serialize for Probe<T> {
 pub struct Manifest {
     /// tailbench crate version.
     pub tool_version: &'static str,
+    /// `git rev-parse HEAD` of the tailbench source tree when this binary was
+    /// built (from build.rs): the commit the code came from. All four git
+    /// fields are Unknown when the source tree is not the top level of its
+    /// own repository (e.g. vendored inside another project's repository).
+    pub build_git_sha: Probe<String>,
+    /// Whether, at build time, `git status --porcelain` listed anything
+    /// (untracked files included) under the build-relevant paths only: src/,
+    /// build.rs, Cargo.toml, Cargo.lock. true means this binary differs from
+    /// `build_git_sha`.
+    pub build_git_dirty: Probe<bool>,
     /// `git rev-parse HEAD` of the tailbench source tree (CARGO_MANIFEST_DIR
-    /// at build time), read at run time.
-    pub git_sha: Probe<String>,
-    /// Whether `git status --porcelain` lists anything, untracked files included.
-    pub git_dirty: Probe<bool>,
+    /// at build time), read at run time. A cross-check: it describes the
+    /// checkout now, which may have moved since the build.
+    pub runtime_git_sha: Probe<String>,
+    /// Whether `git status --porcelain` lists anything at run time, across the
+    /// whole repository, untracked files included. Unlike `build_git_dirty`,
+    /// it also counts files that do not change the binary.
+    pub runtime_git_dirty: Probe<bool>,
+    /// Whether `build_git_sha` and `runtime_git_sha` differ: true means the
+    /// checkout moved after this binary was built. Unknown unless both are known.
+    pub sha_mismatch: Probe<bool>,
     /// `std::env::consts::OS` / `ARCH` of the running binary.
     pub os: &'static str,
     pub arch: &'static str,
@@ -75,10 +92,19 @@ impl Manifest {
     /// `paused_clock` describes that runtime's clock.
     pub fn collect(config: &RunConfig) -> Self {
         let source_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Like build.rs, ask git only if the repository is tailbench's own,
+        // not a parent repository it was vendored or unpacked into.
+        let source_repo = Some(source_dir).filter(|dir| git::is_repo_top_level(dir));
+        let build_git_sha = parse_build_sha(env!("TAILBENCH_BUILD_GIT_SHA"));
+        let runtime_git_sha = source_repo.map_or(Probe::Unknown, git_sha);
+        let mismatch = sha_mismatch(&build_git_sha, &runtime_git_sha);
         Self {
             tool_version: env!("CARGO_PKG_VERSION"),
-            git_sha: git_sha(source_dir),
-            git_dirty: git_dirty(source_dir),
+            build_git_sha,
+            build_git_dirty: parse_build_dirty(env!("TAILBENCH_BUILD_GIT_DIRTY")),
+            runtime_git_sha,
+            runtime_git_dirty: source_repo.map_or(Probe::Unknown, git_dirty),
+            sha_mismatch: mismatch,
             os: OS,
             arch: ARCH,
             kernel: command_stdout("uname", &["-r"]).into(),
@@ -109,23 +135,47 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
     Some(text.trim().to_owned())
 }
 
-/// HEAD of the repository at `dir`. Anything but a full hex SHA (SHA-1 or
-/// SHA-256) is reported as Unknown.
+/// HEAD of the repository at `dir`, lowercased. Anything but a full hex SHA
+/// (SHA-1 or SHA-256) is reported as Unknown.
 fn git_sha(dir: &Path) -> Probe<String> {
-    let dir = dir.to_str();
-    dir.and_then(|dir| command_stdout("git", &["-C", dir, "rev-parse", "HEAD"]))
-        .filter(|sha| (sha.len() == 40 || sha.len() == 64) && sha.bytes().all(|b| b.is_ascii_hexdigit()))
-        .into()
+    git::stdout(dir, &["rev-parse", "HEAD"]).and_then(|sha| normalize_sha(&sha)).into()
 }
 
-/// Whether the working tree at `dir` has changes, untracked files included.
-/// `--no-optional-locks` keeps `git status` from writing the index while the
-/// user may be running git themselves.
+/// Whether the working tree at `dir` has changes anywhere in the repository,
+/// untracked files included.
 fn git_dirty(dir: &Path) -> Probe<bool> {
-    let dir = dir.to_str();
-    dir.and_then(|dir| command_stdout("git", &["--no-optional-locks", "-C", dir, "status", "--porcelain"]))
-        .map(|status| !status.is_empty())
-        .into()
+    git::stdout(dir, &["status", "--porcelain"]).map(|status| !status.is_empty()).into()
+}
+
+/// TAILBENCH_BUILD_GIT_SHA from build.rs, lowercased. "UNKNOWN" and
+/// anything else that is not a full hex SHA are Unknown.
+fn parse_build_sha(raw: &str) -> Probe<String> {
+    normalize_sha(raw).into()
+}
+
+/// `sha` in lowercase if it is a full hex SHA, else `None`. Both SHA fields
+/// go through this, so they can be compared as plain strings.
+fn normalize_sha(sha: &str) -> Option<String> {
+    Some(sha).filter(|sha| is_full_hex_sha(sha)).map(str::to_ascii_lowercase)
+}
+
+/// TAILBENCH_BUILD_GIT_DIRTY from build.rs. Only "true" and "false" are
+/// known; "UNKNOWN" or anything else is Unknown, never false.
+fn parse_build_dirty(raw: &str) -> Probe<bool> {
+    match raw {
+        "true" => Probe::Known(true),
+        "false" => Probe::Known(false),
+        _ => Probe::Unknown,
+    }
+}
+
+/// Whether the build-time and run-time commits differ. Unknown unless both
+/// are known. Both are lowercased when parsed, so plain equality is enough.
+fn sha_mismatch(build: &Probe<String>, runtime: &Probe<String>) -> Probe<bool> {
+    match (build, runtime) {
+        (Probe::Known(build), Probe::Known(runtime)) => Probe::Known(build != runtime),
+        _ => Probe::Unknown,
+    }
 }
 
 fn cpu_model() -> Probe<String> {
@@ -190,6 +240,74 @@ mod tests {
         };
         assert!(sha.len() == 40 || sha.len() == 64, "unexpected SHA length: {sha}");
         assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()), "not hex: {sha}");
+    }
+
+    #[test]
+    fn git_ignores_an_inherited_git_dir() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut child = Command::new("git");
+        child.env("GIT_DIR", "/nonexistent/tailbench-bogus-git-dir");
+        let sha = git::stdout_of(child, dir, &["rev-parse", "HEAD"]);
+        assert_eq!(Probe::from(sha), git_sha(dir), "-C must win over GIT_DIR");
+        assert!(matches!(git_sha(dir), Probe::Known(_)), "expected this repo's SHA");
+    }
+
+    #[test]
+    fn this_crate_is_the_top_level_of_its_repo() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(git::is_repo_top_level(dir));
+        // src/ is inside the same repository but is not its top level.
+        assert!(!git::is_repo_top_level(&dir.join("src")));
+        assert!(!git::is_repo_top_level(Path::new("/nonexistent/tailbench-manifest-test")));
+    }
+
+    #[test]
+    fn build_git_sha_of_this_repo_is_a_full_hex_sha() {
+        let Probe::Known(sha) = parse_build_sha(env!("TAILBENCH_BUILD_GIT_SHA")) else {
+            panic!("expected build.rs to record a git SHA for the tailbench source tree");
+        };
+        assert!(is_full_hex_sha(&sha), "not a full hex SHA: {sha}");
+    }
+
+    const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+    const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ABCDEF";
+
+    #[test]
+    fn parse_build_dirty_accepts_only_true_and_false() {
+        assert_eq!(parse_build_dirty("true"), Probe::Known(true));
+        assert_eq!(parse_build_dirty("false"), Probe::Known(false));
+        // Anything else is Unknown, never Known(false).
+        assert_eq!(parse_build_dirty("UNKNOWN"), Probe::Unknown);
+        assert_eq!(parse_build_dirty(""), Probe::Unknown);
+        assert_eq!(parse_build_dirty("garbage"), Probe::Unknown);
+    }
+
+    #[test]
+    fn parse_build_sha_accepts_only_full_hex_shas() {
+        assert_eq!(parse_build_sha(SHA1), Probe::Known(SHA1.to_owned()));
+        assert_eq!(parse_build_sha(SHA256), Probe::Known(SHA256.to_ascii_lowercase()));
+        assert_eq!(parse_build_sha(&SHA1[..7]), Probe::Unknown, "short");
+        assert_eq!(parse_build_sha(&SHA1.replace('a', "g")), Probe::Unknown, "non-hex");
+        assert_eq!(parse_build_sha("UNKNOWN"), Probe::Unknown);
+    }
+
+    #[test]
+    fn parse_build_sha_lowercases() {
+        let upper = SHA1.to_ascii_uppercase();
+        assert_eq!(parse_build_sha(&upper), Probe::Known(SHA1.to_owned()));
+        // So an uppercase build SHA still matches git's lowercase output.
+        assert_eq!(sha_mismatch(&parse_build_sha(&upper), &Probe::Known(SHA1.to_owned())), Probe::Known(false));
+    }
+
+    #[test]
+    fn sha_mismatch_needs_both_shas() {
+        let a = Probe::Known(SHA1.to_owned());
+        let b = Probe::Known(SHA1.replace('a', "b"));
+        assert_eq!(sha_mismatch(&a, &a), Probe::Known(false), "equal");
+        assert_eq!(sha_mismatch(&a, &b), Probe::Known(true), "different");
+        assert_eq!(sha_mismatch(&a, &Probe::Unknown), Probe::Unknown, "runtime unknown");
+        assert_eq!(sha_mismatch(&Probe::Unknown, &a), Probe::Unknown, "build unknown");
+        assert_eq!(sha_mismatch(&Probe::Unknown, &Probe::Unknown), Probe::Unknown, "both unknown");
     }
 
     #[tokio::test(start_paused = true)]

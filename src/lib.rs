@@ -16,6 +16,7 @@ use serde::Serialize;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
+mod git;
 pub mod manifest;
 
 use manifest::Manifest;

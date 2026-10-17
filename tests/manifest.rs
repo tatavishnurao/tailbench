@@ -87,6 +87,13 @@ async fn manifest_is_written_before_the_first_request() {
         assert_eq!(manifest["seed"], 42);
         assert_eq!(manifest["paused_clock"], true);
         assert_eq!(manifest["tool_version"], env!("CARGO_PKG_VERSION"));
+        // Values depend on the checkout, so only presence is checked here.
+        for key in ["build_git_sha", "build_git_dirty", "runtime_git_sha", "runtime_git_dirty", "sha_mismatch"] {
+            assert!(manifest.get(key).is_some(), "{name}: manifest has {key}");
+        }
+        for old_key in ["git_sha", "git_dirty"] {
+            assert!(manifest.get(old_key).is_none(), "{name}: {old_key} was renamed");
+        }
     }
 }
 
