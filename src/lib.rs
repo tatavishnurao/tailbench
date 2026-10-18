@@ -55,7 +55,12 @@ impl CountedHistogram {
         // HdrHistogram's lower bound must be >= 1, but it can still store 0
         // exactly; `min_us` decides what we treat as out of range.
         let hist = Histogram::new_with_bounds(1, MAX_LATENCY_US, 3).expect("valid histogram bounds");
-        Self { hist, below_min: 0, above_max: 0, min_us }
+        Self {
+            hist,
+            below_min: 0,
+            above_max: 0,
+            min_us,
+        }
     }
 
     fn record(&mut self, value: Duration) {
@@ -148,7 +153,10 @@ impl Schedule {
     /// Panics, before anything is sent, if the last send time cannot be
     /// represented as an `Instant`.
     fn start_now(interval: Duration, count: u64) -> Self {
-        let schedule = Self { start: Instant::now(), interval };
+        let schedule = Self {
+            start: Instant::now(),
+            interval,
+        };
         if let Some(last) = count.checked_sub(1) {
             assert!(
                 schedule.checked_at(last).is_some(),
@@ -192,7 +200,11 @@ where
         call().await;
         latency.record(sent.elapsed());
     }
-    RunResult { latency, service: None, scheduler_lag: None }
+    RunResult {
+        latency,
+        service: None,
+        scheduler_lag: None,
+    }
 }
 
 /// The three instants of one open-loop request.
@@ -235,7 +247,11 @@ where
         let request = call();
         in_flight.spawn(async move {
             request.await;
-            Timestamps { t_intended, t_sent, t_done: Instant::now() }
+            Timestamps {
+                t_intended,
+                t_sent,
+                t_done: Instant::now(),
+            }
         });
     }
     while let Some(ts) = in_flight.join_next().await {
@@ -245,7 +261,11 @@ where
         service.record(ts.t_done - ts.t_sent);
         scheduler_lag.record(ts.t_sent - ts.t_intended);
     }
-    RunResult { latency, service: Some(service), scheduler_lag: Some(scheduler_lag) }
+    RunResult {
+        latency,
+        service: Some(service),
+        scheduler_lag: Some(scheduler_lag),
+    }
 }
 
 #[cfg(test)]
