@@ -84,10 +84,18 @@ fn main() {
     //   Covers commits on packed-only branch refs (the new loose ref file was
     //   not watched when this script last ran) and reset --soft (which
     //   rewrites neither HEAD nor the index).
-    let mut git_files = vec!["HEAD".to_owned(), "index".to_owned(), "packed-refs".to_owned(), "logs/HEAD".to_owned()];
-    git_files.extend(git::stdout(repo, &["rev-parse", "--symbolic-full-name", "HEAD"]).filter(|r| r.starts_with("refs/")));
+    let mut git_files = vec![
+        "HEAD".to_owned(),
+        "index".to_owned(),
+        "packed-refs".to_owned(),
+        "logs/HEAD".to_owned(),
+    ];
+    git_files
+        .extend(git::stdout(repo, &["rev-parse", "--symbolic-full-name", "HEAD"]).filter(|r| r.starts_with("refs/")));
     for name in &git_files {
-        let Some(path) = git::stdout(repo, &["rev-parse", "--git-path", name]) else { continue };
+        let Some(path) = git::stdout(repo, &["rev-parse", "--git-path", name]) else {
+            continue;
+        };
         // Relative paths are relative to `repo`; join keeps an absolute one.
         let path = repo.join(path);
         // Only watch files that exist. Cargo treats a missing path as always
