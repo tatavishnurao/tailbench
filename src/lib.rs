@@ -17,6 +17,7 @@ use serde::Serialize;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
+pub mod compare;
 mod git;
 pub mod manifest;
 pub mod stats;

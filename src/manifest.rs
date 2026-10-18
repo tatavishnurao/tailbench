@@ -42,7 +42,7 @@ impl<T: Serialize> Serialize for Probe<T> {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Manifest {
     /// tailbench crate version.
     pub tool_version: &'static str,
