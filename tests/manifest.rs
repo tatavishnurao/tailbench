@@ -13,7 +13,9 @@ enum Event {
     ManifestFlushed,
     /// A request was sent; `manifest_complete` is whether the bytes written
     /// so far parsed as a whole JSON document at that moment.
-    Request { manifest_complete: bool },
+    Request {
+        manifest_complete: bool,
+    },
 }
 
 #[derive(Default)]
@@ -52,12 +54,20 @@ impl Write for FailingWriter {
 const COUNT: u64 = 3;
 
 fn config(kind: RunnerKind) -> RunConfig {
-    RunConfig { kind, interval: Duration::from_millis(10), count: COUNT, seed: Some(42) }
+    RunConfig {
+        kind,
+        interval: Duration::from_millis(10),
+        count: COUNT,
+        seed: Some(42),
+    }
 }
 
 #[tokio::test(start_paused = true)]
 async fn manifest_is_written_before_the_first_request() {
-    for (kind, name) in [(RunnerKind::ClosedLoop, "closed_loop"), (RunnerKind::OpenLoop, "open_loop")] {
+    for (kind, name) in [
+        (RunnerKind::ClosedLoop, "closed_loop"),
+        (RunnerKind::OpenLoop, "open_loop"),
+    ] {
         let log = Arc::new(Mutex::new(Log::default()));
         let server_log = Arc::clone(&log);
         let result = run(&config(kind), LogWriter(Arc::clone(&log)), move || {
@@ -76,7 +86,9 @@ async fn manifest_is_written_before_the_first_request() {
         assert_eq!(log.events[0], Event::ManifestFlushed, "{name}: manifest flushed first");
         assert_eq!(
             log.events[1],
-            Event::Request { manifest_complete: true },
+            Event::Request {
+                manifest_complete: true
+            },
             "{name}: first request saw a complete manifest"
         );
 
@@ -88,7 +100,13 @@ async fn manifest_is_written_before_the_first_request() {
         assert_eq!(manifest["paused_clock"], true);
         assert_eq!(manifest["tool_version"], env!("CARGO_PKG_VERSION"));
         // Values depend on the checkout, so only presence is checked here.
-        for key in ["build_git_sha", "build_git_dirty", "runtime_git_sha", "runtime_git_dirty", "sha_mismatch"] {
+        for key in [
+            "build_git_sha",
+            "build_git_dirty",
+            "runtime_git_sha",
+            "runtime_git_dirty",
+            "sha_mismatch",
+        ] {
             assert!(manifest.get(key).is_some(), "{name}: manifest has {key}");
         }
         for old_key in ["git_sha", "git_dirty"] {
