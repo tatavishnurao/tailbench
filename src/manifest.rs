@@ -138,13 +138,17 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
 /// HEAD of the repository at `dir`, lowercased. Anything but a full hex SHA
 /// (SHA-1 or SHA-256) is reported as Unknown.
 fn git_sha(dir: &Path) -> Probe<String> {
-    git::stdout(dir, &["rev-parse", "HEAD"]).and_then(|sha| normalize_sha(&sha)).into()
+    git::stdout(dir, &["rev-parse", "HEAD"])
+        .and_then(|sha| normalize_sha(&sha))
+        .into()
 }
 
 /// Whether the working tree at `dir` has changes anywhere in the repository,
 /// untracked files included.
 fn git_dirty(dir: &Path) -> Probe<bool> {
-    git::stdout(dir, &["status", "--porcelain"]).map(|status| !status.is_empty()).into()
+    git::stdout(dir, &["status", "--porcelain"])
+        .map(|status| !status.is_empty())
+        .into()
 }
 
 /// TAILBENCH_BUILD_GIT_SHA from build.rs, lowercased. "UNKNOWN" and
@@ -156,7 +160,9 @@ fn parse_build_sha(raw: &str) -> Probe<String> {
 /// `sha` in lowercase if it is a full hex SHA, else `None`. Both SHA fields
 /// go through this, so they can be compared as plain strings.
 fn normalize_sha(sha: &str) -> Option<String> {
-    Some(sha).filter(|sha| is_full_hex_sha(sha)).map(str::to_ascii_lowercase)
+    Some(sha)
+        .filter(|sha| is_full_hex_sha(sha))
+        .map(str::to_ascii_lowercase)
 }
 
 /// TAILBENCH_BUILD_GIT_DIRTY from build.rs. Only "true" and "false" are
@@ -258,7 +264,9 @@ mod tests {
         assert!(git::is_repo_top_level(dir));
         // src/ is inside the same repository but is not its top level.
         assert!(!git::is_repo_top_level(&dir.join("src")));
-        assert!(!git::is_repo_top_level(Path::new("/nonexistent/tailbench-manifest-test")));
+        assert!(!git::is_repo_top_level(Path::new(
+            "/nonexistent/tailbench-manifest-test"
+        )));
     }
 
     #[test]
@@ -296,7 +304,10 @@ mod tests {
         let upper = SHA1.to_ascii_uppercase();
         assert_eq!(parse_build_sha(&upper), Probe::Known(SHA1.to_owned()));
         // So an uppercase build SHA still matches git's lowercase output.
-        assert_eq!(sha_mismatch(&parse_build_sha(&upper), &Probe::Known(SHA1.to_owned())), Probe::Known(false));
+        assert_eq!(
+            sha_mismatch(&parse_build_sha(&upper), &Probe::Known(SHA1.to_owned())),
+            Probe::Known(false)
+        );
     }
 
     #[test]
@@ -307,7 +318,11 @@ mod tests {
         assert_eq!(sha_mismatch(&a, &b), Probe::Known(true), "different");
         assert_eq!(sha_mismatch(&a, &Probe::Unknown), Probe::Unknown, "runtime unknown");
         assert_eq!(sha_mismatch(&Probe::Unknown, &a), Probe::Unknown, "build unknown");
-        assert_eq!(sha_mismatch(&Probe::Unknown, &Probe::Unknown), Probe::Unknown, "both unknown");
+        assert_eq!(
+            sha_mismatch(&Probe::Unknown, &Probe::Unknown),
+            Probe::Unknown,
+            "both unknown"
+        );
     }
 
     #[tokio::test(start_paused = true)]
