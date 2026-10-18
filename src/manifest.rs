@@ -5,12 +5,14 @@
 //! probed value is either read from the system or reported as "UNKNOWN";
 //! nothing is guessed.
 
+use std::collections::BTreeMap;
 use std::env::consts::{ARCH, OS};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Serialize, Serializer};
+use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::git::{self, is_full_hex_sha};
 use crate::{RunConfig, RunnerKind};
@@ -81,6 +83,13 @@ pub struct Manifest {
     pub machine_label: String,
     /// `rustc --version` of the compiler that built this binary (from build.rs).
     pub rust_version: &'static str,
+    /// Cargo's PROFILE when this binary was built: "release" or "debug",
+    /// whichever the profile inherits from (a custom profile reports that,
+    /// not its own name). Unknown if cargo did not set it.
+    pub build_profile: Probe<String>,
+    /// Cargo's OPT_LEVEL when this binary was built ("0".."3", "s", "z"): the
+    /// profile's real optimization level. Unknown if cargo did not set it.
+    pub opt_level: Probe<String>,
     pub runner: RunnerKind,
     pub interval_ns: u128,
     pub count: u64,
@@ -90,6 +99,15 @@ pub struct Manifest {
     pub start_unix_ns: Probe<u128>,
     /// Whether tokio's clock was paused (test-util) when the manifest was taken.
     pub paused_clock: bool,
+    /// Flavor of the tokio runtime the manifest was collected on (the one
+    /// `run` drives the runner on): "current_thread" or "multi_thread".
+    /// Unknown outside a runtime, or for a flavor tokio adds later.
+    pub runtime_flavor: Probe<String>,
+    /// That runtime's worker threads (`RuntimeMetrics::num_workers`, stable
+    /// in tokio; always 1 on current_thread). Unknown outside a runtime.
+    pub runtime_workers: Probe<u64>,
+    /// `RunConfig::extra`, keys sorted.
+    pub extra: BTreeMap<String, String>,
 }
 
 impl Manifest {
@@ -100,6 +118,7 @@ impl Manifest {
         let build_git_sha = parse_build_sha(env!("TAILBENCH_BUILD_GIT_SHA"));
         let (runtime_git_sha, runtime_git_dirty) = runtime_git(Path::new(env!("CARGO_MANIFEST_DIR")));
         let mismatch = sha_mismatch(&build_git_sha, &runtime_git_sha);
+        let (runtime_flavor, runtime_workers) = tokio_runtime();
         Self {
             tool_version: env!("CARGO_PKG_VERSION"),
             build_git_sha,
@@ -113,6 +132,8 @@ impl Manifest {
             cpu_model: cpu_model(),
             machine_label: machine_label(),
             rust_version: env!("TAILBENCH_RUSTC_VERSION"),
+            build_profile: option_env!("TAILBENCH_BUILD_PROFILE").map(str::to_owned).into(),
+            opt_level: option_env!("TAILBENCH_OPT_LEVEL").map(str::to_owned).into(),
             runner: config.kind,
             interval_ns: config.interval.as_nanos(),
             count: config.count,
@@ -123,8 +144,27 @@ impl Manifest {
                 .map(|d| d.as_nanos())
                 .into(),
             paused_clock: clock_is_paused(),
+            runtime_flavor,
+            runtime_workers,
+            extra: config.extra.clone(),
         }
     }
+}
+
+/// Flavor and worker count of the tokio runtime this is called on, or
+/// Unknown for both outside a runtime.
+fn tokio_runtime() -> (Probe<String>, Probe<u64>) {
+    let Ok(handle) = Handle::try_current() else {
+        return (Probe::Unknown, Probe::Unknown);
+    };
+    let flavor = match handle.runtime_flavor() {
+        RuntimeFlavor::CurrentThread => Probe::Known("current_thread".to_owned()),
+        RuntimeFlavor::MultiThread => Probe::Known("multi_thread".to_owned()),
+        // RuntimeFlavor is #[non_exhaustive].
+        _ => Probe::Unknown,
+    };
+    let workers = u64::try_from(handle.metrics().num_workers()).ok().into();
+    (flavor, workers)
 }
 
 /// Trimmed stdout of a command that exited successfully, else `None`.

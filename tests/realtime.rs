@@ -1,9 +1,17 @@
-//! Real-time smoke test: runs open_loop on tokio's REAL clock to see how far
-//! actual sends drift from the schedule (scheduler lag) on this machine.
+//! Real-time smoke tests: run open_loop on tokio's REAL clock, on a
+//! current_thread and a multi_thread runtime, to see how far actual sends
+//! drift from the schedule (scheduler lag) on this machine.
 //!
-//! Only checks that every request and every lag sample was recorded; it sets
-//! no bound on lag yet, because lag depends on the machine and tokio's timer.
+//! They only check that every request and every lag sample was recorded; they
+//! set no bound on lag yet, because lag depends on the machine and tokio's
+//! timer. tokio 1.53.3 documents that timer, on `tokio::time::sleep`:
+//! "`Sleep` operates at millisecond granularity and should not be used for
+//! tasks that require high-resolution timers. The implementation is platform
+//! specific, and some platforms (specifically Windows) will provide timers
+//! with a larger resolution than 1 ms." So lag of up to about 1 ms (more on
+//! Windows) is the timer, not the code under test.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use tailbench::{CountedHistogram, RunConfig, RunnerKind, run};
@@ -29,13 +37,16 @@ fn row(name: &str, h: &CountedHistogram) {
     );
 }
 
-#[tokio::test]
-async fn scheduler_lag_is_recorded_on_the_real_clock() {
+/// Runs the open loop on the current runtime's real clock, prints the
+/// manifest and the scheduler_lag / service / latency tables, and checks
+/// only that every sample was recorded.
+async fn run_and_report() {
     let config = RunConfig {
         kind: RunnerKind::OpenLoop,
         interval: INTERVAL,
         count: COUNT,
         seed: None,
+        extra: BTreeMap::new(),
     };
     let mut manifest = Vec::new();
     let wall = std::time::Instant::now();
@@ -60,4 +71,14 @@ async fn scheduler_lag_is_recorded_on_the_real_clock() {
     assert_eq!(result.latency.hist.len(), COUNT);
     assert_eq!(service.hist.len(), COUNT);
     assert_eq!(lag.hist.len(), COUNT, "one lag sample per request");
+}
+
+#[tokio::test]
+async fn scheduler_lag_is_recorded_on_the_real_clock() {
+    run_and_report().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_lag_is_recorded_on_a_multi_thread_runtime() {
+    run_and_report().await;
 }

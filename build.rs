@@ -1,6 +1,7 @@
 //! Build script: records how this binary was built, so the run manifest
 //! reports that rather than whatever is true when the binary runs:
 //! - the rustc that compiles tailbench, not whatever `rustc` is on PATH later;
+//! - the cargo profile and opt-level it is compiled with;
 //! - the git commit of the source tree, and whether the build-relevant files
 //!   differed from it, not whatever is checked out later.
 //!
@@ -34,6 +35,19 @@ fn main() {
         .unwrap_or_else(|| "UNKNOWN".to_owned());
     println!("cargo:rustc-env=TAILBENCH_RUSTC_VERSION={version}");
     println!("cargo:rerun-if-env-changed=RUSTC");
+
+    // Cargo sets both for build scripts. PROFILE is only "release" or
+    // "debug" (whichever of release or dev the profile inherits from, so a
+    // custom profile reports its root); OPT_LEVEL is the profile's actual
+    // opt-level. Left unset if missing, so the manifest says UNKNOWN.
+    for (var, key) in [
+        ("PROFILE", "TAILBENCH_BUILD_PROFILE"),
+        ("OPT_LEVEL", "TAILBENCH_OPT_LEVEL"),
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            println!("cargo:rustc-env={key}={value}");
+        }
+    }
 
     // Cargo always sets it; it is also this script's working directory.
     let dir = std::env::var_os("CARGO_MANIFEST_DIR").map_or_else(|| PathBuf::from("."), PathBuf::from);

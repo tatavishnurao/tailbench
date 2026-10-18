@@ -1,6 +1,7 @@
 //! Proves `run` writes and flushes a complete manifest before it sends the
 //! first request, for both runner kinds, and sends nothing if that write fails.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -59,7 +60,73 @@ fn config(kind: RunnerKind) -> RunConfig {
         interval: Duration::from_millis(10),
         count: COUNT,
         seed: Some(42),
+        extra: BTreeMap::new(),
     }
+}
+
+/// Runs `config` against a fake server that sleeps `service` per request and
+/// returns the manifest it wrote, parsed and as text.
+async fn manifest_of(config: &RunConfig, service: Duration) -> (Value, String) {
+    let mut out = Vec::new();
+    run(config, &mut out, move || tokio::time::sleep(service))
+        .await
+        .expect("run succeeds");
+    let text = String::from_utf8(out).expect("manifest is UTF-8");
+    (serde_json::from_str(&text).expect("manifest is JSON"), text)
+}
+
+#[tokio::test(start_paused = true)]
+async fn manifest_records_current_thread_runtime() {
+    for kind in [RunnerKind::ClosedLoop, RunnerKind::OpenLoop] {
+        let (manifest, _) = manifest_of(&config(kind), Duration::from_millis(1)).await;
+        assert_eq!(manifest["runtime_flavor"], "current_thread", "{kind:?}");
+        // tokio documents num_workers as always 1 on current_thread.
+        assert_eq!(manifest["runtime_workers"], 1, "{kind:?}");
+    }
+}
+
+// start_paused needs current_thread, so this one runs on the real clock: a
+// few sends, 1 ms apart, to a server that answers immediately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_records_multi_thread_runtime() {
+    for kind in [RunnerKind::ClosedLoop, RunnerKind::OpenLoop] {
+        let config = RunConfig {
+            interval: Duration::from_millis(1),
+            ..config(kind)
+        };
+        let (manifest, _) = manifest_of(&config, Duration::ZERO).await;
+        assert_eq!(manifest["runtime_flavor"], "multi_thread", "{kind:?}");
+        assert_eq!(manifest["runtime_workers"], 2, "{kind:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn manifest_records_build_profile() {
+    let (manifest, _) = manifest_of(&config(RunnerKind::OpenLoop), Duration::from_millis(1)).await;
+    // `cargo test` builds with the test profile, which inherits from dev.
+    assert_eq!(manifest["build_profile"], "debug");
+    let opt_level = manifest["opt_level"].as_str().expect("opt_level is a string");
+    assert_ne!(opt_level, "UNKNOWN");
+}
+
+#[tokio::test(start_paused = true)]
+async fn manifest_extra_has_sorted_keys_and_defaults_to_empty() {
+    let (manifest, _) = manifest_of(&config(RunnerKind::OpenLoop), Duration::from_millis(1)).await;
+    assert_eq!(manifest["extra"], serde_json::json!({}), "empty map is an empty object");
+
+    let mut labeled = config(RunnerKind::OpenLoop);
+    // Inserted out of order: the manifest must list them sorted.
+    labeled.extra.insert("target".to_owned(), "fake-server".to_owned());
+    labeled.extra.insert("gpu".to_owned(), "4060".to_owned());
+    let (manifest, text) = manifest_of(&labeled, Duration::from_millis(1)).await;
+    assert_eq!(
+        manifest["extra"],
+        serde_json::json!({"gpu": "4060", "target": "fake-server"})
+    );
+    // serde_json::Value sorts keys itself, so check the order in the raw text.
+    let gpu = text.find("\"gpu\"").expect("gpu key in manifest text");
+    let target = text.find("\"target\"").expect("target key in manifest text");
+    assert!(gpu < target, "extra keys not sorted:\n{text}");
 }
 
 #[tokio::test(start_paused = true)]

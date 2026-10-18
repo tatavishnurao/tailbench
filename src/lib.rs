@@ -7,6 +7,7 @@
 //! Timestamps use `tokio::time::Instant` so the runners follow tokio's paused
 //! clock in tests; outside of tests it behaves like `std::time::Instant`.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::{self, Write};
 use std::time::Duration;
@@ -106,6 +107,9 @@ pub struct RunConfig {
     pub count: u64,
     /// Recorded in the manifest only; no runner uses randomness yet.
     pub seed: Option<u64>,
+    /// Caller labels, such as target="fake-server" or gpu="4060", copied into
+    /// the manifest as `extra` with sorted keys. Usually empty.
+    pub extra: BTreeMap<String, String>,
 }
 
 /// Writes the run manifest to `manifest_out` as JSON and flushes it, and only
@@ -228,6 +232,13 @@ struct Timestamps {
 ///
 /// Also records, per request, service = t_done - t_sent and scheduler_lag =
 /// t_sent - t_intended (so latency = scheduler_lag + service).
+///
+/// Sends wait on `tokio::time::sleep_until`, so on the real clock
+/// scheduler_lag includes tokio's timer resolution. tokio 1.53.3 documents
+/// it on `tokio::time::sleep`: "`Sleep` operates at millisecond granularity
+/// and should not be used for tasks that require high-resolution timers. The
+/// implementation is platform specific, and some platforms (specifically
+/// Windows) will provide timers with a larger resolution than 1 ms."
 ///
 /// Panics if the schedule overflows (see `Schedule::start_now`).
 pub async fn open_loop<F, Fut>(interval: Duration, count: u64, mut call: F) -> RunResult
