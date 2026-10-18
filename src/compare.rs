@@ -12,13 +12,23 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::manifest::{Manifest, Probe};
-use crate::stats::{self, CiWarning, DEFAULT_LEVEL, DEFAULT_RESAMPLES, MIN_EPISODES, MIN_RUNS};
+use crate::stats::{self, CiWarning, DEFAULT_LEVEL, DEFAULT_RESAMPLES, MIN_EPISODES, MIN_RUNS, SplitMix64};
 use crate::{RunResult, RunnerKind, Sample};
 
-/// Bootstrap seeds, fixed so `compare` is deterministic. They differ so A's
-/// and B's resamples are independent even when both have the same shape.
-const SEED_A: u64 = 0xA5EE_D000_0000_000A;
-const SEED_B: u64 = 0xB5EE_D000_0000_000B;
+/// Bootstrap seed `compare` uses, fixed so a comparison is deterministic.
+/// A's bootstrap uses it; B's uses the first output of SplitMix64 seeded
+/// with it, so the two groups' resamples are independent even when both
+/// have the same shape.
+pub const DEFAULT_SEED: u64 = 0xA5EE_D000_0000_000A;
+
+/// Default `min_effect` for `compare`: 1 ms, tokio's timer granularity.
+/// Open-loop sends wait on `tokio::time::sleep_until`, which tokio 1.53.3
+/// documents as "`Sleep` operates at millisecond granularity", so every
+/// latency includes up to about 1 ms of timer lag (more on Windows). A
+/// difference smaller than that can come from the timer, not the target.
+/// Pass a larger value for a slower timer; pass `Duration::ZERO` only for
+/// data that is not timed by tokio.
+pub const DEFAULT_MIN_EFFECT: Duration = Duration::from_millis(1);
 
 /// One run's result with the manifest written for it.
 #[derive(Debug)]
@@ -63,6 +73,15 @@ pub enum CompareWarning {
     GitDirty { a: usize, b: usize },
     /// Runs whose `sha_mismatch` is true: the checkout moved after the build.
     ShaMismatch { a: usize, b: usize },
+    /// `interval_ns` or `count` takes more than one value across all runs,
+    /// so the runs were not offered the same load: a different request rate
+    /// changes queueing, and a different count changes how long the load
+    /// lasted. `a` and `b` are the distinct values in each group, sorted.
+    OfferedLoadDiffers {
+        field: &'static str,
+        a: Vec<String>,
+        b: Vec<String>,
+    },
 }
 
 /// A verdict with what it was computed from.
@@ -75,20 +94,25 @@ pub struct Comparison {
     pub runs_b: usize,
     /// Nominal confidence level of the delta CI.
     pub level: f64,
+    /// Bootstrap resamples per group, and the seed (see `DEFAULT_SEED`).
+    /// Rerunning `compare` on the same runs reproduces the same CI.
+    pub resamples: usize,
+    pub seed: u64,
     pub warnings: Vec<CompareWarning>,
 }
 
 /// Compares the `q` percentile of latency between runs `a` and `b`.
 ///
-/// Each group gets a `stats::hier_ci` bootstrap (`DEFAULT_RESAMPLES`, fixed
-/// seeds); resample i of B minus resample i of A gives the bootstrap
+/// Each group gets a `stats::hier_ci` bootstrap (`DEFAULT_RESAMPLES`,
+/// `DEFAULT_SEED`); runs are pooled weighted by their length (see
+/// `stats::hier_ci`). Resample i of B minus resample i of A gives the bootstrap
 /// distribution of delta, and its percentile interval at `DEFAULT_LEVEL` is
 /// the CI. The verdict is Slower or Faster only if none of these holds:
 /// - either group has fewer than `MIN_RUNS` runs;
 /// - either group's estimate is episode-limited (fewer than `MIN_EPISODES`
 ///   episodes at or above it); a sample-count shortfall is only a warning;
 /// - the CI of delta contains 0, or does not contain delta itself;
-/// - |delta| < `min_effect`.
+/// - |delta| < `min_effect` (usually `DEFAULT_MIN_EFFECT`).
 ///
 /// Refused, with no CI, if a group is empty, a run has no samples, runners
 /// differ, or any run is closed-loop.
@@ -105,6 +129,8 @@ pub fn compare(a: &[RecordedRun], b: &[RecordedRun], q: f64, min_effect: Duratio
         runs_a: a.len(),
         runs_b: b.len(),
         level: DEFAULT_LEVEL,
+        resamples: DEFAULT_RESAMPLES,
+        seed: DEFAULT_SEED,
         warnings,
     }
 }
@@ -166,8 +192,8 @@ fn decide(
         stats::hier_bootstrap(&samples(runs), q, DEFAULT_RESAMPLES, seed, DEFAULT_LEVEL)
             .expect("refusal rules out empty groups and runs")
     };
-    let (ci_a, boot_a) = boot(a, SEED_A);
-    let (ci_b, boot_b) = boot(b, SEED_B);
+    let (ci_a, boot_a) = boot(a, DEFAULT_SEED);
+    let (ci_b, boot_b) = boot(b, SplitMix64::new(DEFAULT_SEED).next_u64());
     for (group, ci) in [(Group::A, &ci_a), (Group::B, &ci_b)] {
         warnings.extend(ci.warnings.iter().map(|w| CompareWarning::Ci {
             group,
@@ -256,32 +282,55 @@ fn environment(m: &Manifest) -> [(&'static str, String); 6] {
     ]
 }
 
-/// Environment fields that take more than one value across all runs (an
-/// Unknown counts as a value of its own), then git state.
-fn manifest_warnings(a: &[RecordedRun], b: &[RecordedRun]) -> Vec<CompareWarning> {
+/// The manifest fields that set the load the target was offered.
+fn offered_load(m: &Manifest) -> [(&'static str, String); 2] {
+    [
+        ("interval_ns", m.interval_ns.to_string()),
+        ("count", m.count.to_string()),
+    ]
+}
+
+/// For each field `fields` reads, `(name, A's values, B's values)` if it
+/// takes more than one value across all runs. Values are distinct and sorted.
+fn differing<const N: usize>(
+    a: &[RecordedRun],
+    b: &[RecordedRun],
+    fields: fn(&Manifest) -> [(&'static str, String); N],
+) -> Vec<(&'static str, Vec<String>, Vec<String>)> {
     let values = |runs: &[RecordedRun], field: usize| {
-        let mut v: Vec<String> = runs.iter().map(|r| environment(&r.manifest)[field].1.clone()).collect();
+        let mut v: Vec<String> = runs.iter().map(|r| fields(&r.manifest)[field].1.clone()).collect();
         v.sort();
         v.dedup();
         v
     };
-    let mut warnings = Vec::new();
     let Some(first) = a.iter().chain(b).next() else {
-        return warnings;
+        return Vec::new();
     };
-    for (field, (name, _)) in environment(&first.manifest).into_iter().enumerate() {
+    let mut out = Vec::new();
+    for (field, (name, _)) in fields(&first.manifest).into_iter().enumerate() {
         let (va, vb) = (values(a, field), values(b, field));
         let mut all = [va.as_slice(), vb.as_slice()].concat();
         all.sort();
         all.dedup();
         if all.len() > 1 {
-            warnings.push(CompareWarning::ManifestDiffers {
-                field: name,
-                a: va,
-                b: vb,
-            });
+            out.push((name, va, vb));
         }
     }
+    out
+}
+
+/// Environment fields and offered load that take more than one value across
+/// all runs (an Unknown counts as a value of its own), then git state.
+fn manifest_warnings(a: &[RecordedRun], b: &[RecordedRun]) -> Vec<CompareWarning> {
+    let mut warnings: Vec<CompareWarning> = differing(a, b, environment)
+        .into_iter()
+        .map(|(field, a, b)| CompareWarning::ManifestDiffers { field, a, b })
+        .collect();
+    warnings.extend(
+        differing(a, b, offered_load)
+            .into_iter()
+            .map(|(field, a, b)| CompareWarning::OfferedLoadDiffers { field, a, b }),
+    );
     let count = |runs: &[RecordedRun], f: fn(&Manifest) -> &Probe<bool>| {
         runs.iter().filter(|r| *f(&r.manifest) == Probe::Known(true)).count()
     };
@@ -330,6 +379,12 @@ impl fmt::Display for CompareWarning {
             }
             CompareWarning::GitDirty { a, b } => write!(f, "git-dirty build in {a} A runs and {b} B runs"),
             CompareWarning::ShaMismatch { a, b } => write!(f, "sha_mismatch in {a} A runs and {b} B runs"),
+            CompareWarning::OfferedLoadDiffers { field, a, b } => write!(
+                f,
+                "offered load differs: {field} (A: {}; B: {})",
+                a.join(", "),
+                b.join(", ")
+            ),
         }
     }
 }
@@ -347,14 +402,20 @@ impl CompareWarning {
     }
 }
 
-/// One line, for example
-/// "B slower at p99 by 401.0 ms [380.2, 452.9], 5 vs 5 runs, nominal 95%",
-/// followed by any warning not already given as a reason.
+/// One line, for example "B slower at p99 by 401.0 ms [380.2, 452.9], 5 vs
+/// 5 runs, nominal 95%, 2000 resamples, seed 0xA5EED0000000000A", followed
+/// by any warning not already given as a reason. A refusal ran no bootstrap,
+/// so it shows no level, resamples or seed.
 impl fmt::Display for Comparison {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let p = stats::quantile_label(self.q);
         let runs = format!("{} vs {} runs", self.runs_a, self.runs_b);
-        let level = format!("nominal {}%", self.level * 100.0);
+        let level = format!(
+            "nominal {}%, {} resamples, seed {:#018X}",
+            self.level * 100.0,
+            self.resamples,
+            self.seed
+        );
         match &self.verdict {
             Verdict::Slower { delta, lo, hi } => {
                 let d = decimals_for(*delta);
@@ -390,5 +451,119 @@ impl fmt::Display for Comparison {
             write!(f, " [warnings: {}]", shown.join("; "))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::synth::Synth;
+
+    const R: usize = 5;
+
+    fn model() -> Synth {
+        Synth::new(0.5, 0.5, 0.0)
+    }
+
+    /// R runs of `model` at `scale`; seeds start at `base`.
+    fn runs(model: &Synth, m: &Manifest, base: u64, scale: f64) -> Vec<RecordedRun> {
+        (0..R as u64).map(|i| model.run(m, base + i, scale)).collect()
+    }
+
+    fn load_warning(c: &Comparison, field: &str) -> Option<CompareWarning> {
+        c.warnings
+            .iter()
+            .find(|w| matches!(w, CompareWarning::OfferedLoadDiffers { field: f, .. } if *f == field))
+            .cloned()
+    }
+
+    #[test]
+    fn different_offered_load_warns_with_both_values() {
+        let model = model();
+        let m = model.manifest();
+        let a = runs(&model, &m, 0, 1.0);
+        let mut b = runs(&model, &m, 100, 1.0);
+        let same = compare(&a, &b, 0.5, DEFAULT_MIN_EFFECT);
+        assert_eq!(load_warning(&same, "interval_ns"), None);
+        assert_eq!(load_warning(&same, "count"), None);
+
+        for run in &mut b {
+            run.manifest.interval_ns = 5_000_000;
+            run.manifest.count = 2000;
+        }
+        let c = compare(&a, &b, 0.5, DEFAULT_MIN_EFFECT);
+        println!("{c}");
+        assert_eq!(
+            load_warning(&c, "interval_ns"),
+            Some(CompareWarning::OfferedLoadDiffers {
+                field: "interval_ns",
+                a: vec!["10000000".to_owned()],
+                b: vec!["5000000".to_owned()],
+            })
+        );
+        assert!(load_warning(&c, "count").is_some());
+        let line = c.to_string();
+        assert!(
+            line.contains("offered load differs: interval_ns (A: 10000000; B: 5000000)"),
+            "{line}"
+        );
+        assert!(
+            line.contains("offered load differs: count (A: 1000; B: 2000)"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn run_lengths_more_than_2x_apart_warn() {
+        let model = model();
+        let m = model.manifest();
+        let mut a = runs(&model, &m, 0, 1.0);
+        a[0].result = crate::synth::run_result(model.samples(0, 1.0)[..400].to_vec());
+        let b = runs(&model, &m, 100, 1.0);
+        let c = compare(&a, &b, 0.5, DEFAULT_MIN_EFFECT);
+        println!("{c}");
+        let w = CompareWarning::Ci {
+            group: Group::A,
+            warning: CiWarning::RunLengthsUneven {
+                shortest: 400,
+                longest: 1000,
+            },
+        };
+        assert!(c.warnings.contains(&w), "{:?}", c.warnings);
+        assert!(c.to_string().contains("pooling weights runs by length"));
+    }
+
+    #[test]
+    fn comparison_records_seed_and_resamples() {
+        let model = model();
+        let m = model.manifest();
+        let c = compare(
+            &runs(&model, &m, 0, 1.0),
+            &runs(&model, &m, 100, 1.0),
+            0.5,
+            DEFAULT_MIN_EFFECT,
+        );
+        println!("{c}");
+        assert_eq!((c.seed, c.resamples), (DEFAULT_SEED, DEFAULT_RESAMPLES));
+        assert!(c.to_string().contains("2000 resamples, seed 0xA5EED0000000000A"), "{c}");
+    }
+
+    /// B 5% slower: 0.5 ms at the 10 ms median. The CI resolves it, so with
+    /// min_effect 0 the verdict is Slower; the default 1 ms min_effect
+    /// calls it too small to tell from the timer.
+    #[test]
+    fn default_min_effect_hides_sub_millisecond_delta() {
+        assert_eq!(DEFAULT_MIN_EFFECT, Duration::from_millis(1));
+        let model = model();
+        let m = model.manifest();
+        let (a, b) = (runs(&model, &m, 0, 1.0), runs(&model, &m, 100, 1.05));
+        let zero = compare(&a, &b, 0.5, Duration::ZERO);
+        let default = compare(&a, &b, 0.5, DEFAULT_MIN_EFFECT);
+        println!("{zero}\n{default}");
+        assert!(matches!(zero.verdict, Verdict::Slower { .. }), "{zero}");
+        let Verdict::Inconclusive { reason } = &default.verdict else {
+            panic!("expected Inconclusive: {default}");
+        };
+        assert!(reason.contains("effect below min_effect: |delta| < 1.0 ms"), "{reason}");
     }
 }

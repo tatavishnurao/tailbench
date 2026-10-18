@@ -17,10 +17,14 @@ use serde::Serialize;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until};
 
+#[cfg(test)]
+mod calibration;
 pub mod compare;
 mod git;
 pub mod manifest;
 pub mod stats;
+#[cfg(test)]
+mod synth;
 
 use manifest::Manifest;
 

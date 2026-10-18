@@ -28,6 +28,9 @@ pub const MIN_TAIL_SUPPORT: usize = 10;
 pub const MIN_EPISODES: usize = 5;
 /// Fewest runs for `hier_ci` to see any between-run variance.
 pub const MIN_RUNS: usize = 3;
+/// Most samples the longest run may have, as a multiple of the shortest,
+/// before `hier_ci` warns that pooling lets the long runs dominate.
+pub const MAX_RUN_LENGTH_RATIO: usize = 2;
 /// Default number of bootstrap resamples.
 pub const DEFAULT_RESAMPLES: usize = 2000;
 /// Default confidence level.
@@ -171,6 +174,11 @@ pub enum CiWarning {
     /// cannot show how far a rerun would move the percentile, so the
     /// interval is within-run noise only.
     BetweenRunVarianceUnknown { runs: usize },
+    /// `hier_ci` only: the longest run has more than `MAX_RUN_LENGTH_RATIO`
+    /// times the samples of the shortest. Runs are pooled as they are, so
+    /// each run weighs by its length and the long runs dominate both the
+    /// estimate and the interval.
+    RunLengthsUneven { shortest: usize, longest: usize },
 }
 
 impl fmt::Display for CiWarning {
@@ -198,6 +206,11 @@ impl fmt::Display for CiWarning {
             CiWarning::BetweenRunVarianceUnknown { runs } => {
                 write!(f, "between-run variance unknown: {runs} runs (want >= {MIN_RUNS})")
             }
+            CiWarning::RunLengthsUneven { shortest, longest } => write!(
+                f,
+                "run lengths uneven: {shortest} to {longest} samples (more than {MAX_RUN_LENGTH_RATIO}x); pooling \
+                 weights runs by length"
+            ),
         }
     }
 }
@@ -349,14 +362,20 @@ pub struct HierCi {
 /// Each resample draws `runs.len()` runs uniformly WITH replacement; each
 /// drawn run is block-resampled to its own length exactly as `mbb_ci` does
 /// (circular, `default_block_len` of that run's length); the drawn runs are
-/// pooled and the nearest-rank percentile of the pool is taken. Runs of
-/// different lengths are pooled as they are, so a longer run weighs more.
+/// pooled and the nearest-rank percentile of the pool is taken.
+///
+/// Pooling weights runs by LENGTH: a run of 2000 samples counts twice as
+/// much as a run of 1000, in the estimate and in every resample. That is
+/// right when runs are equally trustworthy per request, and wrong when each
+/// run is one draw of the machine's state (then every run should count the
+/// same). Hence the `RunLengthsUneven` warning.
 /// The interval is the percentile interval, cut as in `mbb_ci`.
 ///
 /// Warnings: `BetweenRunVarianceUnknown` when R < `MIN_RUNS`,
 /// `InsufficientSamples` on the pooled sample count, `EpisodeLimited` when
-/// fewer than `MIN_EPISODES` episodes lie at or above the estimate, and
-/// `EstimateIsSampleMax`.
+/// fewer than `MIN_EPISODES` episodes lie at or above the estimate,
+/// `RunLengthsUneven` when the longest run is more than
+/// `MAX_RUN_LENGTH_RATIO` times the shortest, and `EstimateIsSampleMax`.
 ///
 /// Deterministic for the same arguments. `None` if `runs` is empty or any
 /// run has no samples.
@@ -425,6 +444,11 @@ pub(crate) fn hier_bootstrap(
     }
     if episodes < MIN_EPISODES {
         warnings.push(CiWarning::EpisodeLimited { q, episodes });
+    }
+    let lengths = latencies.iter().map(Vec::len);
+    let (shortest, longest) = (lengths.clone().min().unwrap_or(0), lengths.max().unwrap_or(0));
+    if longest > MAX_RUN_LENGTH_RATIO * shortest {
+        warnings.push(CiWarning::RunLengthsUneven { shortest, longest });
     }
     if pooled.iter().max() == Some(&estimate) {
         warnings.push(CiWarning::EstimateIsSampleMax);
@@ -768,6 +792,32 @@ mod tests {
         assert_eq!(ci.estimate, 500_000);
         assert_eq!(ci.episodes, 30);
         assert!(!has(&ci, |w| matches!(w, CiWarning::EpisodeLimited { .. })));
+    }
+
+    /// More than 2x between the shortest and longest run warns; exactly 2x
+    /// does not.
+    #[test]
+    fn hier_ci_warns_on_uneven_run_lengths() {
+        let uneven = |short: usize, long: usize| {
+            let runs = [
+                samples_of(&scrambled(short as u64)),
+                samples_of(&scrambled(long as u64)),
+            ];
+            hier(&runs, 0.5, 1)
+                .warnings
+                .into_iter()
+                .find(|w| matches!(w, CiWarning::RunLengthsUneven { .. }))
+        };
+        assert_eq!(uneven(500, 1000), None, "exactly 2x");
+        let w = uneven(499, 1000).expect("more than 2x warns");
+        assert_eq!(
+            w,
+            CiWarning::RunLengthsUneven {
+                shortest: 499,
+                longest: 1000
+            }
+        );
+        println!("{w}");
     }
 
     /// A run boundary ends an episode: slow at the end of run 0 and the start
