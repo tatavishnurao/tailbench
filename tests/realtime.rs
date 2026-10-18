@@ -31,7 +31,12 @@ fn row(name: &str, h: &CountedHistogram) {
 
 #[tokio::test]
 async fn scheduler_lag_is_recorded_on_the_real_clock() {
-    let config = RunConfig { kind: RunnerKind::OpenLoop, interval: INTERVAL, count: COUNT, seed: None };
+    let config = RunConfig {
+        kind: RunnerKind::OpenLoop,
+        interval: INTERVAL,
+        count: COUNT,
+        seed: None,
+    };
     let mut manifest = Vec::new();
     let wall = std::time::Instant::now();
     let result = run(&config, &mut manifest, || tokio::time::sleep(SERVICE_TIME))
