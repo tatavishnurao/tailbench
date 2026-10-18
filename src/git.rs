@@ -10,7 +10,13 @@ use std::process::Command;
 /// other than the one `-C` names. They are inherited when tailbench is built
 /// or run from a git hook, `git rebase --exec` or some editors, and would
 /// override `-C`, so every git command here runs without them.
-const REPO_ENV: [&str; 5] = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"];
+const REPO_ENV: [&str; 5] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+];
 
 /// Whether `sha` is a full hex object name: 40 chars (SHA-1) or 64 (SHA-256).
 pub(crate) fn is_full_hex_sha(sha: &str) -> bool {
@@ -32,7 +38,13 @@ pub(crate) fn stdout_of(mut git: Command, dir: &Path, args: &[&str]) -> Option<S
     for var in REPO_ENV {
         git.env_remove(var);
     }
-    let out = git.arg("--no-optional-locks").arg("-C").arg(dir).args(args).output().ok()?;
+    let out = git
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
