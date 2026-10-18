@@ -6,7 +6,8 @@
 
 use std::time::Duration;
 
-use tailbench::{CountedHistogram, closed_loop, open_loop};
+use tailbench::stats::{self, DEFAULT_LEVEL, DEFAULT_RESAMPLES};
+use tailbench::{CountedHistogram, RunResult, closed_loop, open_loop};
 use tokio::time::{Instant, sleep, sleep_until};
 
 const SERVICE_TIME: Duration = Duration::from_millis(1);
@@ -155,4 +156,142 @@ async fn stall_is_hidden_by_closed_loop_and_visible_in_open_loop() {
     assert_eq!(open_lag.hist.len(), COUNT, "one lag sample per request");
     assert_eq!(open_lag.below_min + open_lag.above_max, 0, "lag never altered");
     assert_eq!(open_lag.hist.max(), 0, "paused clock: every send exactly on schedule");
+}
+
+const MS: u64 = 1_000_000;
+
+/// Per-request samples on the same stall run, in intended-send order.
+///
+/// open_loop: send i is intended at i * 10 ms. Sends 200..250 (intended
+/// 2000..=2490 ms) are frozen: latency = 2501 ms - i * 10 ms. Everything else
+/// takes 1 ms. Lag is 0 on the paused clock, so service = latency.
+///
+/// closed_loop: intended offsets are the same schedule; latency is measured
+/// from the actual send, so only send 200 (sent at 2000 ms) shows the freeze
+/// (501 ms). It has no service or lag split.
+#[tokio::test(start_paused = true)]
+async fn samples_are_in_intended_order_with_exact_values() {
+    let server = FakeServer::starting_now();
+    let closed = closed_loop(INTERVAL, COUNT, || server.call()).await;
+    let server = FakeServer::starting_now();
+    let open = open_loop(INTERVAL, COUNT, || server.call()).await;
+
+    assert_eq!(open.samples.len() as u64, COUNT);
+    for (i, s) in (0u64..).zip(&open.samples) {
+        let want = if (200..250).contains(&i) {
+            2501 * MS - i * 10 * MS
+        } else {
+            MS
+        };
+        assert_eq!(s.intended_offset_ns, i * 10 * MS, "open send {i} out of order");
+        assert_eq!(s.latency_ns, want, "open send {i} latency");
+        assert_eq!(s.service_ns, Some(want), "open send {i} service");
+        assert_eq!(s.scheduler_lag_ns, Some(0), "open send {i} lag");
+    }
+
+    assert_eq!(closed.samples.len() as u64, COUNT);
+    for (i, s) in (0u64..).zip(&closed.samples) {
+        let want = if i == 200 { 501 * MS } else { MS };
+        assert_eq!(s.intended_offset_ns, i * 10 * MS, "closed send {i} out of order");
+        assert_eq!(s.latency_ns, want, "closed send {i} latency");
+        assert_eq!(s.service_ns, None);
+        assert_eq!(s.scheduler_lag_ns, None);
+    }
+}
+
+/// `percentile` on raw samples picks the same sample as `value_at_quantile`
+/// on the histogram, so after truncating ns to whole us (as the histogram
+/// does), the histogram value is that sample rounded up to its bucket.
+#[tokio::test(start_paused = true)]
+async fn percentile_agrees_with_histograms_on_stall_data() {
+    let server = FakeServer::starting_now();
+    let closed = closed_loop(INTERVAL, COUNT, || server.call()).await;
+    let server = FakeServer::starting_now();
+    let open = open_loop(INTERVAL, COUNT, || server.call()).await;
+
+    let series: [(&str, &CountedHistogram, Vec<u64>); 4] = [
+        (
+            "closed latency",
+            &closed.latency,
+            column(&closed, |s| Some(s.latency_ns)),
+        ),
+        ("open latency", &open.latency, column(&open, |s| Some(s.latency_ns))),
+        (
+            "open service",
+            open.service.as_ref().unwrap(),
+            column(&open, |s| s.service_ns),
+        ),
+        (
+            "open lag",
+            open.scheduler_lag.as_ref().unwrap(),
+            column(&open, |s| s.scheduler_lag_ns),
+        ),
+    ];
+    for (name, h, ns) in &series {
+        for (label, q) in QUANTILES.into_iter().chain([("max", 1.0)]) {
+            let v = stats::percentile(ns, q).unwrap() / 1000;
+            let got = h.hist.value_at_quantile(q);
+            assert!(
+                got >= v && got <= v + v / 1024,
+                "{name} {label}: histogram {got} us, raw {v} us"
+            );
+        }
+    }
+}
+
+fn column(result: &RunResult, f: impl Fn(&tailbench::Sample) -> Option<u64>) -> Vec<u64> {
+    result.samples.iter().map(|s| f(s).expect("field recorded")).collect()
+}
+
+const CI_SEED: u64 = 0x5EED;
+
+fn ms_f(ns: u64) -> f64 {
+    ns as f64 / 1e6
+}
+
+/// The 50 frozen requests are one contiguous run in intended-send order.
+/// Block resampling keeps that run in clumps, so how many slow samples a
+/// resample gets varies more than under iid resampling, and the p99 CI must
+/// be at least as wide.
+#[tokio::test(start_paused = true)]
+async fn p99_ci_on_stall_run_mbb_is_at_least_as_wide_as_iid() {
+    let server = FakeServer::starting_now();
+    let open = open_loop(INTERVAL, COUNT, || server.call()).await;
+    let latency = column(&open, |s| Some(s.latency_ns));
+    let block_len = stats::default_block_len(latency.len());
+
+    let mbb = stats::mbb_ci(&latency, 0.99, block_len, DEFAULT_RESAMPLES, CI_SEED, DEFAULT_LEVEL).unwrap();
+    let iid = stats::iid_ci(&latency, 0.99, DEFAULT_RESAMPLES, CI_SEED, DEFAULT_LEVEL).unwrap();
+
+    println!(
+        "open latency p99, n = {}, block_len = {block_len}, resamples = {DEFAULT_RESAMPLES}, level = {DEFAULT_LEVEL}",
+        latency.len()
+    );
+    for (name, ci) in [("mbb", &mbb), ("iid", &iid)] {
+        println!(
+            "{name}: estimate {:.3} ms, CI [{:.3}, {:.3}] ms, width {:.3} ms, warnings {:?}",
+            ms_f(ci.estimate),
+            ms_f(ci.lo),
+            ms_f(ci.hi),
+            ms_f(ci.hi - ci.lo),
+            ci.warnings
+        );
+    }
+
+    assert_eq!(
+        mbb.estimate,
+        401 * MS,
+        "p99 = 40th frozen request, as in the histogram test"
+    );
+    assert_eq!(iid.estimate, mbb.estimate);
+    assert!(
+        mbb.warnings.is_empty() && iid.warnings.is_empty(),
+        "support is exactly 10"
+    );
+    assert!(
+        mbb.hi - mbb.lo >= iid.hi - iid.lo,
+        "mbb CI {:?} narrower than iid CI {:?}",
+        (mbb.lo, mbb.hi),
+        (iid.lo, iid.hi)
+    );
 }

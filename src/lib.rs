@@ -19,6 +19,7 @@ use tokio::time::{Instant, sleep_until};
 
 mod git;
 pub mod manifest;
+pub mod stats;
 
 use manifest::Manifest;
 
@@ -80,6 +81,28 @@ impl CountedHistogram {
     }
 }
 
+/// One request, as raw values.
+///
+/// Every field is whole nanoseconds, saturated at `u64::MAX` (about 584
+/// years). Unlike the histograms, nothing is truncated to microseconds or
+/// clamped to [min, 1 h].
+///
+/// Memory: 48 bytes per sample (`size_of::<Sample>()`, pinned by a test), so
+/// 1M requests keep 48 MB (45.8 MiB) of samples. The runners allocate exactly
+/// `count` of them, so nothing extra goes to `Vec` growth. The histograms have
+/// a fixed size, whatever the count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sample {
+    /// t_intended - schedule start, that is `i * interval` for send `i`.
+    pub intended_offset_ns: u64,
+    /// Same definition as `RunResult::latency` for the runner that made it.
+    pub latency_ns: u64,
+    /// open_loop only: t_done - t_sent.
+    pub service_ns: Option<u64>,
+    /// open_loop only: t_sent - t_intended.
+    pub scheduler_lag_ns: Option<u64>,
+}
+
 /// What a run measured.
 #[derive(Debug)]
 pub struct RunResult {
@@ -89,6 +112,10 @@ pub struct RunResult {
     pub service: Option<CountedHistogram>,
     /// open_loop only: t_sent - t_intended, how late the sender woke up.
     pub scheduler_lag: Option<CountedHistogram>,
+    /// One sample per request, ordered by INTENDED send time (send `i` is at
+    /// index `i`), not by completion. Order matters to `stats`: a stall shows
+    /// up as a contiguous run of slow samples.
+    pub samples: Vec<Sample>,
 }
 
 /// Which runner a run uses.
@@ -144,6 +171,17 @@ fn send_offset(interval: Duration, i: u64) -> Option<Duration> {
     Some(Duration::new(secs, (nanos % NANOS_PER_SEC) as u32))
 }
 
+/// Whole nanoseconds, saturated at `u64::MAX`.
+fn nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// `count` as a buffer length. Panics, before anything is sent, if it cannot
+/// be one.
+fn sample_len(count: u64) -> usize {
+    usize::try_from(count).expect("count fits in usize")
+}
+
 /// Intended send times `start + i * interval` for `i` in `0..count`.
 struct Schedule {
     start: Instant,
@@ -177,6 +215,11 @@ impl Schedule {
     fn at(&self, i: u64) -> Instant {
         self.checked_at(i).expect("checked in Schedule::start_now")
     }
+
+    /// `t - start`, in whole nanoseconds.
+    fn offset_ns(&self, t: Instant) -> u64 {
+        nanos(t - self.start)
+    }
 }
 
 /// PACED closed loop: one client, at most one request in flight.
@@ -197,22 +240,35 @@ where
     Fut: Future<Output = ()>,
 {
     let mut latency = CountedHistogram::new(MIN_LATENCY_US);
+    // Allocated in full before the schedule starts, so the loop never grows it.
+    let mut samples = Vec::with_capacity(sample_len(count));
     let schedule = Schedule::start_now(interval, count);
     for i in 0..count {
-        sleep_until(schedule.at(i)).await;
+        let t_intended = schedule.at(i);
+        sleep_until(t_intended).await;
         let sent = Instant::now();
         call().await;
-        latency.record(sent.elapsed());
+        let took = sent.elapsed();
+        latency.record(took);
+        samples.push(Sample {
+            intended_offset_ns: schedule.offset_ns(t_intended),
+            latency_ns: nanos(took),
+            service_ns: None,
+            scheduler_lag_ns: None,
+        });
     }
     RunResult {
         latency,
         service: None,
         scheduler_lag: None,
+        samples,
     }
 }
 
 /// The three instants of one open-loop request.
 struct Timestamps {
+    /// Index of the send in the schedule.
+    i: usize,
     /// When the schedule said to send (computed before the send).
     t_intended: Instant,
     /// When the sender actually woke up and sent.
@@ -249,9 +305,13 @@ where
     let mut latency = CountedHistogram::new(MIN_LATENCY_US);
     let mut service = CountedHistogram::new(MIN_LATENCY_US);
     let mut scheduler_lag = CountedHistogram::new(MIN_LAG_US);
+    // Allocated before the schedule starts: responses complete in any order,
+    // so each one is written to its send's slot. Every send is joined exactly
+    // once, so every slot is overwritten.
+    let mut samples = vec![Sample::default(); sample_len(count)];
     let mut in_flight = JoinSet::new();
     let schedule = Schedule::start_now(interval, count);
-    for i in 0..count {
+    for (i, slot) in (0..count).zip(0usize..) {
         let t_intended = schedule.at(i);
         sleep_until(t_intended).await;
         let t_sent = Instant::now();
@@ -259,6 +319,7 @@ where
         in_flight.spawn(async move {
             request.await;
             Timestamps {
+                i: slot,
                 t_intended,
                 t_sent,
                 t_done: Instant::now(),
@@ -268,14 +329,26 @@ where
     while let Some(ts) = in_flight.join_next().await {
         let ts = ts.expect("request task panicked");
         // tokio's Instant subtraction saturates at zero, so none can underflow.
-        latency.record(ts.t_done - ts.t_intended);
-        service.record(ts.t_done - ts.t_sent);
-        scheduler_lag.record(ts.t_sent - ts.t_intended);
+        let (lat, svc, lag) = (
+            ts.t_done - ts.t_intended,
+            ts.t_done - ts.t_sent,
+            ts.t_sent - ts.t_intended,
+        );
+        latency.record(lat);
+        service.record(svc);
+        scheduler_lag.record(lag);
+        samples[ts.i] = Sample {
+            intended_offset_ns: schedule.offset_ns(ts.t_intended),
+            latency_ns: nanos(lat),
+            service_ns: Some(nanos(svc)),
+            scheduler_lag_ns: Some(nanos(lag)),
+        };
     }
     RunResult {
         latency,
         service: Some(service),
         scheduler_lag: Some(scheduler_lag),
+        samples,
     }
 }
 
@@ -331,6 +404,13 @@ mod tests {
         assert_eq!(lag.below_min, 0);
         assert_eq!(lag.hist.len(), 2);
         assert_eq!(lag.hist.max(), 0, "both samples stored as exactly 0 us");
+    }
+
+    #[test]
+    fn sample_is_48_bytes() {
+        let bytes = std::mem::size_of::<Sample>();
+        println!("Sample = {bytes} bytes; 1M samples = {} bytes", bytes * 1_000_000);
+        assert_eq!(bytes, 48);
     }
 
     #[test]
