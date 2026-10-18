@@ -45,22 +45,28 @@ pub struct Manifest {
     /// tailbench crate version.
     pub tool_version: &'static str,
     /// `git rev-parse HEAD` of the tailbench source tree when this binary was
-    /// built (from build.rs): the commit the code came from. All four git
-    /// fields are Unknown when the source tree is not the top level of its
-    /// own repository (e.g. vendored inside another project's repository).
+    /// built (from build.rs): the commit the code came from. Unknown when, at
+    /// build time, the crate dir was not the top level of its own repository
+    /// (e.g. vendored inside another project's repository), git was missing,
+    /// or the output was not a full hex object name.
     pub build_git_sha: Probe<String>,
     /// Whether, at build time, `git status --porcelain` listed anything
     /// (untracked files included) under the build-relevant paths only: src/,
     /// build.rs, Cargo.toml, Cargo.lock. true means this binary differs from
-    /// `build_git_sha`.
+    /// `build_git_sha`. Unknown when, at build time, the crate dir was not
+    /// the top level of its own repository or git was missing or failed.
     pub build_git_dirty: Probe<bool>,
     /// `git rev-parse HEAD` of the tailbench source tree (CARGO_MANIFEST_DIR
     /// at build time), read at run time. A cross-check: it describes the
-    /// checkout now, which may have moved since the build.
+    /// checkout now, which may have moved since the build. Unknown when the
+    /// crate dir is not the top level of its own repository, git is missing,
+    /// or the output is not a full hex object name.
     pub runtime_git_sha: Probe<String>,
     /// Whether `git status --porcelain` lists anything at run time, across the
     /// whole repository, untracked files included. Unlike `build_git_dirty`,
-    /// it also counts files that do not change the binary.
+    /// it also counts files that do not change the binary. Unknown when the
+    /// crate dir is not the top level of its own repository or git is
+    /// missing or fails.
     pub runtime_git_dirty: Probe<bool>,
     /// Whether `build_git_sha` and `runtime_git_sha` differ: true means the
     /// checkout moved after this binary was built. Unknown unless both are known.
@@ -91,19 +97,15 @@ impl Manifest {
     /// `uname`. Call it inside the tokio runtime that will drive the run, so
     /// `paused_clock` describes that runtime's clock.
     pub fn collect(config: &RunConfig) -> Self {
-        let source_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        // Like build.rs, ask git only if the repository is tailbench's own,
-        // not a parent repository it was vendored or unpacked into.
-        let source_repo = Some(source_dir).filter(|dir| git::is_repo_top_level(dir));
         let build_git_sha = parse_build_sha(env!("TAILBENCH_BUILD_GIT_SHA"));
-        let runtime_git_sha = source_repo.map_or(Probe::Unknown, git_sha);
+        let (runtime_git_sha, runtime_git_dirty) = runtime_git(Path::new(env!("CARGO_MANIFEST_DIR")));
         let mismatch = sha_mismatch(&build_git_sha, &runtime_git_sha);
         Self {
             tool_version: env!("CARGO_PKG_VERSION"),
             build_git_sha,
             build_git_dirty: parse_build_dirty(env!("TAILBENCH_BUILD_GIT_DIRTY")),
             runtime_git_sha,
-            runtime_git_dirty: source_repo.map_or(Probe::Unknown, git_dirty),
+            runtime_git_dirty,
             sha_mismatch: mismatch,
             os: OS,
             arch: ARCH,
@@ -133,6 +135,17 @@ fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
     }
     let text = String::from_utf8(out.stdout).ok()?;
     Some(text.trim().to_owned())
+}
+
+/// Run-time `(git_sha, git_dirty)` of the tailbench source tree at `dir`.
+/// Like build.rs, git is asked only if `dir` is the top level of its own
+/// repository, not a parent repository tailbench was vendored or unpacked
+/// into; otherwise both are Unknown.
+pub(crate) fn runtime_git(dir: &Path) -> (Probe<String>, Probe<bool>) {
+    if !git::is_repo_top_level(dir) {
+        return (Probe::Unknown, Probe::Unknown);
+    }
+    (git_sha(dir), git_dirty(dir))
 }
 
 /// HEAD of the repository at `dir`, lowercased. Anything but a full hex SHA
@@ -224,7 +237,52 @@ fn clock_is_paused() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+
+    /// Whether `git` can be run at all.
+    fn git_installed() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    /// Whether `test` may assume the crate dir is the top level of its own
+    /// repository, as in a tailbench checkout. In a vendored copy or a
+    /// crates.io tarball it is not, so the test prints why and skips.
+    fn in_own_repo(test: &str) -> bool {
+        let reason = if !git_installed() {
+            "git is not installed"
+        } else if !git::is_repo_top_level(Path::new(env!("CARGO_MANIFEST_DIR"))) {
+            "crate dir is not the top level of its own git repository"
+        } else {
+            return true;
+        };
+        eprintln!("skipping: {test}: {reason}");
+        false
+    }
+
+    /// A new directory under the system temp dir, removed on drop (so also
+    /// when the test panics). `create_dir` fails rather than reuse a path.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+            let name = format!("tailbench-{tag}-{}-{nanos}", std::process::id());
+            let path = std::env::temp_dir().join(name);
+            std::fs::create_dir(&path).expect("create temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn unknown_serializes_as_the_string_unknown() {
@@ -241,6 +299,9 @@ mod tests {
 
     #[test]
     fn git_sha_of_this_repo_is_a_full_hex_sha() {
+        if !in_own_repo("git_sha_of_this_repo_is_a_full_hex_sha") {
+            return;
+        }
         let Probe::Known(sha) = git_sha(Path::new(env!("CARGO_MANIFEST_DIR"))) else {
             panic!("expected a git SHA for the tailbench source tree");
         };
@@ -250,6 +311,9 @@ mod tests {
 
     #[test]
     fn git_ignores_an_inherited_git_dir() {
+        if !in_own_repo("git_ignores_an_inherited_git_dir") {
+            return;
+        }
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut child = Command::new("git");
         child.env("GIT_DIR", "/nonexistent/tailbench-bogus-git-dir");
@@ -260,6 +324,9 @@ mod tests {
 
     #[test]
     fn this_crate_is_the_top_level_of_its_repo() {
+        if !in_own_repo("this_crate_is_the_top_level_of_its_repo") {
+            return;
+        }
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(git::is_repo_top_level(dir));
         // src/ is inside the same repository but is not its top level.
@@ -271,10 +338,51 @@ mod tests {
 
     #[test]
     fn build_git_sha_of_this_repo_is_a_full_hex_sha() {
+        if !in_own_repo("build_git_sha_of_this_repo_is_a_full_hex_sha") {
+            return;
+        }
         let Probe::Known(sha) = parse_build_sha(env!("TAILBENCH_BUILD_GIT_SHA")) else {
             panic!("expected build.rs to record a git SHA for the tailbench source tree");
         };
         assert!(is_full_hex_sha(&sha), "not a full hex SHA: {sha}");
+    }
+
+    #[test]
+    fn runtime_git_is_unknown_inside_a_parent_repo() {
+        if !git_installed() {
+            eprintln!("skipping: runtime_git_is_unknown_inside_a_parent_repo: git is not installed");
+            return;
+        }
+        let parent = TempDir::new("parent-repo");
+        // git::stdout drops inherited GIT_DIR etc., so this cannot touch the
+        // repository the tests are run from.
+        let git = |args: &[&str]| git::stdout(&parent.0, args).unwrap_or_else(|| panic!("git {args:?} failed"));
+        git(&["init", "-q"]);
+        std::fs::write(parent.0.join("file"), "x").expect("write file");
+        git(&["add", "file"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--no-verify",
+            "-m",
+            "init",
+        ]);
+        let parent_sha = git(&["rev-parse", "HEAD"]);
+        // Stands in for tailbench vendored into another project's repository.
+        let vendored = parent.0.join("vendor").join("tailbench");
+        std::fs::create_dir_all(&vendored).expect("create vendored dir");
+        // Precondition: asked directly, git reports the parent's commit here.
+        assert_eq!(git_sha(&vendored), Probe::Known(parent_sha.clone()));
+
+        let (sha, dirty) = runtime_git(&vendored);
+        assert_eq!(sha, Probe::Unknown, "parent repo's SHA {parent_sha} leaked");
+        assert_eq!(dirty, Probe::Unknown, "parent repo's status leaked");
     }
 
     const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
