@@ -34,7 +34,10 @@ struct FakeServer {
 impl FakeServer {
     fn starting_now() -> Self {
         let freeze_start = Instant::now() + FREEZE_AT;
-        Self { freeze_start, freeze_end: freeze_start + FREEZE_FOR }
+        Self {
+            freeze_start,
+            freeze_end: freeze_start + FREEZE_FOR,
+        }
     }
 
     /// Arrival is taken when `call` is invoked (i.e. at send time), not when
@@ -62,7 +65,12 @@ fn report(name: &str, samples: &CountedHistogram) {
     for (_, q) in QUANTILES {
         print!(" {:>9.3}", ms(h.value_at_quantile(q)));
     }
-    println!(" {:>9.3} {:>9} {:>9}", ms(h.max()), samples.below_min, samples.above_max);
+    println!(
+        " {:>9.3} {:>9} {:>9}",
+        ms(h.max()),
+        samples.below_min,
+        samples.above_max
+    );
 }
 
 /// HdrHistogram with 3 significant digits reports the HIGHEST value of the
@@ -139,7 +147,10 @@ async fn stall_is_hidden_by_closed_loop_and_visible_in_open_loop() {
     assert_samples("open_loop service", open_service, [1, 1, 401, 491, 501]);
 
     assert!(closed.service.is_none(), "closed loop does not split service time");
-    assert!(closed.scheduler_lag.is_none(), "closed loop does not split scheduler lag");
+    assert!(
+        closed.scheduler_lag.is_none(),
+        "closed loop does not split scheduler lag"
+    );
 
     assert_eq!(open_lag.hist.len(), COUNT, "one lag sample per request");
     assert_eq!(open_lag.below_min + open_lag.above_max, 0, "lag never altered");
