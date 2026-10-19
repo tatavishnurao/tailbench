@@ -33,19 +33,34 @@ pub const DEFAULT_MIN_EFFECT: Duration = Duration::from_millis(1);
 /// How `compare` puts a CI on delta. The refusals, the warnings, the
 /// `MIN_RUNS` rule, the episode guard and `min_effect` are the same for
 /// both; they differ in what delta is and how its interval is computed.
+///
+/// PerRunWelch is the default because it holds its nominal false-verdict
+/// rate across the settings in docs/calibration.md, and Hierarchical does
+/// not once runs differ by 10% or more (its interval is too narrow for R of
+/// 3 to 10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompareMethod {
     /// delta = the percentile of B's runs pooled minus that of A's. The CI
     /// is the percentile interval of paired `stats::hier_ci` bootstrap
     /// draws (`DEFAULT_RESAMPLES`, `DEFAULT_SEED`). Runs weigh by length.
-    #[default]
     Hierarchical,
     /// Each run's percentile is one observation, so each run weighs the
     /// same: delta = the mean of B's per-run percentiles minus the mean of
     /// A's, and the CI is Welch's t interval with Welch-Satterthwaite df
     /// (`stats::welch_ci`). No resampling: `Comparison::resamples` and
     /// `seed` do not apply.
+    #[default]
     PerRunWelch,
+}
+
+impl CompareMethod {
+    /// What delta is a difference of: "pooled" or "mean per-run".
+    pub fn estimand(self) -> &'static str {
+        match self {
+            CompareMethod::Hierarchical => "pooled",
+            CompareMethod::PerRunWelch => "mean per-run",
+        }
+    }
 }
 
 /// One run's result with the manifest written for it.
@@ -125,7 +140,7 @@ pub struct Comparison {
 }
 
 /// Compares the `q` percentile of latency between runs `a` and `b`, by the
-/// default `CompareMethod` (Hierarchical): `compare_with` with that method.
+/// default `CompareMethod` (PerRunWelch): `compare_with` with that method.
 pub fn compare(a: &[RecordedRun], b: &[RecordedRun], q: f64, min_effect: Duration) -> Comparison {
     compare_with(a, b, q, min_effect, CompareMethod::default())
 }
@@ -298,7 +313,7 @@ fn decide(
     }
     if pooled_a.episodes < MIN_EPISODES || pooled_b.episodes < MIN_EPISODES {
         reasons.push(format!(
-            "episode-limited: {} tail episodes at or above A's {p} ({} ms) and {} at or above B's ({} ms), want >= \
+            "episode-limited: {} tail episodes at or above A's pooled {p} ({} ms) and {} at or above B's ({} ms), want >= \
              {MIN_EPISODES} each",
             pooled_a.episodes,
             unsigned_ms(diff(pooled_a.estimate, 0), d),
@@ -491,33 +506,32 @@ impl CompareWarning {
     }
 }
 
-/// One line, for example "B slower at p99 by 401.0 ms [380.2, 452.9], 5 vs
-/// 5 runs, nominal 95%, 2000 resamples, seed 0xA5EED0000000000A", followed
-/// by any warning not already given as a reason. PerRunWelch ends "nominal
-/// 95%, per-run Welch t, df 7.3" instead. A refusal computed no CI, so it
-/// shows no level, method, resamples or seed.
+/// One line that names the estimand, for example "B slower at p99 (mean
+/// per-run) by 5.9 ms [2.1, 9.7], 5 vs 5 runs, Welch t df 7.4, nominal 95%"
+/// or "B slower at p99 (pooled) by 401.0 ms [380.2, 452.9], 5 vs 5 runs,
+/// hierarchical bootstrap, 2000 resamples, seed 0xA5EED0000000000A, nominal
+/// 95%", followed by any warning not already given as a reason. A refusal
+/// computed no estimate or CI, so it shows no estimand, method or level.
 impl fmt::Display for Comparison {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let p = stats::quantile_label(self.q);
         let runs = format!("{} vs {} runs", self.runs_a, self.runs_b);
-        let level = match (self.method, self.df) {
+        let method = match (self.method, self.df) {
             (CompareMethod::Hierarchical, _) => format!(
-                "nominal {}%, {} resamples, seed {:#018X}",
-                self.level * 100.0,
-                self.resamples,
-                self.seed
+                "hierarchical bootstrap, {} resamples, seed {:#018X}",
+                self.resamples, self.seed
             ),
-            (CompareMethod::PerRunWelch, Some(df)) => {
-                format!("nominal {}%, per-run Welch t, df {df:.1}", self.level * 100.0)
-            }
-            (CompareMethod::PerRunWelch, None) => format!("nominal {}%, per-run Welch t", self.level * 100.0),
+            (CompareMethod::PerRunWelch, Some(df)) => format!("Welch t df {df:.1}"),
+            (CompareMethod::PerRunWelch, None) => "Welch t, no CI".to_owned(),
         };
+        let level = format!("{method}, nominal {}%", self.level * 100.0);
+        let at = format!("{p} ({})", self.method.estimand());
         match &self.verdict {
             Verdict::Slower { delta, lo, hi } => {
                 let d = decimals_for(*delta);
                 write!(
                     f,
-                    "B slower at {p} by {} ms [{}, {}], {runs}, {level}",
+                    "B slower at {at} by {} ms [{}, {}], {runs}, {level}",
                     unsigned_ms(*delta, d),
                     unsigned_ms(*lo, d),
                     unsigned_ms(*hi, d)
@@ -528,13 +542,13 @@ impl fmt::Display for Comparison {
                 let d = decimals_for(*delta);
                 write!(
                     f,
-                    "B faster at {p} by {} ms [{}, {}], {runs}, {level}",
+                    "B faster at {at} by {} ms [{}, {}], {runs}, {level}",
                     unsigned_ms(-delta, d),
                     unsigned_ms(-hi, d),
                     unsigned_ms(-lo, d)
                 )?;
             }
-            Verdict::Inconclusive { reason } => write!(f, "inconclusive at {p}: {reason}, {runs}, {level}")?,
+            Verdict::Inconclusive { reason } => write!(f, "inconclusive at {at}: {reason}, {runs}, {level}")?,
             Verdict::Refused { reason } => write!(f, "refused at {p}: {reason}, {runs}")?,
         }
         let shown: Vec<String> = self
@@ -629,19 +643,26 @@ mod tests {
         assert!(c.to_string().contains("pooling weights runs by length"));
     }
 
+    /// Hierarchical names its estimand "pooled" and records its bootstrap.
     #[test]
     fn comparison_records_seed_and_resamples() {
         let model = model();
         let m = model.manifest();
-        let c = compare(
+        let c = compare_with(
             &runs(&model, &m, 0, 1.0),
             &runs(&model, &m, 100, 1.0),
             0.5,
             DEFAULT_MIN_EFFECT,
+            CompareMethod::Hierarchical,
         );
         println!("{c}");
         assert_eq!((c.seed, c.resamples), (DEFAULT_SEED, DEFAULT_RESAMPLES));
-        assert!(c.to_string().contains("2000 resamples, seed 0xA5EED0000000000A"), "{c}");
+        let line = c.to_string();
+        assert!(line.starts_with("inconclusive at p50 (pooled): "), "{c}");
+        assert!(
+            line.contains("hierarchical bootstrap, 2000 resamples, seed 0xA5EED0000000000A, nominal 95%"),
+            "{c}"
+        );
     }
 
     /// B 5% slower: 0.5 ms at the 10 ms median. The CI resolves it, so with
@@ -690,15 +711,16 @@ mod tests {
             }
         );
         assert_eq!((c.method, c.df), (CompareMethod::PerRunWelch, Some(want.df)));
+        let line = c.to_string();
+        assert!(line.starts_with("B slower at p99 (mean per-run) by "), "{c}");
         assert!(
-            c.to_string().contains(&format!("per-run Welch t, df {:.1}", want.df)),
+            line.ends_with(&format!(", 5 vs 5 runs, Welch t df {:.1}, nominal 95%", want.df)),
             "{c}"
         );
         assert!(!c.to_string().contains("resamples"), "{c}");
-        assert_eq!(
-            compare(&a, &b, 0.99, DEFAULT_MIN_EFFECT).method,
-            CompareMethod::Hierarchical
-        );
+        // PerRunWelch is the default: `compare` gives the same comparison.
+        assert_eq!(compare(&a, &b, 0.99, DEFAULT_MIN_EFFECT), c);
+        assert_eq!(CompareMethod::default(), CompareMethod::PerRunWelch);
     }
 
     /// The refusals, the R < MIN_RUNS rule and the episode guard do not
