@@ -22,6 +22,8 @@ use crate::{CountedHistogram, MIN_LAG_US, MIN_LATENCY_US, RunConfig, RunResult, 
 /// - offset ~ N(0, run_sd_ns^2), drawn once per run before x_0: every
 ///   sample of the run is shifted by it (between-run variance).
 /// - Rounded to whole nanoseconds; a negative value saturates at 0.
+/// - With `stall` set, a stalled run also adds `extra_ns` to each of a
+///   contiguous `fraction` of its samples (see `Stall`).
 ///
 /// Sample i is intended at i * interval; service = latency and scheduler
 /// lag = 0, as on a perfect timer.
@@ -31,9 +33,27 @@ pub(crate) struct Synth {
     pub sigma: f64,
     pub phi: f64,
     pub run_sd_ns: f64,
+    pub stall: Option<Stall>,
     /// Samples per run.
     pub n: usize,
     pub interval: Duration,
+}
+
+/// A run stalls with probability `prob`; a stall adds `extra_ns` to every
+/// sample of a contiguous `round(fraction * n)` samples starting at a
+/// uniform position. The stall is the machine, not the code under test, so
+/// `scale` does not apply to it. Whether and where a run stalls is drawn
+/// from a stream of its own, so adding a stall leaves the body unchanged.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Stall {
+    pub prob: f64,
+    pub extra_ns: f64,
+    pub fraction: f64,
+}
+
+impl Stall {
+    /// XORed into a run's seed to seed its stall stream.
+    const STREAM: u64 = 0x57A1_1000_0000_0000;
 }
 
 impl Synth {
@@ -47,6 +67,7 @@ impl Synth {
             sigma,
             phi,
             run_sd_ns,
+            stall: None,
             n: 1000,
             interval: Duration::from_millis(10),
         }
@@ -57,14 +78,24 @@ impl Synth {
         let offset = self.run_sd_ns * rng.normal();
         let innovation = (1.0 - self.phi * self.phi).sqrt();
         let interval_ns = u64::try_from(self.interval.as_nanos()).expect("interval fits in u64 ns");
+        let stalled = self.stall.and_then(|stall| {
+            let mut rng = SplitMix64::new(seed ^ Stall::STREAM);
+            let len = ((stall.fraction * self.n as f64).round() as usize).min(self.n);
+            let start = (rng.next_f64() * (self.n - len + 1) as f64) as usize;
+            (rng.next_f64() < stall.prob).then_some((start..start + len, stall.extra_ns))
+        });
         let mut x = rng.normal();
         (0u64..)
             .take(self.n)
             .map(|i| {
                 let body = self.median_ns * (self.sigma * x).exp();
                 x = self.phi * x + innovation * rng.normal();
+                let extra = match &stalled {
+                    Some((range, extra_ns)) if range.contains(&(i as usize)) => *extra_ns,
+                    _ => 0.0,
+                };
                 // f64 -> u64 `as` saturates: negative values become 0.
-                let ns = (scale * (body + offset)).round() as u64;
+                let ns = (scale * (body + offset) + extra).round() as u64;
                 Sample {
                     intended_offset_ns: i * interval_ns,
                     latency_ns: ns,
@@ -79,18 +110,22 @@ impl Synth {
     /// set clean so results do not depend on the working tree. Blocking (runs
     /// git): collect once, then clone per run.
     pub fn manifest(&self) -> Manifest {
-        let config = RunConfig {
+        let mut m = Manifest::collect(&self.config());
+        m.build_git_dirty = Probe::Known(false);
+        m.runtime_git_dirty = Probe::Known(false);
+        m.sha_mismatch = Probe::Known(false);
+        m
+    }
+
+    /// The open-loop config a real run of this model would have.
+    pub fn config(&self) -> RunConfig {
+        RunConfig {
             kind: RunnerKind::OpenLoop,
             interval: self.interval,
             count: self.n as u64,
             seed: None,
             extra: BTreeMap::from([("target".to_owned(), "synth".to_owned())]),
-        };
-        let mut m = Manifest::collect(&config);
-        m.build_git_dirty = Probe::Known(false);
-        m.runtime_git_dirty = Probe::Known(false);
-        m.sha_mismatch = Probe::Known(false);
-        m
+        }
     }
 
     /// `samples(seed, scale)` as an open-loop run, histograms included.
@@ -189,5 +224,32 @@ mod tests {
         assert!((sd / 3e5 - 1.0).abs() < 0.1, "offset sd {sd}");
         let (one, scaled) = (m.samples(9, 1.0)[0].latency_ns, m.samples(9, 1.1)[0].latency_ns);
         assert!(scaled.abs_diff(one * 11 / 10) <= 1, "{one} {scaled}");
+    }
+
+    /// A stall adds `extra_ns` to a contiguous `fraction` of a stalled
+    /// run, unscaled, in about `prob` of runs, and changes nothing else.
+    #[test]
+    fn stall_hits_contiguous_fraction_of_some_runs() {
+        let plain = Synth::new(0.5, 0.5, 3e5);
+        let mut m = plain;
+        m.stall = Some(Stall {
+            prob: 0.2,
+            extra_ns: 300e6,
+            fraction: 0.02,
+        });
+        let mut stalled_runs = 0;
+        for seed in 0..1000 {
+            let (base, with) = (latencies(&plain.samples(seed, 1.1)), latencies(&m.samples(seed, 1.1)));
+            let hit: Vec<usize> = (0..base.len()).filter(|&i| with[i] != base[i]).collect();
+            if hit.is_empty() {
+                continue;
+            }
+            stalled_runs += 1;
+            assert_eq!(hit.len(), 20, "seed {seed}");
+            assert_eq!(hit[19] - hit[0], 19, "seed {seed}: not contiguous");
+            assert!(hit.iter().all(|&i| with[i] - base[i] == 300_000_000), "seed {seed}");
+        }
+        println!("{stalled_runs} of 1000 runs stalled (want about 200)");
+        assert!((150..=250).contains(&stalled_runs), "{stalled_runs}");
     }
 }

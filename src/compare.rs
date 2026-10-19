@@ -12,7 +12,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::manifest::{Manifest, Probe};
-use crate::stats::{self, CiWarning, DEFAULT_LEVEL, DEFAULT_RESAMPLES, MIN_EPISODES, MIN_RUNS, SplitMix64};
+use crate::stats::{self, CiWarning, DEFAULT_LEVEL, DEFAULT_RESAMPLES, MIN_EPISODES, MIN_RUNS, Pooled, SplitMix64};
 use crate::{RunResult, RunnerKind, Sample};
 
 /// Bootstrap seed `compare` uses, fixed so a comparison is deterministic.
@@ -29,6 +29,24 @@ pub const DEFAULT_SEED: u64 = 0xA5EE_D000_0000_000A;
 /// Pass a larger value for a slower timer; pass `Duration::ZERO` only for
 /// data that is not timed by tokio.
 pub const DEFAULT_MIN_EFFECT: Duration = Duration::from_millis(1);
+
+/// How `compare` puts a CI on delta. The refusals, the warnings, the
+/// `MIN_RUNS` rule, the episode guard and `min_effect` are the same for
+/// both; they differ in what delta is and how its interval is computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompareMethod {
+    /// delta = the percentile of B's runs pooled minus that of A's. The CI
+    /// is the percentile interval of paired `stats::hier_ci` bootstrap
+    /// draws (`DEFAULT_RESAMPLES`, `DEFAULT_SEED`). Runs weigh by length.
+    #[default]
+    Hierarchical,
+    /// Each run's percentile is one observation, so each run weighs the
+    /// same: delta = the mean of B's per-run percentiles minus the mean of
+    /// A's, and the CI is Welch's t interval with Welch-Satterthwaite df
+    /// (`stats::welch_ci`). No resampling: `Comparison::resamples` and
+    /// `seed` do not apply.
+    PerRunWelch,
+}
 
 /// One run's result with the manifest written for it.
 #[derive(Debug)]
@@ -94,34 +112,56 @@ pub struct Comparison {
     pub runs_b: usize,
     /// Nominal confidence level of the delta CI.
     pub level: f64,
-    /// Bootstrap resamples per group, and the seed (see `DEFAULT_SEED`).
-    /// Rerunning `compare` on the same runs reproduces the same CI.
+    pub method: CompareMethod,
+    /// Hierarchical only: bootstrap resamples per group, and the seed (see
+    /// `DEFAULT_SEED`). Rerunning `compare` on the same runs reproduces the
+    /// same CI.
     pub resamples: usize,
     pub seed: u64,
+    /// PerRunWelch only: the Welch-Satterthwaite df of the CI. `None` for
+    /// Hierarchical, a refusal, or a group with fewer than 2 runs.
+    pub df: Option<f64>,
     pub warnings: Vec<CompareWarning>,
+}
+
+/// Compares the `q` percentile of latency between runs `a` and `b`, by the
+/// default `CompareMethod` (Hierarchical): `compare_with` with that method.
+pub fn compare(a: &[RecordedRun], b: &[RecordedRun], q: f64, min_effect: Duration) -> Comparison {
+    compare_with(a, b, q, min_effect, CompareMethod::default())
 }
 
 /// Compares the `q` percentile of latency between runs `a` and `b`.
 ///
-/// Each group gets a `stats::hier_ci` bootstrap (`DEFAULT_RESAMPLES`,
-/// `DEFAULT_SEED`); runs are pooled weighted by their length (see
-/// `stats::hier_ci`). Resample i of B minus resample i of A gives the bootstrap
-/// distribution of delta, and its percentile interval at `DEFAULT_LEVEL` is
-/// the CI. The verdict is Slower or Faster only if none of these holds:
+/// Hierarchical: each group gets a `stats::hier_ci` bootstrap
+/// (`DEFAULT_RESAMPLES`, `DEFAULT_SEED`); runs are pooled weighted by their
+/// length (see `stats::hier_ci`). Resample i of B minus resample i of A
+/// gives the bootstrap distribution of delta, and its percentile interval
+/// at `DEFAULT_LEVEL` is the CI. PerRunWelch: see `CompareMethod`.
+///
+/// The episode guard and the CI warnings are those of `stats::hier_ci` on
+/// each group, whichever the method: episodes are counted at the POOLED
+/// percentile. The verdict is Slower or Faster only if none of these holds:
 /// - either group has fewer than `MIN_RUNS` runs;
 /// - either group's estimate is episode-limited (fewer than `MIN_EPISODES`
 ///   episodes at or above it); a sample-count shortfall is only a warning;
-/// - the CI of delta contains 0, or does not contain delta itself;
+/// - there is no CI (PerRunWelch with fewer than 2 runs in a group), or
+///   the CI of delta contains 0, or does not contain delta itself;
 /// - |delta| < `min_effect` (usually `DEFAULT_MIN_EFFECT`).
 ///
 /// Refused, with no CI, if a group is empty, a run has no samples, runners
 /// differ, or any run is closed-loop.
-pub fn compare(a: &[RecordedRun], b: &[RecordedRun], q: f64, min_effect: Duration) -> Comparison {
+pub fn compare_with(
+    a: &[RecordedRun],
+    b: &[RecordedRun],
+    q: f64,
+    min_effect: Duration,
+    method: CompareMethod,
+) -> Comparison {
     stats::check_quantile(q);
     let mut warnings = manifest_warnings(a, b);
-    let verdict = match refusal(a, b) {
-        Some(reason) => Verdict::Refused { reason },
-        None => decide(a, b, q, min_effect, &mut warnings),
+    let (verdict, df) = match refusal(a, b) {
+        Some(reason) => (Verdict::Refused { reason }, None),
+        None => decide(a, b, q, min_effect, method, &mut warnings),
     };
     Comparison {
         verdict,
@@ -129,8 +169,10 @@ pub fn compare(a: &[RecordedRun], b: &[RecordedRun], q: f64, min_effect: Duratio
         runs_a: a.len(),
         runs_b: b.len(),
         level: DEFAULT_LEVEL,
+        method,
         resamples: DEFAULT_RESAMPLES,
         seed: DEFAULT_SEED,
+        df,
         warnings,
     }
 }
@@ -179,61 +221,100 @@ fn samples(runs: &[RecordedRun]) -> Vec<&[Sample]> {
     runs.iter().map(|r| r.result.samples.as_slice()).collect()
 }
 
-/// The verdict for runs that passed `refusal`; adds each group's CI warnings
-/// to `warnings`.
+/// Nanoseconds in f64 rounded to i64 (`as` saturates).
+fn round_ns(ns: f64) -> i64 {
+    ns.round() as i64
+}
+
+/// Hierarchical: delta of the pooled estimates, and the percentile interval
+/// of paired bootstrap draws.
+fn hierarchical_delta(pooled_a: &Pooled, pooled_b: &Pooled, q: f64) -> (i64, Option<(i64, i64)>) {
+    let boot_a = pooled_a.hier_draws(q, DEFAULT_RESAMPLES, DEFAULT_SEED);
+    let boot_b = pooled_b.hier_draws(q, DEFAULT_RESAMPLES, SplitMix64::new(DEFAULT_SEED).next_u64());
+    // A's and B's resamples are independent, so pairing them by index gives
+    // draws of q(B*) - q(A*).
+    let mut deltas: Vec<i64> = boot_b.iter().zip(&boot_a).map(|(&b, &a)| diff(b, a)).collect();
+    deltas.sort_unstable();
+    let (lo_rank, hi_rank) = stats::interval_ranks(DEFAULT_RESAMPLES, DEFAULT_LEVEL);
+    let delta = diff(pooled_b.estimate, pooled_a.estimate);
+    (delta, Some((deltas[lo_rank - 1], deltas[hi_rank - 1])))
+}
+
+/// PerRunWelch: delta of the means of per-run percentiles, its Welch
+/// interval, and the interval's df.
+fn welch_delta(pooled_a: &Pooled, pooled_b: &Pooled, q: f64) -> (i64, Option<(i64, i64)>, Option<f64>) {
+    let per_run = |p: &Pooled| -> Vec<f64> {
+        p.latencies
+            .iter()
+            .map(|run| stats::percentile(run, q).expect("runs are not empty") as f64)
+            .collect()
+    };
+    let (qa, qb) = (per_run(pooled_a), per_run(pooled_b));
+    let mean = |x: &[f64]| x.iter().sum::<f64>() / x.len() as f64;
+    match stats::welch_ci(&qa, &qb, DEFAULT_LEVEL) {
+        Some(ci) => (
+            round_ns(ci.delta),
+            Some((round_ns(ci.lo), round_ns(ci.hi))),
+            Some(ci.df),
+        ),
+        None => (round_ns(mean(&qb) - mean(&qa)), None, None),
+    }
+}
+
+/// The verdict for runs that passed `refusal`, and the CI's df for
+/// PerRunWelch; adds each group's CI warnings to `warnings`.
 fn decide(
     a: &[RecordedRun],
     b: &[RecordedRun],
     q: f64,
     min_effect: Duration,
+    method: CompareMethod,
     warnings: &mut Vec<CompareWarning>,
-) -> Verdict {
-    let boot = |runs, seed| {
-        stats::hier_bootstrap(&samples(runs), q, DEFAULT_RESAMPLES, seed, DEFAULT_LEVEL)
-            .expect("refusal rules out empty groups and runs")
-    };
-    let (ci_a, boot_a) = boot(a, DEFAULT_SEED);
-    let (ci_b, boot_b) = boot(b, SplitMix64::new(DEFAULT_SEED).next_u64());
-    for (group, ci) in [(Group::A, &ci_a), (Group::B, &ci_b)] {
-        warnings.extend(ci.warnings.iter().map(|w| CompareWarning::Ci {
+) -> (Verdict, Option<f64>) {
+    let pooled = |runs| Pooled::new(&samples(runs), q).expect("refusal rules out empty groups and runs");
+    let (pooled_a, pooled_b) = (pooled(a), pooled(b));
+    for (group, p) in [(Group::A, &pooled_a), (Group::B, &pooled_b)] {
+        warnings.extend(p.warnings.iter().map(|w| CompareWarning::Ci {
             group,
             warning: w.clone(),
         }));
     }
-
-    // A's and B's resamples are independent, so pairing them by index gives
-    // draws of q(B*) - q(A*).
-    let delta = diff(ci_b.estimate, ci_a.estimate);
-    let mut deltas: Vec<i64> = boot_b.iter().zip(&boot_a).map(|(&b, &a)| diff(b, a)).collect();
-    deltas.sort_unstable();
-    let (lo_rank, hi_rank) = stats::interval_ranks(DEFAULT_RESAMPLES, DEFAULT_LEVEL);
-    let (lo, hi) = (deltas[lo_rank - 1], deltas[hi_rank - 1]);
+    let (delta, ci, df) = match method {
+        CompareMethod::Hierarchical => {
+            let (delta, ci) = hierarchical_delta(&pooled_a, &pooled_b, q);
+            (delta, ci, None)
+        }
+        CompareMethod::PerRunWelch => welch_delta(&pooled_a, &pooled_b, q),
+    };
 
     let p = stats::quantile_label(q);
     let d = decimals_for(delta);
+    let (runs_a, runs_b) = (pooled_a.latencies.len(), pooled_b.latencies.len());
     let mut reasons = Vec::new();
-    if ci_a.runs < MIN_RUNS || ci_b.runs < MIN_RUNS {
+    if runs_a < MIN_RUNS || runs_b < MIN_RUNS {
         reasons.push(format!(
-            "R < {MIN_RUNS} (A: {}, B: {}): between-run variance unknown",
-            ci_a.runs, ci_b.runs
+            "R < {MIN_RUNS} (A: {runs_a}, B: {runs_b}): between-run variance unknown"
         ));
     }
-    if ci_a.episodes < MIN_EPISODES || ci_b.episodes < MIN_EPISODES {
+    if pooled_a.episodes < MIN_EPISODES || pooled_b.episodes < MIN_EPISODES {
         reasons.push(format!(
             "episode-limited: {} tail episodes at or above A's {p} ({} ms) and {} at or above B's ({} ms), want >= \
              {MIN_EPISODES} each",
-            ci_a.episodes,
-            unsigned_ms(diff(ci_a.estimate, 0), d),
-            ci_b.episodes,
-            unsigned_ms(diff(ci_b.estimate, 0), d)
+            pooled_a.episodes,
+            unsigned_ms(diff(pooled_a.estimate, 0), d),
+            pooled_b.episodes,
+            unsigned_ms(diff(pooled_b.estimate, 0), d)
         ));
     }
-    if lo <= 0 && hi >= 0 {
-        reasons.push("CI of delta crosses 0".to_owned());
-    } else if (lo > 0) != (delta > 0) {
+    match ci {
+        None => reasons.push("no CI of delta: Welch needs >= 2 runs per group".to_owned()),
+        Some((lo, hi)) if lo <= 0 && hi >= 0 => reasons.push("CI of delta crosses 0".to_owned()),
         // Possible with a percentile interval, if rare: it is not centred
         // on the estimate.
-        reasons.push("CI of delta excludes 0 on the other side of delta".to_owned());
+        Some((lo, _)) if (lo > 0) != (delta > 0) => {
+            reasons.push("CI of delta excludes 0 on the other side of delta".to_owned());
+        }
+        Some(_) => {}
     }
     let min_ns = i64::try_from(min_effect.as_nanos()).unwrap_or(i64::MAX);
     if delta.unsigned_abs() < min_ns.unsigned_abs() {
@@ -243,22 +324,30 @@ fn decide(
         ));
     }
 
-    if !reasons.is_empty() {
-        let numbers = format!(
-            "delta {} ms [{}, {}]",
-            signed_ms(delta, d),
-            signed_ms(lo, d),
-            signed_ms(hi, d)
-        );
-        return Verdict::Inconclusive {
-            reason: format!("{} ({numbers})", reasons.join("; ")),
-        };
-    }
-    if delta > 0 {
-        Verdict::Slower { delta, lo, hi }
-    } else {
-        Verdict::Faster { delta, lo, hi }
-    }
+    let verdict = match ci {
+        Some((lo, hi)) if reasons.is_empty() => {
+            if delta > 0 {
+                Verdict::Slower { delta, lo, hi }
+            } else {
+                Verdict::Faster { delta, lo, hi }
+            }
+        }
+        _ => {
+            let numbers = match ci {
+                Some((lo, hi)) => format!(
+                    "delta {} ms [{}, {}]",
+                    signed_ms(delta, d),
+                    signed_ms(lo, d),
+                    signed_ms(hi, d)
+                ),
+                None => format!("delta {} ms, no CI", signed_ms(delta, d)),
+            };
+            Verdict::Inconclusive {
+                reason: format!("{} ({numbers})", reasons.join("; ")),
+            }
+        }
+    };
+    (verdict, df)
 }
 
 /// `p` as a string, "UNKNOWN" when it is Unknown.
@@ -404,18 +493,25 @@ impl CompareWarning {
 
 /// One line, for example "B slower at p99 by 401.0 ms [380.2, 452.9], 5 vs
 /// 5 runs, nominal 95%, 2000 resamples, seed 0xA5EED0000000000A", followed
-/// by any warning not already given as a reason. A refusal ran no bootstrap,
-/// so it shows no level, resamples or seed.
+/// by any warning not already given as a reason. PerRunWelch ends "nominal
+/// 95%, per-run Welch t, df 7.3" instead. A refusal computed no CI, so it
+/// shows no level, method, resamples or seed.
 impl fmt::Display for Comparison {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let p = stats::quantile_label(self.q);
         let runs = format!("{} vs {} runs", self.runs_a, self.runs_b);
-        let level = format!(
-            "nominal {}%, {} resamples, seed {:#018X}",
-            self.level * 100.0,
-            self.resamples,
-            self.seed
-        );
+        let level = match (self.method, self.df) {
+            (CompareMethod::Hierarchical, _) => format!(
+                "nominal {}%, {} resamples, seed {:#018X}",
+                self.level * 100.0,
+                self.resamples,
+                self.seed
+            ),
+            (CompareMethod::PerRunWelch, Some(df)) => {
+                format!("nominal {}%, per-run Welch t, df {df:.1}", self.level * 100.0)
+            }
+            (CompareMethod::PerRunWelch, None) => format!("nominal {}%, per-run Welch t", self.level * 100.0),
+        };
         match &self.verdict {
             Verdict::Slower { delta, lo, hi } => {
                 let d = decimals_for(*delta);
@@ -565,5 +661,90 @@ mod tests {
             panic!("expected Inconclusive: {default}");
         };
         assert!(reason.contains("effect below min_effect: |delta| < 1.0 ms"), "{reason}");
+    }
+
+    /// PerRunWelch: delta is the mean of B's per-run p99 minus the mean of
+    /// A's, and the CI is `stats::welch_ci` on those per-run values.
+    #[test]
+    fn per_run_welch_is_welch_on_per_run_quantiles() {
+        let model = model();
+        let m = model.manifest();
+        let (a, b) = (runs(&model, &m, 0, 1.0), runs(&model, &m, 100, 1.3));
+        let c = compare_with(&a, &b, 0.99, DEFAULT_MIN_EFFECT, CompareMethod::PerRunWelch);
+        println!("{c}");
+        let per_run = |runs: &[RecordedRun]| -> Vec<f64> {
+            runs.iter()
+                .map(|r| {
+                    let lat: Vec<u64> = r.result.samples.iter().map(|s| s.latency_ns).collect();
+                    stats::percentile(&lat, 0.99).unwrap() as f64
+                })
+                .collect()
+        };
+        let want = stats::welch_ci(&per_run(&a), &per_run(&b), DEFAULT_LEVEL).unwrap();
+        assert_eq!(
+            c.verdict,
+            Verdict::Slower {
+                delta: want.delta.round() as i64,
+                lo: want.lo.round() as i64,
+                hi: want.hi.round() as i64,
+            }
+        );
+        assert_eq!((c.method, c.df), (CompareMethod::PerRunWelch, Some(want.df)));
+        assert!(
+            c.to_string().contains(&format!("per-run Welch t, df {:.1}", want.df)),
+            "{c}"
+        );
+        assert!(!c.to_string().contains("resamples"), "{c}");
+        assert_eq!(
+            compare(&a, &b, 0.99, DEFAULT_MIN_EFFECT).method,
+            CompareMethod::Hierarchical
+        );
+    }
+
+    /// The refusals, the R < MIN_RUNS rule and the episode guard do not
+    /// depend on the method.
+    #[test]
+    fn both_methods_share_refusals_and_guards() {
+        let model = model();
+        let m = model.manifest();
+        let (a, b) = (runs(&model, &m, 0, 1.0), runs(&model, &m, 100, 1.0));
+
+        let mut closed = runs(&model, &m, 200, 1.0);
+        closed[0].manifest.runner = RunnerKind::ClosedLoop;
+
+        // Every A run constant at 10 ms but one, which holds a single
+        // 60-sample stall at 300 ms: the pooled p99 (rank 4950 of 5000) lies
+        // in that one stall, so it is one episode.
+        let flat = Synth::new(0.0, 0.0, 0.0);
+        let mut stalled = runs(&flat, &m, 0, 1.0);
+        let mut s = stalled[2].result.samples.clone();
+        for x in &mut s[400..460] {
+            x.latency_ns = 300_000_000;
+            x.service_ns = Some(300_000_000);
+        }
+        stalled[2].result = crate::synth::run_result(s);
+
+        for method in [CompareMethod::Hierarchical, CompareMethod::PerRunWelch] {
+            let c = compare_with(&a[..2], &b[..2], 0.5, Duration::ZERO, method);
+            println!("{c}");
+            assert!(
+                matches!(&c.verdict, Verdict::Inconclusive { reason } if reason.contains("R < 3 (A: 2, B: 2)")),
+                "{method:?}: {c}"
+            );
+            let c = compare_with(&a, &closed, 0.5, Duration::ZERO, method);
+            assert!(matches!(c.verdict, Verdict::Refused { .. }), "{method:?}: {c}");
+            assert_eq!(c.df, None);
+            let c = compare_with(&stalled, &b, 0.99, Duration::ZERO, method);
+            println!("{c}");
+            assert!(
+                matches!(&c.verdict, Verdict::Inconclusive { reason } if reason.contains("episode-limited: 1 tail episodes")),
+                "{method:?}: {c}"
+            );
+        }
+        // One run per group: Welch has no variance, so no CI at all.
+        let c = compare_with(&a[..1], &b[..1], 0.5, Duration::ZERO, CompareMethod::PerRunWelch);
+        println!("{c}");
+        assert!(c.to_string().contains("no CI of delta"), "{c}");
+        assert!(c.to_string().contains(", no CI)"), "{c}");
     }
 }

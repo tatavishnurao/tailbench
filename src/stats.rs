@@ -383,85 +383,268 @@ pub struct HierCi {
 /// Panics if `q` is not in [0, 1], `level` is not in (0, 1), or `resamples`
 /// is 0.
 pub fn hier_ci(runs: &[&[Sample]], q: f64, resamples: usize, seed: u64, level: f64) -> Option<HierCi> {
-    hier_bootstrap(runs, q, resamples, seed, level).map(|(ci, _)| ci)
-}
-
-/// `hier_ci`, plus the `resamples` bootstrap percentiles in the order drawn
-/// (unsorted), for callers that combine two groups resample by resample.
-pub(crate) fn hier_bootstrap(
-    runs: &[&[Sample]],
-    q: f64,
-    resamples: usize,
-    seed: u64,
-    level: f64,
-) -> Option<(HierCi, Vec<u64>)> {
     check_quantile(q);
     assert!(level > 0.0 && level < 1.0, "level {level} is not in (0, 1)");
     assert!(resamples > 0, "resamples must be at least 1");
-    if runs.is_empty() || runs.iter().any(|run| run.is_empty()) {
+    let pooled = Pooled::new(runs, q)?;
+    let mut boot = pooled.hier_draws(q, resamples, seed);
+    boot.sort_unstable();
+    let (lo_rank, hi_rank) = interval_ranks(resamples, level);
+    Some(HierCi {
+        estimate: pooled.estimate,
+        lo: boot[lo_rank - 1],
+        hi: boot[hi_rank - 1],
+        runs: pooled.latencies.len(),
+        episodes: pooled.episodes,
+        warnings: pooled.warnings,
+    })
+}
+
+/// What `hier_ci` reports apart from its interval, which needs no
+/// resampling, with each run's latencies. `compare` builds one per group
+/// and then puts an interval on it by whichever method it was asked for.
+#[derive(Debug, Clone)]
+pub(crate) struct Pooled {
+    /// Each run's `latency_ns`, in send order.
+    pub latencies: Vec<Vec<u64>>,
+    /// As in `HierCi`.
+    pub estimate: u64,
+    pub episodes: usize,
+    pub warnings: Vec<CiWarning>,
+}
+
+impl Pooled {
+    /// `None` if `runs` is empty or any run has no samples.
+    ///
+    /// Panics if `q` is not in [0, 1].
+    pub fn new(runs: &[&[Sample]], q: f64) -> Option<Self> {
+        check_quantile(q);
+        if runs.is_empty() || runs.iter().any(|run| run.is_empty()) {
+            return None;
+        }
+        let latencies: Vec<Vec<u64>> = runs
+            .iter()
+            .map(|run| run.iter().map(|s| s.latency_ns).collect())
+            .collect();
+        let pooled = latencies.concat();
+
+        let estimate = percentile(&pooled, q).expect("runs are not empty");
+        let episodes = latencies.iter().map(|run| tail_episodes(run, estimate)).sum();
+        let mut warnings = Vec::new();
+        if runs.len() < MIN_RUNS {
+            warnings.push(CiWarning::BetweenRunVarianceUnknown { runs: runs.len() });
+        }
+        let n = pooled.len();
+        let support = tail_support(n, q);
+        if support < MIN_TAIL_SUPPORT {
+            warnings.push(CiWarning::InsufficientSamples {
+                q,
+                n,
+                support,
+                needed: samples_needed(q),
+            });
+        }
+        if episodes < MIN_EPISODES {
+            warnings.push(CiWarning::EpisodeLimited { q, episodes });
+        }
+        let lengths = latencies.iter().map(Vec::len);
+        let (shortest, longest) = (lengths.clone().min().unwrap_or(0), lengths.max().unwrap_or(0));
+        if longest > MAX_RUN_LENGTH_RATIO * shortest {
+            warnings.push(CiWarning::RunLengthsUneven { shortest, longest });
+        }
+        if pooled.iter().max() == Some(&estimate) {
+            warnings.push(CiWarning::EstimateIsSampleMax);
+        }
+        Some(Self {
+            latencies,
+            estimate,
+            episodes,
+            warnings,
+        })
+    }
+
+    /// The `resamples` hierarchical bootstrap percentiles `hier_ci` cuts its
+    /// interval from, in the order drawn (unsorted), for callers that
+    /// combine two groups resample by resample.
+    pub fn hier_draws(&self, q: f64, resamples: usize, seed: u64) -> Vec<u64> {
+        let runs = &self.latencies;
+        let block_lens: Vec<usize> = runs.iter().map(|run| default_block_len(run.len())).collect();
+        let mut rng = SplitMix64(seed);
+        // A resample is longer than the pool when long runs are drawn more
+        // often; the Vec then grows once and keeps that capacity.
+        let mut resample = Vec::with_capacity(runs.iter().map(Vec::len).sum());
+        let mut boot = Vec::with_capacity(resamples);
+        for _ in 0..resamples {
+            resample.clear();
+            for _ in 0..runs.len() {
+                let pick = rng.below(runs.len());
+                extend_block_resample(&mut resample, &runs[pick], block_lens[pick], &mut rng);
+            }
+            let r = rank(resample.len(), q);
+            boot.push(select(&mut resample, r));
+        }
+        boot
+    }
+}
+
+/// A Welch t interval for mean(b) - mean(a).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WelchCi {
+    pub delta: f64,
+    pub lo: f64,
+    pub hi: f64,
+    /// Welch-Satterthwaite degrees of freedom; infinite when both groups
+    /// have zero variance (the interval is then the point `delta`).
+    pub df: f64,
+}
+
+/// Welch's t interval at `level` for the difference of the means of `b` and
+/// `a`, without assuming equal variances: with s^2 the sample variances
+/// (divisor n - 1) and w = s^2 / n for each group, the interval is
+/// delta +/- t_{(1 + level) / 2, df} * sqrt(w_a + w_b), with the
+/// Welch-Satterthwaite df = (w_a + w_b)^2 / (w_a^2 / (n_a - 1) + w_b^2 / (n_b - 1)).
+///
+/// `None` if either group has fewer than 2 values (no variance).
+///
+/// Panics if `level` is not in (0, 1).
+pub fn welch_ci(a: &[f64], b: &[f64], level: f64) -> Option<WelchCi> {
+    assert!(level > 0.0 && level < 1.0, "level {level} is not in (0, 1)");
+    if a.len() < 2 || b.len() < 2 {
         return None;
     }
-    let latencies: Vec<Vec<u64>> = runs
-        .iter()
-        .map(|run| run.iter().map(|s| s.latency_ns).collect())
-        .collect();
-    let block_lens: Vec<usize> = latencies.iter().map(|run| default_block_len(run.len())).collect();
-    let pooled = latencies.concat();
-
-    let mut rng = SplitMix64(seed);
-    // A resample is longer than `pooled` when long runs are drawn more often;
-    // the Vec then grows once and keeps that capacity.
-    let mut resample = Vec::with_capacity(pooled.len());
-    let mut boot = Vec::with_capacity(resamples);
-    for _ in 0..resamples {
-        resample.clear();
-        for _ in 0..runs.len() {
-            let pick = rng.below(runs.len());
-            extend_block_resample(&mut resample, &latencies[pick], block_lens[pick], &mut rng);
-        }
-        let r = rank(resample.len(), q);
-        boot.push(select(&mut resample, r));
-    }
-    let mut sorted = boot.clone();
-    sorted.sort_unstable();
-    let (lo_rank, hi_rank) = interval_ranks(resamples, level);
-
-    let estimate = percentile(&pooled, q).expect("runs are not empty");
-    let episodes = latencies.iter().map(|run| tail_episodes(run, estimate)).sum();
-    let mut warnings = Vec::new();
-    if runs.len() < MIN_RUNS {
-        warnings.push(CiWarning::BetweenRunVarianceUnknown { runs: runs.len() });
-    }
-    let n = pooled.len();
-    let support = tail_support(n, q);
-    if support < MIN_TAIL_SUPPORT {
-        warnings.push(CiWarning::InsufficientSamples {
-            q,
-            n,
-            support,
-            needed: samples_needed(q),
+    let mean_var = |x: &[f64]| {
+        let n = x.len() as f64;
+        let mean = x.iter().sum::<f64>() / n;
+        let var = x.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        (mean, var / n, n)
+    };
+    let ((mean_a, w_a, n_a), (mean_b, w_b, n_b)) = (mean_var(a), mean_var(b));
+    let delta = mean_b - mean_a;
+    let se2 = w_a + w_b;
+    if se2 == 0.0 {
+        return Some(WelchCi {
+            delta,
+            lo: delta,
+            hi: delta,
+            df: f64::INFINITY,
         });
     }
-    if episodes < MIN_EPISODES {
-        warnings.push(CiWarning::EpisodeLimited { q, episodes });
+    let df = se2 * se2 / (w_a * w_a / (n_a - 1.0) + w_b * w_b / (n_b - 1.0));
+    let half = t_quantile((1.0 + level) / 2.0, df) * se2.sqrt();
+    Some(WelchCi {
+        delta,
+        lo: delta - half,
+        hi: delta + half,
+        df,
+    })
+}
+
+/// The `p` quantile of Student's t with `df` degrees of freedom (`df` need
+/// not be a whole number), by bisection on `t_cdf` to f64 precision.
+///
+/// Panics unless 0 < p < 1 and df is finite and > 0.
+pub fn t_quantile(p: f64, df: f64) -> f64 {
+    assert!(p > 0.0 && p < 1.0, "p {p} is not in (0, 1)");
+    assert!(df.is_finite() && df > 0.0, "df {df} is not finite and > 0");
+    if p < 0.5 {
+        return -t_quantile(1.0 - p, df);
     }
-    let lengths = latencies.iter().map(Vec::len);
-    let (shortest, longest) = (lengths.clone().min().unwrap_or(0), lengths.max().unwrap_or(0));
-    if longest > MAX_RUN_LENGTH_RATIO * shortest {
-        warnings.push(CiWarning::RunLengthsUneven { shortest, longest });
+    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+    while t_cdf(hi, df) < p {
+        lo = hi;
+        hi *= 2.0;
     }
-    if pooled.iter().max() == Some(&estimate) {
-        warnings.push(CiWarning::EstimateIsSampleMax);
+    // t_cdf is increasing; stop when the bracket can no longer shrink.
+    loop {
+        let mid = 0.5 * (lo + hi);
+        if mid <= lo || mid >= hi {
+            return mid;
+        }
+        if t_cdf(mid, df) < p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
     }
-    let ci = HierCi {
-        estimate,
-        lo: sorted[lo_rank - 1],
-        hi: sorted[hi_rank - 1],
-        runs: runs.len(),
-        episodes,
-        warnings,
-    };
-    Some((ci, boot))
+}
+
+/// P(T <= t) for Student's t with `df` degrees of freedom:
+/// P(|T| > |t|) = I_x(df / 2, 1 / 2) with x = df / (df + t^2), where I is
+/// the regularized incomplete beta function.
+pub fn t_cdf(t: f64, df: f64) -> f64 {
+    let tail = 0.5 * incomplete_beta(df / 2.0, 0.5, df / (df + t * t));
+    if t > 0.0 { 1.0 - tail } else { tail }
+}
+
+/// Regularized incomplete beta I_x(a, b), from its continued fraction
+/// (Numerical Recipes, 3rd ed., 6.4), using the symmetry
+/// I_x(a, b) = 1 - I_{1-x}(b, a) where the fraction converges slowly.
+fn incomplete_beta(a: f64, b: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+    let ln_front = ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * x.ln() + b * (1.0 - x).ln();
+    if x < (a + 1.0) / (a + b + 2.0) {
+        ln_front.exp() * beta_fraction(a, b, x) / a
+    } else {
+        1.0 - ln_front.exp() * beta_fraction(b, a, 1.0 - x) / b
+    }
+}
+
+/// The continued fraction for I_x(a, b), by the modified Lentz method.
+fn beta_fraction(a: f64, b: f64, x: f64) -> f64 {
+    const TINY: f64 = 1e-300;
+    let nonzero = |v: f64| if v.abs() < TINY { TINY } else { v };
+    let mut c = 1.0;
+    let mut d = 1.0 / nonzero(1.0 - (a + b) * x / (a + 1.0));
+    let mut h = d;
+    for m in 1..=1000 {
+        let m = f64::from(m);
+        let even = m * (b - m) * x / ((a + 2.0 * m - 1.0) * (a + 2.0 * m));
+        d = 1.0 / nonzero(1.0 + even * d);
+        c = nonzero(1.0 + even / c);
+        h *= d * c;
+        let odd = -(a + m) * (a + b + m) * x / ((a + 2.0 * m) * (a + 2.0 * m + 1.0));
+        d = 1.0 / nonzero(1.0 + odd * d);
+        c = nonzero(1.0 + odd / c);
+        let step = d * c;
+        h *= step;
+        if (step - 1.0).abs() < 1e-15 {
+            break;
+        }
+    }
+    h
+}
+
+/// ln Gamma(x) for x > 0: the Lanczos approximation with g = 7 and 9
+/// coefficients (relative error about 1e-15), reflected below x = 0.5.
+fn ln_gamma(x: f64) -> f64 {
+    const G: f64 = 7.0;
+    const COEF: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    use std::f64::consts::PI;
+    if x < 0.5 {
+        return (PI / (PI * x).sin()).ln() - ln_gamma(1.0 - x);
+    }
+    let x = x - 1.0;
+    let sum = COEF[1..]
+        .iter()
+        .zip(1..)
+        .fold(COEF[0], |acc, (c, i)| acc + c / (x + f64::from(i)));
+    let t = x + G + 0.5;
+    0.5 * (2.0 * PI).ln() + (x + 0.5) * t.ln() - t + sum.ln()
 }
 
 /// SplitMix64 (Steele, Lea and Flood, 2014): a tiny, fast, seedable PRNG.
@@ -882,5 +1065,54 @@ mod tests {
             iid_width / seeds
         );
         assert!(mbb_cov >= 0.88, "mbb coverage {mbb_cov} < 0.88");
+    }
+
+    /// Student t quantiles against printed tables (6 decimals), and df = 1,
+    /// where t is Cauchy: t_p = tan(pi * (p - 1/2)).
+    #[test]
+    fn t_quantile_matches_tables() {
+        let table: [(f64, [f64; 4]); 3] = [
+            (0.95, [2.919_986, 2.131_847, 1.859_548, 1.697_261]),
+            (0.975, [4.302_653, 2.776_445, 2.306_004, 2.042_272]),
+            (0.995, [9.924_843, 4.604_095, 3.355_387, 2.749_996]),
+        ];
+        for (p, row) in table {
+            for (df, want) in [2.0, 4.0, 8.0, 30.0].into_iter().zip(row) {
+                let got = t_quantile(p, df);
+                println!("t({p}, {df}) = {got:.6} (table {want})");
+                assert!((got - want).abs() < 1e-6, "t({p}, {df}) = {got}, table {want}");
+                assert!((t_quantile(1.0 - p, df) + got).abs() < 1e-9, "symmetry at {p}, {df}");
+            }
+        }
+        let cauchy = (std::f64::consts::PI * 0.475).tan();
+        assert!((t_quantile(0.975, 1.0) - cauchy).abs() < 1e-9);
+        assert_eq!(t_quantile(0.5, 3.0), 0.0);
+        // Non-integer df, as Welch-Satterthwaite gives: the CDF inverts it.
+        for df in [1.3, 2.56, 7.9] {
+            let t = t_quantile(0.975, df);
+            assert!((t_cdf(t, df) - 0.975).abs() < 1e-12, "df {df}");
+        }
+    }
+
+    #[test]
+    fn welch_ci_matches_hand_computation() {
+        // Equal sizes and variances: df = 2n - 2 = 4 exactly.
+        let ci = welch_ci(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0], 0.95).unwrap();
+        let half = 2.776_445 * (2.0f64 / 3.0).sqrt();
+        assert!((ci.df - 4.0).abs() < 1e-12, "df {}", ci.df);
+        assert_eq!(ci.delta, 3.0);
+        assert!(
+            (ci.lo - (3.0 - half)).abs() < 1e-5 && (ci.hi - (3.0 + half)).abs() < 1e-5,
+            "{ci:?}"
+        );
+        // Unequal: w_a = 5/12, w_b = 3, so df = (41/12)^2 / ((5/12)^2 / 3 + 9 / 2) = 5043/1969.
+        let ci = welch_ci(&[1.0, 2.0, 3.0, 4.0], &[3.0, 6.0, 9.0], 0.95).unwrap();
+        assert!((ci.df - 5043.0 / 1969.0).abs() < 1e-12, "df {}", ci.df);
+        let half = t_quantile(0.975, ci.df) * (41.0f64 / 12.0).sqrt();
+        assert!((ci.hi - ci.delta - half).abs() < 1e-12 && ci.delta == 3.5, "{ci:?}");
+        // No variance: a point; fewer than 2 values: no interval.
+        let point = welch_ci(&[2.0, 2.0], &[5.0, 5.0, 5.0], 0.95).unwrap();
+        assert_eq!((point.lo, point.hi, point.df), (3.0, 3.0, f64::INFINITY));
+        assert_eq!(welch_ci(&[1.0], &[1.0, 2.0], 0.95), None);
     }
 }
