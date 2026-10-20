@@ -8,9 +8,14 @@
 //! it did for every request to a JSONL log, which a harness's measurements
 //! can then be checked against.
 //!
+//! A request with `"stream": true` is answered as Server-Sent Events, one
+//! chunk per token, on a scripted time to first token (TTFT) and inter-token
+//! latency (ITL); its log line also records when each token was handed off.
+//!
 //! Times in the log are nanoseconds since t0, the arrival of the first
 //! non-healthz request, on the server's own monotonic clock.
 
+use std::convert::Infallible;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -25,19 +30,32 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Tokens per streamed response when neither `--output-tokens` nor the
+/// request says otherwise.
+pub const DEFAULT_OUTPUT_TOKENS: u64 = 32;
+/// ITL when `--itl-ms` and `--itl-lognormal` are both unset.
+pub const DEFAULT_ITL: ServiceSpec = ServiceSpec::Fixed { ms: 10 };
 
 const NS_PER_MS: u64 = 1_000_000;
+/// The text of every streamed token: one chunk is one token.
+const TOKEN_TEXT: &str = " tok";
+const PROMPT_TOKENS: u64 = 8;
+/// Keys for the TTFT and ITL draws, so they never reuse the service-time
+/// draw or each other's ("ttft" and "itl" in ASCII).
+const TTFT_DOMAIN: u64 = 0x7474_6674;
+const ITL_DOMAIN: u64 = 0x0069_746c;
 /// The writer flushes anything it has written within this long.
 const FLUSH_EVERY: Duration = Duration::from_millis(100);
 /// Request bodies are read and discarded; this only bounds memory.
@@ -106,7 +124,45 @@ impl std::error::Error for SpecError {}
 
 /// Parses `--service-ms`: a whole number of milliseconds > 0.
 pub fn parse_service_ms(s: &str) -> Result<ServiceSpec, SpecError> {
-    let invalid = |why: &str| SpecError(format!("invalid service time {s:?}: {why}"));
+    parse_fixed_ms("service time", s)
+}
+
+/// Parses `--lognormal`: `MEDIAN_MS:SIGMA`, both finite and > 0.
+pub fn parse_lognormal(s: &str) -> Result<ServiceSpec, SpecError> {
+    parse_lognormal_spec("lognormal spec", s)
+}
+
+/// Parses `--ttft-ms`, like `--service-ms`.
+pub fn parse_ttft_ms(s: &str) -> Result<ServiceSpec, SpecError> {
+    parse_fixed_ms("TTFT", s)
+}
+
+/// Parses `--ttft-lognormal`, like `--lognormal`.
+pub fn parse_ttft_lognormal(s: &str) -> Result<ServiceSpec, SpecError> {
+    parse_lognormal_spec("TTFT lognormal spec", s)
+}
+
+/// Parses `--itl-ms`, like `--service-ms`.
+pub fn parse_itl_ms(s: &str) -> Result<ServiceSpec, SpecError> {
+    parse_fixed_ms("ITL", s)
+}
+
+/// Parses `--itl-lognormal`, like `--lognormal`.
+pub fn parse_itl_lognormal(s: &str) -> Result<ServiceSpec, SpecError> {
+    parse_lognormal_spec("ITL lognormal spec", s)
+}
+
+/// Parses `--output-tokens`: a whole number > 0.
+pub fn parse_output_tokens(s: &str) -> Result<u64, SpecError> {
+    s.parse::<u64>()
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| SpecError(format!("invalid output tokens {s:?}: expected a whole number > 0")))
+}
+
+/// A whole number of milliseconds > 0; `what` names it in the error.
+fn parse_fixed_ms(what: &str, s: &str) -> Result<ServiceSpec, SpecError> {
+    let invalid = |why: &str| SpecError(format!("invalid {what} {s:?}: {why}"));
     let ms = s
         .parse::<u64>()
         .map_err(|_| invalid("expected a whole number of milliseconds > 0"))?;
@@ -115,9 +171,9 @@ pub fn parse_service_ms(s: &str) -> Result<ServiceSpec, SpecError> {
     Ok(spec)
 }
 
-/// Parses `--lognormal`: `MEDIAN_MS:SIGMA`, both finite and > 0.
-pub fn parse_lognormal(s: &str) -> Result<ServiceSpec, SpecError> {
-    let invalid = |why: &str| SpecError(format!("invalid lognormal spec {s:?}: {why}"));
+/// `MEDIAN_MS:SIGMA`, both finite and > 0; `what` names it in the error.
+fn parse_lognormal_spec(what: &str, s: &str) -> Result<ServiceSpec, SpecError> {
+    let invalid = |why: &str| SpecError(format!("invalid {what} {s:?}: {why}"));
     let [median, sigma] = split_pair(s).ok_or_else(|| invalid("expected MEDIAN_MS:SIGMA, e.g. 20:0.5"))?;
     let number = |part: &str| {
         part.parse::<f64>()
@@ -154,6 +210,28 @@ fn split_pair(s: &str) -> Option<[&str; 2]> {
     parts.next().is_none().then_some(pair)
 }
 
+/// How streamed responses are timed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StreamSpec {
+    /// Time to first token; `None` uses the script's service-time spec (with
+    /// its own draws, not the service-time ones).
+    pub ttft: Option<ServiceSpec>,
+    /// Gap before each token after the first.
+    pub itl: ServiceSpec,
+    /// Tokens per response, unless the request's `max_tokens` is smaller.
+    pub output_tokens: u64,
+}
+
+impl Default for StreamSpec {
+    fn default() -> Self {
+        Self {
+            ttft: None,
+            itl: DEFAULT_ITL,
+            output_tokens: DEFAULT_OUTPUT_TOKENS,
+        }
+    }
+}
+
 /// What the server does to each request, fixed at startup.
 #[derive(Debug, Clone)]
 pub struct Script {
@@ -163,6 +241,7 @@ pub struct Script {
     stalls: Vec<Stall>,
     /// `stalls` as [start, end) in ns since t0.
     windows_ns: Vec<(u64, u64)>,
+    stream: StreamSpec,
 }
 
 impl Script {
@@ -195,7 +274,27 @@ impl Script {
             service,
             stalls,
             windows_ns,
+            stream: StreamSpec::default(),
         })
+    }
+
+    /// Sets how streamed responses are timed (default: `StreamSpec::default()`),
+    /// validating it like the other specs.
+    pub fn with_stream(mut self, stream: StreamSpec) -> Result<Self, SpecError> {
+        if let Some(ttft) = stream.ttft {
+            ttft.check()
+                .map_err(|why| SpecError(format!("invalid TTFT spec {ttft:?}: {why}")))?;
+        }
+        let itl = stream.itl;
+        itl.check()
+            .map_err(|why| SpecError(format!("invalid ITL spec {itl:?}: {why}")))?;
+        if stream.output_tokens == 0 {
+            return Err(SpecError(
+                "invalid output tokens 0: expected a whole number > 0".to_owned(),
+            ));
+        }
+        self.stream = stream;
+        Ok(self)
     }
 
     pub fn seed(&self) -> u64 {
@@ -210,16 +309,30 @@ impl Script {
         &self.stalls
     }
 
+    pub fn stream(&self) -> StreamSpec {
+        self.stream
+    }
+
+    /// The TTFT spec in effect: `--ttft-*` if given, else the service spec.
+    pub fn ttft_spec(&self) -> ServiceSpec {
+        self.stream.ttft.unwrap_or(self.service)
+    }
+
     /// Service time for request `seq`: a pure function of (seed, seq).
     pub fn scripted_service_ns(&self, seq: u64) -> u64 {
-        match self.service {
-            ServiceSpec::Fixed { ms } => ms * NS_PER_MS,
-            ServiceSpec::Lognormal { median_ms, sigma } => {
-                let z = standard_normal(self.seed, seq);
-                // `as` saturates, so an extreme draw is capped, not wrapped.
-                (median_ms * NS_PER_MS as f64 * (sigma * z).exp()).round() as u64
-            }
-        }
+        sample_ns(self.service, || standard_normal(self.seed, seq))
+    }
+
+    /// Time to first token for streamed request `seq`: a pure function of
+    /// (seed, seq), drawn from its own stream.
+    pub fn scripted_ttft_ns(&self, seq: u64) -> u64 {
+        sample_ns(self.ttft_spec(), || keyed_normal(self.seed, TTFT_DOMAIN, seq, 0))
+    }
+
+    /// Gap before token `index` (1 for the second token) of streamed request
+    /// `seq`: a pure function of (seed, seq, index), drawn from its own stream.
+    pub fn scripted_itl_ns(&self, seq: u64, index: u64) -> u64 {
+        sample_ns(self.stream.itl, || keyed_normal(self.seed, ITL_DOMAIN, seq, index))
     }
 
     /// How long a request arriving at `arrival_ns` waits before service: until
@@ -247,12 +360,41 @@ impl SplitMix64 {
     }
 }
 
+/// One splitmix64 output from state `x`: a bijective mix of all 64 bits.
+fn mix(x: u64) -> u64 {
+    SplitMix64(x).next()
+}
+
+/// `spec` in ns; `z` is a standard normal draw, taken only for lognormal.
+fn sample_ns(spec: ServiceSpec, z: impl FnOnce() -> f64) -> u64 {
+    match spec {
+        ServiceSpec::Fixed { ms } => ms * NS_PER_MS,
+        // `as` saturates, so an extreme draw is capped, not wrapped.
+        ServiceSpec::Lognormal { median_ms, sigma } => {
+            (median_ms * NS_PER_MS as f64 * (sigma * z()).exp()).round() as u64
+        }
+    }
+}
+
 /// A standard normal draw for request `seq`, by Box-Muller from two uniforms.
 /// Each request's stream starts at mix(seed) XOR seq: nearby seqs start at
 /// nearby states, but the increment is far larger than their distance, so
 /// requests do not share draws.
 fn standard_normal(seed: u64, seq: u64) -> f64 {
-    let mut rng = SplitMix64(SplitMix64(seed).next() ^ seq);
+    normal_from(mix(seed) ^ seq)
+}
+
+/// A standard normal draw for (seq, index) in `domain` (TTFT or ITL). The
+/// start state mixes seed, domain, seq and index one after another; mix is a
+/// bijection, so a different domain (or a domain at all, against the service
+/// draw's mix(seed)) gives a different stream.
+fn keyed_normal(seed: u64, domain: u64, seq: u64, index: u64) -> f64 {
+    normal_from(mix(mix(mix(seed ^ domain) ^ seq) ^ index))
+}
+
+/// Box-Muller from the first two outputs of splitmix64 started at `start`.
+fn normal_from(start: u64) -> f64 {
+    let mut rng = SplitMix64(start);
     // 53 random bits each. u1 is in (0, 1] so its logarithm is finite.
     let scale = 1.0 / (1u64 << 53) as f64;
     let u1 = ((rng.next() >> 11) + 1) as f64 * scale;
@@ -268,24 +410,49 @@ struct Manifest<'a> {
     seed: u64,
     service: ServiceSpec,
     stalls: &'a [Stall],
+    /// The TTFT spec in effect (the service spec unless set).
+    ttft: ServiceSpec,
+    itl: ServiceSpec,
+    output_tokens: u64,
     listen: String,
     /// Wall-clock start, for matching runs up; never used for intervals.
     start_unix_ns: u64,
     times: &'static str,
 }
 
-/// One line per chat request; all times are ns since t0.
+/// One line per chat or completions request; all times are ns since t0.
 #[derive(Serialize)]
 #[serde(tag = "type", rename = "req")]
 struct Record {
     seq: u64,
     arrival_ns: u64,
+    /// For a stream: scripted_ttft_ns + the sum of scripted_itl_ns.
     scripted_service_ns: u64,
+    /// For a stream: the sum of token_stall_wait_ns.
     stall_wait_ns: u64,
+    /// For a stream: when the [DONE] event was handed off.
     sent_ns: u64,
     /// The request's `x-request-id` header, if it is a u64; omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     client_id: Option<u64>,
+    /// Streams only; a non-streaming line has none of these fields.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    stream: Option<StreamRecord>,
+}
+
+/// The per-token ground truth of one streamed response.
+#[derive(Serialize)]
+struct StreamRecord {
+    stream: bool,
+    endpoint: &'static str,
+    scripted_ttft_ns: u64,
+    /// The scripted gap before each token after the first.
+    scripted_itl_ns: Vec<u64>,
+    /// When each token's chunk was handed to the response stream.
+    token_ns: Vec<u64>,
+    /// How long a stall held each token past its scheduled time.
+    token_stall_wait_ns: Vec<u64>,
+    output_tokens: u64,
 }
 
 struct Shared {
@@ -315,6 +482,9 @@ pub async fn start(listener: TcpListener, script: Script, log_path: &Path) -> io
         seed: script.seed,
         service: script.service,
         stalls: &script.stalls,
+        ttft: script.ttft_spec(),
+        itl: script.stream.itl,
+        output_tokens: script.stream.output_tokens,
         listen: addr.to_string(),
         start_unix_ns: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, nanos),
         times: "ns since t0, the arrival of the first non-healthz request, on the server's monotonic clock",
@@ -338,6 +508,7 @@ pub async fn start(listener: TcpListener, script: Script, log_path: &Path) -> io
     });
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
         .route("/healthz", get(healthz))
         .with_state(shared);
     let (stop, stopped) = oneshot::channel::<()>();
@@ -405,13 +576,143 @@ fn write_records(mut out: BufWriter<File>, rx: Receiver<Record>) -> io::Result<(
     }
 }
 
-async fn chat_completions(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Body) -> Response {
+/// Which OpenAI endpoint a request came in on; it decides only the shape of
+/// the response, never its timing.
+#[derive(Debug, Clone, Copy)]
+enum Endpoint {
+    Chat,
+    Completions,
+}
+
+impl Endpoint {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Chat => "/v1/chat/completions",
+            Self::Completions => "/v1/completions",
+        }
+    }
+
+    fn id(self, seq: u64) -> String {
+        match self {
+            Self::Chat => format!("chatcmpl-phantom-{seq}"),
+            Self::Completions => format!("cmpl-phantom-{seq}"),
+        }
+    }
+
+    /// A minimal non-streaming response. It depends only on seq: `created`
+    /// is fixed rather than the time of the request.
+    fn completion(self, seq: u64) -> Value {
+        let text = "This is a phantom response.";
+        let usage = usage(6);
+        match self {
+            Self::Chat => json!({
+                "id": self.id(seq),
+                "object": "chat.completion",
+                "created": 0,
+                "model": "phantom",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop"
+                }],
+                "usage": usage
+            }),
+            Self::Completions => json!({
+                "id": self.id(seq),
+                "object": "text_completion",
+                "created": 0,
+                "model": "phantom",
+                "choices": [{"index": 0, "text": text, "logprobs": null, "finish_reason": "stop"}],
+                "usage": usage
+            }),
+        }
+    }
+
+    /// One streamed chunk: `delta` is the chat delta (or None for the final
+    /// chunk), `text` the completions text, `usage` only on the final chunk.
+    fn chunk(self, seq: u64, delta: Value, text: &str, finish_reason: Option<&str>, usage: Option<Value>) -> Value {
+        let (object, choice) = match self {
+            Self::Chat => (
+                "chat.completion.chunk",
+                json!({"index": 0, "delta": delta, "finish_reason": finish_reason}),
+            ),
+            Self::Completions => (
+                "text_completion",
+                json!({"index": 0, "text": text, "logprobs": null, "finish_reason": finish_reason}),
+            ),
+        };
+        let mut chunk = json!({
+            "id": self.id(seq),
+            "object": object,
+            "created": 0,
+            "model": "phantom",
+            "choices": [choice]
+        });
+        if let Some(usage) = usage {
+            chunk["usage"] = usage;
+        }
+        chunk
+    }
+
+    /// The chunk that opens a chat stream; completions have none.
+    fn role_chunk(self, seq: u64) -> Option<Value> {
+        match self {
+            Self::Chat => Some(self.chunk(seq, json!({"role": "assistant", "content": ""}), "", None, None)),
+            Self::Completions => None,
+        }
+    }
+
+    fn token_chunk(self, seq: u64) -> Value {
+        self.chunk(seq, json!({"content": TOKEN_TEXT}), TOKEN_TEXT, None, None)
+    }
+
+    fn finish_chunk(self, seq: u64, tokens: u64) -> Value {
+        self.chunk(seq, json!({}), "", Some("length"), Some(usage(tokens)))
+    }
+}
+
+fn usage(completion_tokens: u64) -> Value {
+    json!({
+        "prompt_tokens": PROMPT_TOKENS,
+        "completion_tokens": completion_tokens,
+        "total_tokens": PROMPT_TOKENS + completion_tokens
+    })
+}
+
+/// The only parts of a request body phantom reads.
+struct RequestOptions {
+    /// `"stream": true`, exactly; anything else is a non-streaming request.
+    stream: bool,
+    /// `max_tokens`, if it is a whole number.
+    max_tokens: Option<u64>,
+}
+
+impl RequestOptions {
+    /// Anything that is not a JSON object reads as a non-streaming request.
+    fn parse(body: &[u8]) -> Self {
+        let value = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+        Self {
+            stream: value.get("stream") == Some(&Value::Bool(true)),
+            max_tokens: value.get("max_tokens").and_then(Value::as_u64),
+        }
+    }
+}
+
+async fn chat_completions(state: State<Arc<Shared>>, headers: HeaderMap, body: Body) -> Response {
+    handle(state, headers, body, Endpoint::Chat).await
+}
+
+async fn completions(state: State<Arc<Shared>>, headers: HeaderMap, body: Body) -> Response {
+    handle(state, headers, body, Endpoint::Completions).await
+}
+
+async fn handle(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Body, endpoint: Endpoint) -> Response {
     let seq = shared.next_seq.fetch_add(1, Ordering::Relaxed);
     // t0 is read before arrival, so arrival_ns is never negative.
     let t0 = *shared.t0.get_or_init(Instant::now);
     let arrival = Instant::now();
-    // Read so the connection can be reused; the content does not matter.
-    let _ = axum::body::to_bytes(body, MAX_BODY_BYTES).await;
+    // Read so the connection can be reused; only stream and max_tokens matter.
+    let options = RequestOptions::parse(&axum::body::to_bytes(body, MAX_BODY_BYTES).await.unwrap_or_default());
 
     let client_id = headers
         .get(REQUEST_ID_HEADER)
@@ -419,6 +720,20 @@ async fn chat_completions(State(shared): State<Arc<Shared>>, headers: HeaderMap,
         .and_then(|v| v.parse::<u64>().ok());
     let script = &shared.script;
     let arrival_ns = nanos(arrival - t0);
+    if options.stream {
+        let n = script.stream.output_tokens;
+        // min(max_tokens, N), but at least one token.
+        let tokens = options.max_tokens.map_or(n, |max| max.min(n)).max(1);
+        let request = StreamRequest {
+            endpoint,
+            seq,
+            t0,
+            arrival_ns,
+            client_id,
+            tokens,
+        };
+        return stream_response(Arc::clone(&shared), request);
+    }
     let stall_wait_ns = script.stall_wait_ns(arrival_ns);
     let scripted_service_ns = script.scripted_service_ns(seq);
     // Held until the window ends, measured from arrival, however long the
@@ -426,7 +741,7 @@ async fn chat_completions(State(shared): State<Arc<Shared>>, headers: HeaderMap,
     sleep_until(arrival + Duration::from_nanos(stall_wait_ns)).await;
     sleep(Duration::from_nanos(scripted_service_ns)).await;
 
-    let response = Json(completion(seq)).into_response();
+    let response = Json(endpoint.completion(seq)).into_response();
     let sent_ns = nanos(t0.elapsed());
     // Only fails if the writer has stopped on an I/O error, which `shutdown`
     // reports.
@@ -437,29 +752,109 @@ async fn chat_completions(State(shared): State<Arc<Shared>>, headers: HeaderMap,
         stall_wait_ns,
         sent_ns,
         client_id,
+        stream: None,
     });
     response
 }
 
-async fn healthz() -> &'static str {
-    "ok"
+/// One streamed request, as the handler saw it.
+struct StreamRequest {
+    endpoint: Endpoint,
+    seq: u64,
+    t0: Instant,
+    arrival_ns: u64,
+    client_id: Option<u64>,
+    tokens: u64,
 }
 
-/// A minimal non-streaming chat completion. It depends only on seq: `created`
-/// is fixed rather than the time of the request.
-fn completion(seq: u64) -> Value {
-    json!({
-        "id": format!("chatcmpl-phantom-{seq}"),
-        "object": "chat.completion",
-        "created": 0,
-        "model": "phantom",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": "This is a phantom response."},
-            "finish_reason": "stop"
-        }],
-        "usage": {"prompt_tokens": 8, "completion_tokens": 6, "total_tokens": 14}
-    })
+/// Answers with an event stream fed by `emit_tokens`, which runs as its own
+/// task. The channel is unbounded, so handing a chunk off never waits: the
+/// time taken just before the hand-off is the time it entered the stream.
+fn stream_response(shared: Arc<Shared>, request: StreamRequest) -> Response {
+    let (tx, rx) = tokio_mpsc::unbounded_channel::<Event>();
+    tokio::spawn(emit_tokens(shared, request, tx));
+    let events = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|event| (Ok::<_, Infallible>(event), rx))
+    });
+    Sse::new(events).into_response()
+}
+
+/// Emits a stream on the script, then logs it.
+///
+/// Token 0 is scheduled at arrival + TTFT, and token k at the previous
+/// token's hand-off + ITL_k, so every gap is at least its scripted ITL. A
+/// token scheduled inside a stall window is held to the window's end, and the
+/// next gap counts from there. The chat role chunk goes out just before token
+/// 0, so a client that times the first chunk and one that times the first
+/// content chunk see the same TTFT.
+///
+/// If the client goes away, the stream stops at the next hand-off and is not
+/// logged, as no [DONE] was handed off.
+async fn emit_tokens(shared: Arc<Shared>, request: StreamRequest, tx: tokio_mpsc::UnboundedSender<Event>) {
+    let StreamRequest {
+        endpoint,
+        seq,
+        t0,
+        arrival_ns,
+        client_id,
+        tokens,
+    } = request;
+    let script = &shared.script;
+    let event = |chunk: Value| Event::default().data(chunk.to_string());
+    let scripted_ttft_ns = script.scripted_ttft_ns(seq);
+    let (mut scripted_itl_ns, mut token_ns, mut token_stall_wait_ns) = (Vec::new(), Vec::new(), Vec::new());
+    let mut scheduled = arrival_ns.saturating_add(scripted_ttft_ns);
+    for k in 0..tokens {
+        if let Some(&previous) = token_ns.last() {
+            let itl = script.scripted_itl_ns(seq, k);
+            scripted_itl_ns.push(itl);
+            scheduled = u64::saturating_add(previous, itl);
+        }
+        let wait = script.stall_wait_ns(scheduled);
+        sleep_until(t0 + Duration::from_nanos(scheduled.saturating_add(wait))).await;
+        if k == 0
+            && let Some(role) = endpoint.role_chunk(seq)
+            && tx.send(event(role)).is_err()
+        {
+            return;
+        }
+        let chunk = event(endpoint.token_chunk(seq));
+        let handed_off = nanos(t0.elapsed());
+        if tx.send(chunk).is_err() {
+            return;
+        }
+        token_ns.push(handed_off);
+        token_stall_wait_ns.push(wait);
+    }
+    if tx.send(event(endpoint.finish_chunk(seq, tokens))).is_err() {
+        return;
+    }
+    let done = Event::default().data("[DONE]");
+    let sent_ns = nanos(t0.elapsed());
+    if tx.send(done).is_err() {
+        return;
+    }
+    let _ = shared.log.send(Record {
+        seq,
+        arrival_ns,
+        scripted_service_ns: scripted_ttft_ns.saturating_add(scripted_itl_ns.iter().sum()),
+        stall_wait_ns: token_stall_wait_ns.iter().sum(),
+        sent_ns,
+        client_id,
+        stream: Some(StreamRecord {
+            stream: true,
+            endpoint: endpoint.path(),
+            scripted_ttft_ns,
+            scripted_itl_ns,
+            token_ns,
+            token_stall_wait_ns,
+            output_tokens: tokens,
+        }),
+    });
+}
+
+async fn healthz() -> &'static str {
+    "ok"
 }
 
 fn nanos(d: Duration) -> u64 {

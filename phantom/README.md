@@ -19,11 +19,43 @@ cargo run -p phantom -- --listen 127.0.0.1:8080 --seed 1 --service-ms 20 --stall
 | `--service-ms MS` | fixed service time, whole milliseconds > 0 |
 | `--lognormal MEDIAN_MS:SIGMA` | service time `MEDIAN_MS * exp(SIGMA * Z)`, Z standard normal; both finite and > 0 |
 | `--stall START_MS:LEN_MS` | freeze window `[START_MS, START_MS + LEN_MS)` after t0; repeatable; length > 0; windows must not overlap |
+| `--ttft-ms MS` | streaming time to first token, whole milliseconds > 0 (default: the service-time spec) |
+| `--ttft-lognormal MEDIAN_MS:SIGMA` | lognormal streaming time to first token |
+| `--itl-ms MS` | streaming inter-token latency, whole milliseconds > 0 (default: 10) |
+| `--itl-lognormal MEDIAN_MS:SIGMA` | lognormal streaming inter-token latency |
+| `--output-tokens N` | tokens per streamed response, > 0 (default 32); a request's smaller `max_tokens` wins |
 | `--log PATH` | ground-truth log, created or truncated |
 
-Exactly one of `--service-ms` or `--lognormal` is required. Invalid specs exit non-zero with a message before anything is bound or written. SIGINT or SIGTERM shuts down gracefully: in-flight requests are answered, then the log is flushed.
+Exactly one of `--service-ms` or `--lognormal` is required. At most one of each `--ttft-*` and `--itl-*` pair may be given. Invalid specs exit non-zero with a message before anything is bound or written. SIGINT or SIGTERM shuts down gracefully: in-flight requests, including streams, are answered, then the log is flushed.
 
-Endpoints: `POST /v1/chat/completions` returns a fixed non-streaming chat completion (`id` depends on seq; nothing else varies). `GET /healthz` returns 200 and is not logged.
+Endpoints:
+
+- `POST /v1/chat/completions` returns a fixed non-streaming chat completion (`id` depends on seq; nothing else varies), or an event stream when the body has `"stream": true`.
+- `POST /v1/completions` does the same with the completions shapes: `text_completion` objects with `choices[0].text`.
+- `GET /healthz` returns 200 and is not logged.
+
+## Streaming
+
+```sh
+cargo run -p phantom -- --service-ms 1 --ttft-ms 100 --itl-ms 20 --output-tokens 5 --log /tmp/gt.jsonl
+curl -N -H 'content-type: application/json' -d '{"stream":true}' http://127.0.0.1:8080/v1/chat/completions
+```
+
+A body with `"stream": true` (the JSON boolean) gets `text/event-stream`, one `data: {...}` event per chunk, each followed by a blank line:
+
+- **chat:** a `chat.completion.chunk` with `delta.role` `"assistant"`, then one chunk per token with `delta.content` `" tok"`, then a chunk with `finish_reason` `"length"` and `usage` (`prompt_tokens` 8, `completion_tokens` = tokens sent), then `data: [DONE]`.
+- **completions:** one `text_completion` chunk per token with `choices[0].text` `" tok"`, the same final chunk (with `text` `""`) and usage, then `data: [DONE]`. There is no role chunk.
+
+Only `stream` and `max_tokens` are read from the body; everything else is ignored. Without `"stream": true`, including when the body is not JSON, both endpoints take the non-streaming path and log exactly the old fields.
+
+Tokens per response: `min(max_tokens, --output-tokens)` when `max_tokens` is a whole number, else `--output-tokens`. `max_tokens` 0 still gets one token: a stream always carries at least one.
+
+Timing, on the server's own clock:
+
+- Token 0 is scheduled at `arrival + scripted_ttft_ns`. Token k is scheduled at the previous token's hand-off time + `scripted_itl_ns` for that gap, so every gap is at least its scripted ITL.
+- A token whose scheduled time falls inside a stall window is handed off at the window end (`token_stall_wait_ns` = window end − scheduled time). The next gap counts from there, so later tokens keep their scripted gaps.
+- The chat role chunk is handed off just before token 0. A client that times the first chunk and one that times the first content chunk see the same TTFT.
+- `scripted_ttft_ns` is a pure function of (seed, seq), and each `scripted_itl_ns` of (seed, seq, token index). Both use splitmix64 and Box-Muller like the service time, with their own keys, so they never reuse the service-time draw or each other's. With no `--ttft-*`, TTFT follows the service-time spec but takes its own draws.
 
 ## Script
 
@@ -31,18 +63,41 @@ Endpoints: `POST /v1/chat/completions` returns a fixed non-streaming chat comple
 - **seq** comes from an atomic counter at arrival: 0, 1, 2, ... with no gaps.
 - **scripted_service_ns** is a pure function of (seed, seq): splitmix64 feeds Box-Muller for lognormal; fixed is `ms * 1e6`.
 - **stall_wait_ns** is `window_end - arrival_ns` if arrival falls in a stall window (start inclusive, end exclusive), else 0.
-- The handler holds the request until `arrival + stall_wait_ns`, then sleeps `scripted_service_ns`, then responds.
+- A non-streaming request is held until `arrival + stall_wait_ns`, then sleeps `scripted_service_ns`, then gets its response. Streams follow the token schedule in "Streaming" above.
 
 ## Log format
 
-The first line is the manifest; then one line per chat request, in the order responses were finished (not seq order):
+The first line is the manifest; then one line per chat or completions request, in the order responses were finished (not seq order):
 
 ```json
-{"type":"manifest","phantom_version":"0.1.0","seed":1,"service":{"kind":"fixed","ms":20},"stalls":[{"start_ms":2000,"len_ms":500}],"listen":"127.0.0.1:8080","start_unix_ns":1792507757152789210,"times":"ns since t0, the arrival of the first non-healthz request, on the server's monotonic clock"}
+{"type":"manifest","phantom_version":"0.1.0","seed":1,"service":{"kind":"fixed","ms":20},"stalls":[{"start_ms":2000,"len_ms":500}],"ttft":{"kind":"fixed","ms":20},"itl":{"kind":"fixed","ms":10},"output_tokens":32,"listen":"127.0.0.1:8080","start_unix_ns":1792507757152789210,"times":"ns since t0, the arrival of the first non-healthz request, on the server's monotonic clock"}
 {"type":"req","seq":2,"arrival_ns":2161907075,"scripted_service_ns":20000000,"stall_wait_ns":338092925,"sent_ns":2522484756,"client_id":2}
 ```
 
+The manifest's `ttft` is the TTFT spec in effect: the service-time spec unless `--ttft-*` was given.
+
 `client_id` is the request's `x-request-id` header when it parses as a u64 (decimal); it is omitted when the header is absent or is not a u64. It lets a load generator match its own request index to the log line.
+
+A streamed request's line has the same fields plus the per-token ground truth. Here it is from `--ttft-ms 100 --itl-ms 20 --output-tokens 5`:
+
+```json
+{"type":"req","seq":0,"arrival_ns":141,"scripted_service_ns":180000000,"stall_wait_ns":0,"sent_ns":186181856,"stream":true,"endpoint":"/v1/chat/completions","scripted_ttft_ns":100000000,"scripted_itl_ns":[20000000,20000000,20000000,20000000],"token_ns":[101023993,122503552,143129064,164630776,186139048],"token_stall_wait_ns":[0,0,0,0,0],"output_tokens":5}
+```
+
+| field | meaning |
+|:---|:---|
+| `stream` | always `true` on a streamed line; absent otherwise |
+| `endpoint` | `/v1/chat/completions` or `/v1/completions` |
+| `scripted_ttft_ns` | scripted time to first token |
+| `scripted_itl_ns` | scripted gap before each token after the first (`output_tokens` − 1 entries) |
+| `token_ns` | when each token's chunk was handed to the response stream, ns since t0 |
+| `token_stall_wait_ns` | how long a stall held each token past its scheduled time |
+| `output_tokens` | tokens sent |
+| `sent_ns` | when the `[DONE]` event was handed off |
+| `scripted_service_ns` | `scripted_ttft_ns` + the sum of `scripted_itl_ns` |
+| `stall_wait_ns` | the sum of `token_stall_wait_ns` |
+
+So `sent_ns - arrival_ns >= stall_wait_ns + scripted_service_ns` holds for every line, streamed or not.
 
 Records go through a channel to a dedicated writer thread, so handlers do not wait on file I/O. Anything written is flushed within 100 ms, and again at shutdown.
 
@@ -57,7 +112,11 @@ Records go through a channel to a dedicated writer thread, so handlers do not wa
 - **A log write error does not stop serving.** If writing the log fails, phantom keeps answering requests but stops logging them; the error is reported at shutdown and the exit status is non-zero.
 - **The log is flushed, not fsynced.** A clean shutdown leaves it complete; a host crash can lose the last unsynced writes.
 - **Overlapping stalls are refused,** not merged; windows that only touch are allowed, and each one is applied separately.
-- **The request body is ignored.** It is read (up to 16 MiB) and discarded; any body gets the same response, and `stream: true` is not supported.
+- **The request body is read only for `stream` and `max_tokens`.** It is read (up to 16 MiB), and everything else in it is ignored: any prompt gets the same response.
+- **Chunk hand-off time is not wire time.** `token_ns` and a stream's `sent_ns` are taken immediately before each chunk is handed to the response stream. hyper's write to the socket, the kernel and the network come after them.
+- **One chunk is one "token", with fixed text.** Every token is the chunk `" tok"`. A client that re-tokenizes the text, rather than counting chunks, may count a different number of tokens.
+- **tokio timers have 1 ms granularity.** Each token is handed off at least its scripted gap after the previous one, typically about 1-2 ms more, and the overshoot accumulates over a stream (it is in `token_ns`, never hidden). An ITL below about 5 ms is therefore not meaningful.
+- **A stream the client abandons is not logged.** If the client goes away, phantom stops at the next chunk and writes no line, because no `[DONE]` was handed off; its seq is then missing from the log.
 
 ## Audit results
 
