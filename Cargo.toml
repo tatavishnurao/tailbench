@@ -3,7 +3,7 @@ name = "tailbench"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Open-loop, coordinated-omission-safe latency harness"
+description = "Latency benchmark harness that audits itself: provenance manifest, calibrated verdicts that can refuse"
 repository = "https://github.com/tatavishnurao/tailbench"
 readme = "README.md"
 keywords = ["benchmark", "latency", "coordinated-omission", "async"]
@@ -21,3 +21,6 @@ tokio = { version = "1.53.3", features = ["rt", "time"] }
 # macros: #[tokio::test]. test-util: start_paused (the paused clock).
 # rt-multi-thread: #[tokio::test(flavor = "multi_thread")].
 tokio = { version = "1.53.3", features = ["macros", "test-util", "rt-multi-thread"] }
+
+[workspace]
+members = ["phantom"]

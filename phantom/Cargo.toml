@@ -1,0 +1,22 @@
+[package]
+name = "phantom"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Deterministic fake OpenAI-compatible server that logs ground truth for every request"
+publish = false
+
+[dependencies]
+axum = "0.8.9"
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# Held at the version tailbench locks, so adding phantom does not move tailbench's
+# dependency tree. signal: SIGINT/SIGTERM trigger the graceful shutdown that
+# flushes the log.
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+
+[dev-dependencies]
+# Loopback HTTP only: default features (TLS, HTTP/2, proxy discovery) are not needed.
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
+tempfile = "3.27.0"
