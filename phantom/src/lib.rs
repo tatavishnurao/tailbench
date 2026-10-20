@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -41,6 +42,8 @@ const NS_PER_MS: u64 = 1_000_000;
 const FLUSH_EVERY: Duration = Duration::from_millis(100);
 /// Request bodies are read and discarded; this only bounds memory.
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// A client's own id for a request, logged as `client_id` if it is a u64.
+const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// How long a request is serviced for, after any stall.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -280,6 +283,9 @@ struct Record {
     scripted_service_ns: u64,
     stall_wait_ns: u64,
     sent_ns: u64,
+    /// The request's `x-request-id` header, if it is a u64; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_id: Option<u64>,
 }
 
 struct Shared {
@@ -399,7 +405,7 @@ fn write_records(mut out: BufWriter<File>, rx: Receiver<Record>) -> io::Result<(
     }
 }
 
-async fn chat_completions(State(shared): State<Arc<Shared>>, body: Body) -> Response {
+async fn chat_completions(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Body) -> Response {
     let seq = shared.next_seq.fetch_add(1, Ordering::Relaxed);
     // t0 is read before arrival, so arrival_ns is never negative.
     let t0 = *shared.t0.get_or_init(Instant::now);
@@ -407,6 +413,10 @@ async fn chat_completions(State(shared): State<Arc<Shared>>, body: Body) -> Resp
     // Read so the connection can be reused; the content does not matter.
     let _ = axum::body::to_bytes(body, MAX_BODY_BYTES).await;
 
+    let client_id = headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
     let script = &shared.script;
     let arrival_ns = nanos(arrival - t0);
     let stall_wait_ns = script.stall_wait_ns(arrival_ns);
@@ -426,6 +436,7 @@ async fn chat_completions(State(shared): State<Arc<Shared>>, body: Body) -> Resp
         scripted_service_ns,
         stall_wait_ns,
         sent_ns,
+        client_id,
     });
     response
 }

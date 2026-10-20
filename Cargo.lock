@@ -605,6 +605,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tailbench",
  "tempfile",
  "tokio",
 ]

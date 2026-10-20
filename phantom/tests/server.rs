@@ -60,6 +60,19 @@ async fn chat(client: &reqwest::Client, base: &str) -> Value {
     resp.json().await.unwrap()
 }
 
+/// Sends one chat completion request with header `x-request-id: id`.
+async fn chat_with_request_id(client: &reqwest::Client, base: &str, id: &str) {
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .header("x-request-id", id)
+        .json(&json!({"model": "any", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.bytes().await.unwrap();
+}
+
 /// Sends `n` chat requests at once and returns their bodies.
 async fn chat_concurrently(h: &Harness, n: usize) -> Vec<Value> {
     let mut set = JoinSet::new();
@@ -264,6 +277,11 @@ async fn log_has_a_manifest_then_one_line_per_request() {
     });
     healthz(&h).await;
     assert_eq!(bodies.len(), N);
+    // client_id is logged only for an x-request-id that parses as a u64.
+    let valid = ["0", "7", "18446744073709551615"];
+    for id in valid.iter().chain(&["-1", "abc", "18446744073709551616", ""]) {
+        chat_with_request_id(&h.client, &h.base, id).await;
+    }
     let log = h.finish().await;
 
     let m = &log.manifest;
@@ -278,7 +296,7 @@ async fn log_has_a_manifest_then_one_line_per_request() {
     assert_eq!(m["listen"], addr, "{m}");
     assert!(field(m, "start_unix_ns") > 0, "{m}");
 
-    assert_eq!(log.reqs.len(), N, "expected exactly one req line per chat request");
+    assert_eq!(log.reqs.len(), N + 7, "expected exactly one req line per chat request");
     let keys: BTreeSet<&str> = [
         "type",
         "seq",
@@ -288,10 +306,20 @@ async fn log_has_a_manifest_then_one_line_per_request() {
         "sent_ns",
     ]
     .into();
+    let mut client_ids = Vec::new();
     for r in &log.reqs {
-        let got: BTreeSet<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut got: BTreeSet<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+        if got.remove("client_id") {
+            client_ids.push(field(r, "client_id"));
+        }
         assert_eq!(got, keys, "{r}");
     }
+    client_ids.sort_unstable();
+    let expected: Vec<u64> = valid.iter().map(|id| id.parse().unwrap()).collect();
+    assert_eq!(
+        client_ids, expected,
+        "client_id must be logged exactly for valid u64 headers"
+    );
     assert_seqs_are_dense(&log.reqs);
 }
 
