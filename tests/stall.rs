@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use tailbench::episodes::{self, Threshold, ThresholdRule};
 use tailbench::stats::{self, DEFAULT_LEVEL, DEFAULT_RESAMPLES};
 use tailbench::{CountedHistogram, RunResult, closed_loop, open_loop};
 use tokio::time::{Instant, sleep, sleep_until};
@@ -294,4 +295,56 @@ async fn p99_ci_on_stall_run_mbb_is_at_least_as_wide_as_iid() {
         (mbb.lo, mbb.hi),
         (iid.lo, iid.hi)
     );
+}
+
+/// Split at the default threshold, the freeze is one episode and the body is
+/// the run the freeze interrupted.
+///
+/// Threshold: 950 of the 1000 samples are 1 ms, so the pooled median is
+/// 1 ms and T = 10 x 1 ms = 10 ms. The 50 frozen samples (sends 200..250,
+/// 11 to 501 ms) are all >= 10 ms and consecutive, so they are one episode.
+/// It is open from send 200's intended time, 2000 ms, to the frozen
+/// requests' completion at 2501 ms: 501 ms of the run's 9991 ms (the last
+/// send, at 9990 ms, completes at 9991 ms).
+///
+/// Body: the samples sent outside that window [2000, 2501) ms, so the 50
+/// frozen ones and send 250 (intended at 2500 ms, 1 ms) are left out: 949
+/// samples, all 1 ms, so the body p99 is 1 ms. Without the freeze every
+/// request would take 1 ms, so here taking the episode out biases the body
+/// p99 by 0.
+#[tokio::test(start_paused = true)]
+async fn freeze_is_one_episode_and_body_p99_is_1ms() {
+    let server = FakeServer::starting_now();
+    let open = open_loop(INTERVAL, COUNT, || server.call()).await;
+    let t = Threshold::derive(&[&open.samples], ThresholdRule::default()).unwrap();
+    let e = episodes::run_episodes(&open.samples, t.ns);
+    let body = column_of(&episodes::body(&open.samples, t.ns));
+    let p99 = stats::percentile(&body, 0.99).unwrap();
+    println!(
+        "threshold {t}; {} episode(s), {} samples, {:.3} ms of {:.3} ms; body n = {}, body p99 {:.3} ms (all samples: {:.3} ms)",
+        e.episodes,
+        e.samples,
+        ms_f(e.time_ns),
+        ms_f(e.span_ns),
+        body.len(),
+        ms_f(p99),
+        ms_f(stats::percentile(&column(&open, |s| Some(s.latency_ns)), 0.99).unwrap())
+    );
+    assert_eq!((t.pooled_median_ns, t.ns), (MS, 10 * MS));
+    assert_eq!(
+        e,
+        episodes::RunEpisodes {
+            episodes: 1,
+            samples: 50,
+            excluded: 51,
+            time_ns: 501 * MS,
+            span_ns: 9991 * MS,
+        }
+    );
+    assert_eq!(body.len(), 949);
+    assert_eq!(p99, MS);
+}
+
+fn column_of(samples: &[tailbench::Sample]) -> Vec<u64> {
+    samples.iter().map(|s| s.latency_ns).collect()
 }
