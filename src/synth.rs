@@ -24,6 +24,8 @@ use crate::{CountedHistogram, MIN_LAG_US, MIN_LATENCY_US, RunConfig, RunResult, 
 /// - Rounded to whole nanoseconds; a negative value saturates at 0.
 /// - With `stall` set, a stalled run also adds `extra_ns` to each of a
 ///   contiguous `fraction` of its samples (see `Stall`).
+/// - With `poisson_stalls` set, stalls also start at random times, any
+///   number per run (see `PoissonStalls`).
 ///
 /// Sample i is intended at i * interval; service = latency and scheduler
 /// lag = 0, as on a perfect timer.
@@ -34,6 +36,7 @@ pub(crate) struct Synth {
     pub phi: f64,
     pub run_sd_ns: f64,
     pub stall: Option<Stall>,
+    pub poisson_stalls: Option<PoissonStalls>,
     /// Samples per run.
     pub n: usize,
     pub interval: Duration,
@@ -56,6 +59,25 @@ impl Stall {
     const STREAM: u64 = 0x57A1_1000_0000_0000;
 }
 
+/// Stalls as a Poisson process in time: they start at rate `per_s` per
+/// second of the run's schedule (n x interval), so a run can have none or
+/// several. A stall starting at time t adds `extra_ns` to the
+/// `round(fraction * n)` consecutive samples from the first one intended at
+/// or after t, cut at the end of the run. A sample covered by overlapping
+/// stalls gets `extra_ns` once, so overlapping stalls make one longer stall.
+/// Unscaled, and drawn from a stream of its own, like `Stall`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PoissonStalls {
+    pub per_s: f64,
+    pub extra_ns: f64,
+    pub fraction: f64,
+}
+
+impl PoissonStalls {
+    /// XORed into a run's seed to seed its Poisson stall stream.
+    const STREAM: u64 = 0x9015_5000_0000_0000;
+}
+
 impl Synth {
     /// Median of the body: 10 ms.
     pub const MEDIAN_NS: f64 = 10e6;
@@ -68,6 +90,7 @@ impl Synth {
             phi,
             run_sd_ns,
             stall: None,
+            poisson_stalls: None,
             n: 1000,
             interval: Duration::from_millis(10),
         }
@@ -84,16 +107,29 @@ impl Synth {
             let start = (rng.next_f64() * (self.n - len + 1) as f64) as usize;
             (rng.next_f64() < stall.prob).then_some((start..start + len, stall.extra_ns))
         });
+        let poisson = self.poisson_stalls.map(|p| {
+            let len = ((p.fraction * self.n as f64).round() as usize).min(self.n);
+            let mut covered = vec![false; self.n];
+            for start in self.poisson_stall_starts(seed) {
+                covered[start..(start + len).min(self.n)].fill(true);
+            }
+            (covered, p.extra_ns)
+        });
         let mut x = rng.normal();
         (0u64..)
             .take(self.n)
             .map(|i| {
                 let body = self.median_ns * (self.sigma * x).exp();
                 x = self.phi * x + innovation * rng.normal();
-                let extra = match &stalled {
+                let mut extra = match &stalled {
                     Some((range, extra_ns)) if range.contains(&(i as usize)) => *extra_ns,
                     _ => 0.0,
                 };
+                if let Some((covered, extra_ns)) = &poisson
+                    && covered[i as usize]
+                {
+                    extra += extra_ns;
+                }
                 // f64 -> u64 `as` saturates: negative values become 0.
                 let ns = (scale * (body + offset) + extra).round() as u64;
                 Sample {
@@ -104,6 +140,30 @@ impl Synth {
                 }
             })
             .collect()
+    }
+
+    /// First sample index of each Poisson stall of run `seed`, in order
+    /// (empty without `poisson_stalls`): exponential gaps of mean 1 / per_s
+    /// seconds over the run's n x interval.
+    pub fn poisson_stall_starts(&self, seed: u64) -> Vec<usize> {
+        let Some(p) = self.poisson_stalls else {
+            return Vec::new();
+        };
+        let mut rng = SplitMix64::new(seed ^ PoissonStalls::STREAM);
+        let interval_s = self.interval.as_secs_f64();
+        let duration_s = self.n as f64 * interval_s;
+        let mut starts = Vec::new();
+        let mut t = 0.0;
+        loop {
+            t += -(1.0 - rng.next_f64()).ln() / p.per_s;
+            if t >= duration_s {
+                return starts;
+            }
+            let start = (t / interval_s).ceil() as usize;
+            if start < self.n {
+                starts.push(start);
+            }
+        }
     }
 
     /// An open-loop manifest for this machine and model, with the git fields
@@ -251,5 +311,42 @@ mod tests {
         }
         println!("{stalled_runs} of 1000 runs stalled (want about 200)");
         assert!((150..=250).contains(&stalled_runs), "{stalled_runs}");
+    }
+
+    /// Poisson stalls at 0.2/s over 10 s runs: about 2 per run, with
+    /// variance about equal to the mean; each covers 20 samples from its
+    /// start (cut at the run's end), overlaps once, and nothing else moves.
+    #[test]
+    fn poisson_stalls_start_at_rate_per_second() {
+        let plain = Synth::new(0.5, 0.5, 3e5);
+        let mut m = plain;
+        m.poisson_stalls = Some(PoissonStalls {
+            per_s: 0.2,
+            extra_ns: 300e6,
+            fraction: 0.02,
+        });
+        let counts: Vec<f64> = (0..2000)
+            .map(|seed| m.poisson_stall_starts(seed).len() as f64)
+            .collect();
+        let mean = counts.iter().sum::<f64>() / counts.len() as f64;
+        let var = counts.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / (counts.len() - 1) as f64;
+        println!(
+            "stalls per 10 s run: mean {mean:.3} (want 2), variance/mean {:.3} (want 1)",
+            var / mean
+        );
+        assert!((mean - 2.0).abs() < 0.1, "mean {mean}");
+        assert!((var / mean - 1.0).abs() < 0.1, "variance/mean {}", var / mean);
+        assert!(counts.iter().any(|&c| c >= 4.0), "several stalls per run happen");
+
+        for seed in 0..200 {
+            let (base, with) = (latencies(&plain.samples(seed, 1.1)), latencies(&m.samples(seed, 1.1)));
+            let mut want = vec![0u64; base.len()];
+            for start in m.poisson_stall_starts(seed) {
+                want[start..(start + 20).min(base.len())].fill(300_000_000);
+            }
+            let got: Vec<u64> = with.iter().zip(&base).map(|(w, b)| w - b).collect();
+            assert_eq!(got, want, "seed {seed}");
+        }
+        assert!(plain.poisson_stall_starts(1).is_empty());
     }
 }
