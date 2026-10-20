@@ -1,5 +1,6 @@
 # tailbench
 
+[![CI](https://github.com/tatavishnurao/tailbench/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tatavishnurao/tailbench/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 status: pre-release
