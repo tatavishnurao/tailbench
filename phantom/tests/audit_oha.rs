@@ -9,21 +9,32 @@
 //! cargo test --release -p phantom --test audit_oha -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! Reference. oha sends no per-request id, so its requests cannot be matched
-//! to log lines. The reference is the intended-schedule truth of tailbench's
-//! open-loop run against the same script and rate (scenario B of audit.rs,
-//! computed by the same code in `common`). It is not an independent
-//! measurement of oha's run.
+//! Primary comparison: per-run truth. oha sends no per-request id, so its
+//! requests are keyed by phantom's seq (arrival order) and run through the
+//! same truth formula as tailbench's (`common::truth_from_log`, `Key::Seq`;
+//! the ordering assumption is stated there).
+//!
+//! Secondary: the cross-run reference, the truth of tailbench's own open-loop
+//! run against the same script and rate (scenario B of audit.rs). It is a
+//! different run, so it is not an independent measurement of oha's run.
+//!
+//! Percentile conventions differ. This audit uses nearest rank (index
+//! `ceil(q * n) - 1`). oha 1.16.0 takes index `floor(p / 100 * n)`
+//! (src/result_data.rs, `percentile_iter`), one rank higher at p50, p99 and
+//! p99.9 when n = 1000, so per-run truth is also shown at oha's index.
 //!
 //! oha's JSON reports latencies in seconds (`latencyPercentiles`, and
-//! `summary.slowest` for the maximum); they are converted to ms here.
+//! `summary.slowest` for the maximum); they are converted to ns here.
 
 mod common;
 
 use std::process::Command;
 use std::sync::OnceLock;
 
-use common::{MAX, NS_PER_MS, P50, P99, P999, Pct, STALL, period_ns, scenario_b, sorted, start_phantom, truth_at};
+use common::{
+    Key, MAX, NS_PER_MS, P50, P99, P999, Pct, STALL, period_ns, scenario_b, sorted, start_phantom, truth_at,
+    truth_from_log,
+};
 use serde_json::Value;
 
 /// The oha command shared by every scenario, before the URL.
@@ -47,14 +58,26 @@ const PCTS: [Pct; 4] = [P50, P99, P999, MAX];
 const BURST_WINDOW_NS: u64 = 50_000_000;
 const MIN_LOGGED: usize = 100;
 
-/// Reference truth percentiles in ns, in PCTS order, printed once.
+/// Cross-run reference percentiles in ns, in PCTS order. Prints the machine
+/// line and the reference once.
 fn reference() -> &'static [f64; 4] {
     static REFERENCE: OnceLock<[f64; 4]> = OnceLock::new();
     REFERENCE.get_or_init(|| {
         let b = scenario_b();
+        let m = &b.manifest;
+        println!(
+            "\nmachine: {}, kernel {}, {}, build {} (opt-level {}), tokio {} (from Cargo.lock: tailbench's manifest \
+             records no tokio version)",
+            m["cpu_model"],
+            m["kernel"],
+            m["rust_version"],
+            m["build_profile"],
+            m["opt_level"],
+            locked_tokio_version()
+        );
         let truth = sorted(&b.truth_ns);
         let values = PCTS.map(|p| truth_at(&truth, p));
-        println!("\n== reference: tailbench open loop, stall 2000:500, intended-schedule truth from phantom's log ==");
+        println!("== cross-run reference: tailbench open loop, stall 2000:500, truth from phantom's log ==");
         println!(
             "{} requests every {:.0} ms, {} stalled by phantom",
             b.truth_ns.len(),
@@ -68,12 +91,18 @@ fn reference() -> &'static [f64; 4] {
     })
 }
 
-/// What phantom logged for one oha run.
+/// tokio's version in the workspace lockfile.
+fn locked_tokio_version() -> String {
+    let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../Cargo.lock")).unwrap();
+    lock.split_once("name = \"tokio\"\nversion = \"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map_or_else(|| "UNKNOWN".to_owned(), |(version, _)| version.to_owned())
+}
+
+/// Phantom-side counts for one oha run that the truth does not show.
 struct LogSummary {
-    received: usize,
     largest_gap_ns: u64,
     burst_after_stall: usize,
-    stalled: usize,
     max_stall_wait_ns: u64,
 }
 
@@ -88,13 +117,11 @@ fn summarize_log(text: &str) -> LogSummary {
     arrivals.sort_unstable();
     let stall_end = (STALL.start_ms + STALL.len_ms) * 1_000_000;
     LogSummary {
-        received: arrivals.len(),
         largest_gap_ns: arrivals.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0),
         burst_after_stall: arrivals
             .iter()
             .filter(|&&a| a >= stall_end && a < stall_end + BURST_WINDOW_NS)
             .count(),
-        stalled: waits.iter().filter(|&&w| w > 0).count(),
         max_stall_wait_ns: waits.iter().copied().max().unwrap_or(0),
     }
 }
@@ -108,8 +135,26 @@ fn oha_at(json: &Value, p: Pct) -> f64 {
     secs.as_f64().unwrap_or_else(|| panic!("oha JSON has no {}", p.name)) * 1e9
 }
 
+/// `sorted` at oha 1.16.0's index, `(p / 100 * n) as usize`, with oha's own
+/// percent literals so the float arithmetic matches.
+fn at_oha_index(sorted: &[i64], p: Pct) -> f64 {
+    let percent = match p.name {
+        "p50" => 50.0,
+        "p99" => 99.0,
+        "p99.9" => 99.9,
+        _ => return sorted[sorted.len() - 1] as f64,
+    };
+    let i = (percent / 100.0 * sorted.len() as f64) as usize;
+    sorted[i.min(sorted.len() - 1)] as f64
+}
+
+fn ms(ns: f64) -> f64 {
+    ns / NS_PER_MS
+}
+
 /// Runs oha with `extra` flags against a fresh phantom (stall 2000:500) and
-/// prints oha's numbers against the reference and phantom's view of the run.
+/// prints oha's numbers against this run's truth, the cross-run reference,
+/// and phantom's view of the run.
 fn oha_scenario(title: &str, extra: &[&str]) {
     let reference = reference();
     let server = start_phantom(vec![STALL]);
@@ -126,43 +171,61 @@ fn oha_scenario(title: &str, extra: &[&str]) {
         String::from_utf8_lossy(&out.stderr)
     );
     let json: Value = serde_json::from_slice(&out.stdout).expect("oha printed JSON");
-    let summary = summarize_log(&log);
+    let truth = truth_from_log(&log, Key::Seq);
     assert!(
-        summary.received >= MIN_LOGGED,
+        truth.truth_ns.len() >= MIN_LOGGED,
         "phantom logged {} requests",
-        summary.received
+        truth.truth_ns.len()
     );
+    let summary = summarize_log(&log);
+    let run_truth = sorted(&truth.truth_ns);
 
     println!("\n== {title} ==");
-    println!("oha {}", args.join(" "));
+    println!("oha {args:?}");
     println!(
         "oha: status codes {}, errors {}",
         json["statusCodeDistribution"], json["errorDistribution"]
     );
     println!(
-        "{:<10} | {:>10} | {:>12} | {:>10} | {:>9}",
-        "percentile", "oha ms", "reference ms", "delta ms", "relative"
+        "{:<6} | {:>9} | {:>13} | {:>8} | {:>8} | {:>14} | {:>8} | {:>15} | {:>8}",
+        "pct", "oha ms", "run truth ms", "delta", "relative", "truth@oha-idx", "delta", "cross-run ref", "delta"
     );
-    for (p, &r) in PCTS.iter().zip(reference) {
+    for (p, &cross) in PCTS.iter().zip(reference) {
         let o = oha_at(&json, *p);
+        let t = truth_at(&run_truth, *p);
+        let t_oha = at_oha_index(&run_truth, *p);
         println!(
-            "{:<10} | {:>10.3} | {:>12.3} | {:>+10.3} | {:>+8.2}%",
+            "{:<6} | {:>9.3} | {:>13.3} | {:>+8.3} | {:>+7.2}% | {:>14.3} | {:>+8.3} | {:>15.3} | {:>+8.3}",
             p.name,
-            o / NS_PER_MS,
-            r / NS_PER_MS,
-            (o - r) / NS_PER_MS,
-            (o - r) / r * 100.0
+            ms(o),
+            ms(t),
+            ms(o - t),
+            (o - t) / t * 100.0,
+            ms(t_oha),
+            ms(o - t_oha),
+            ms(cross),
+            ms(o - cross)
         );
     }
+    let lateness = sorted(&truth.lateness_ns);
+    let late = lateness.iter().filter(|&&l| l > period_ns()).count();
+    println!(
+        "send lateness (arrival - intended): p50 {:.3} ms, p99 {:.3} ms, max {:.3} ms; {} of {} later than one period",
+        ms(truth_at(&lateness, P50)),
+        ms(truth_at(&lateness, P99)),
+        ms(truth_at(&lateness, MAX)),
+        late,
+        lateness.len()
+    );
     println!(
         "phantom: {} requests received, largest arrival gap {:.3} ms, {} arrived in the {} ms after the stall ended, \
          {} stalled (max stall_wait {:.3} ms)",
-        summary.received,
-        summary.largest_gap_ns as f64 / NS_PER_MS,
+        truth.truth_ns.len(),
+        ms(summary.largest_gap_ns as f64),
         summary.burst_after_stall,
         BURST_WINDOW_NS / 1_000_000,
-        summary.stalled,
-        summary.max_stall_wait_ns as f64 / NS_PER_MS
+        truth.stalled,
+        ms(summary.max_stall_wait_ns as f64)
     );
 }
 
@@ -194,4 +257,13 @@ fn o3_ten_connections_corrected() {
 #[ignore = "runs the external oha binary for 10 s"]
 fn o4_one_connection_uncorrected() {
     oha_scenario("O4. oha, 1 connection, no latency correction", &["-c", "1"]);
+}
+
+#[test]
+#[ignore = "runs the external oha binary for 10 s"]
+fn o5_one_connection_corrected() {
+    oha_scenario(
+        "O5. oha, 1 connection, --latency-correction",
+        &["-c", "1", "--latency-correction"],
+    );
 }

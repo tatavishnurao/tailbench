@@ -2,9 +2,11 @@
 //! tailbench against it, and computing intended-schedule truth from
 //! phantom's log. Each test binary uses a different subset.
 //!
-//! Truth. Request `i` carries `x-request-id: i`, which phantom logs as
-//! `client_id`. Its intended send time is `i * PERIOD` after tailbench's
-//! schedule start. tailbench's schedule start is placed on phantom's clock at
+//! Truth. Request `i` is the `i`-th send of the schedule, keyed in phantom's
+//! log either by `client_id` (tailbench sends `x-request-id: i`) or by `seq`
+//! (arrival order, for a load generator that sends no id; see `Key`). Its
+//! intended send time is `i * PERIOD` after the schedule start, which is
+//! placed on phantom's clock at
 //!
 //! `origin = min over i of (arrival_ns_i - i * PERIOD)`
 //!
@@ -186,13 +188,14 @@ pub fn audit(kind: RunnerKind, stalls: Vec<Stall>) -> Audit {
     let log = server.finish();
 
     let manifest = read_manifest(&manifest_path);
-    let (truth_ns, origin_shift_ns, stalled) = truth_from_log(&log);
+    let truth = truth_from_log(&log, Key::ClientId);
+    assert_eq!(truth.truth_ns.len(), COUNT as usize, "every client_id is in the log");
     Audit {
         result,
-        truth_ns,
-        origin_shift_ns,
+        truth_ns: truth.truth_ns,
+        origin_shift_ns: truth.origin_shift_ns,
         manifest,
-        stalled,
+        stalled: truth.stalled,
     }
 }
 
@@ -201,47 +204,97 @@ fn read_manifest(path: &Path) -> Value {
     serde_json::from_str(&text).expect("tailbench manifest is JSON")
 }
 
-/// Truth latency per client_id, how far the origin is before client_id 0's
-/// arrival, and how many requests phantom stalled.
-fn truth_from_log(text: &str) -> (Vec<i64>, i64, usize) {
+/// Which log field gives a request's index `i` in the send schedule.
+#[derive(Clone, Copy, Debug)]
+pub enum Key {
+    /// `client_id`, from the `x-request-id` header tailbench sends.
+    ClientId,
+    /// phantom's `seq`, its arrival order. Assumes the load generator sends in
+    /// schedule order and requests arrive in the order they were sent. Inside
+    /// a burst (after a stall, say) requests that arrive together may be
+    /// permuted: that changes individual truth values, but by no more than
+    /// the burst's spread, and leaves the set of intended times unchanged.
+    Seq,
+}
+
+impl Key {
+    fn field(self) -> &'static str {
+        match self {
+            Key::ClientId => "client_id",
+            Key::Seq => "seq",
+        }
+    }
+}
+
+/// Intended-schedule truth for one run, indexed by `i`.
+pub struct Truth {
+    /// `sent_ns_i - (origin + i * PERIOD)`.
+    pub truth_ns: Vec<i64>,
+    /// `arrival_ns_i - (origin + i * PERIOD)`: how late request `i` reached
+    /// phantom after its intended send time, its send lateness plus the trip.
+    pub lateness_ns: Vec<i64>,
+    /// How far the origin is before request 0's arrival (>= 0): what aligning
+    /// on request 0 would have added to every truth value's error.
+    pub origin_shift_ns: i64,
+    /// Requests phantom stalled.
+    pub stalled: usize,
+}
+
+/// Truth for every request in phantom's log, indexed by `key`. Panics if an
+/// index in 0..=max is missing or logged twice.
+pub fn truth_from_log(text: &str, key: Key) -> Truth {
     let mut lines = text.lines().map(|l| serde_json::from_str::<Value>(l).unwrap());
     assert_eq!(lines.next().unwrap()["type"], "manifest");
-    // (arrival_ns, sent_ns) by client_id.
-    let mut by_id: Vec<Option<(u64, u64)>> = vec![None; COUNT as usize];
+    // (arrival_ns, sent_ns) by index.
+    let mut by_index: Vec<Option<(u64, u64)>> = Vec::new();
     let mut stalled = 0;
     for r in lines {
-        let id = r["client_id"].as_u64().unwrap_or_else(|| panic!("no client_id: {r}")) as usize;
+        let i = r[key.field()]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no {}: {r}", key.field())) as usize;
+        if by_index.len() <= i {
+            by_index.resize(i + 1, None);
+        }
         let times = (r["arrival_ns"].as_u64().unwrap(), r["sent_ns"].as_u64().unwrap());
-        assert!(by_id[id].replace(times).is_none(), "client_id {id} logged twice");
+        assert!(by_index[i].replace(times).is_none(), "{} {i} logged twice", key.field());
         if r["stall_wait_ns"].as_u64().unwrap() > 0 {
             stalled += 1;
         }
     }
-    let by_id: Vec<(u64, u64)> = by_id
+    let by_index: Vec<(u64, u64)> = by_index
         .into_iter()
         .enumerate()
-        .map(|(i, t)| t.unwrap_or_else(|| panic!("client_id {i} not in the log")))
+        .map(|(i, t)| t.unwrap_or_else(|| panic!("{} {i} not in the log", key.field())))
         .collect();
-    // Why the least-lagged request: arrival_ns_i - i * PERIOD is tailbench's
-    // schedule start on phantom's clock PLUS request i's own delay (scheduler
-    // lag, client send, loopback, header parsing), and that delay is never
-    // negative. Any single request, client_id 0 included, carries its own
-    // delay into every truth value; the minimum over all requests carries only
-    // the smallest one. Stalls do not bias it: phantom applies them after
-    // arrival, and a closed loop's late sends only raise arrivals.
+    // Why the least-lagged request: arrival_ns_i - i * PERIOD is the schedule
+    // start on phantom's clock PLUS request i's own delay (scheduler lag,
+    // client send, loopback, header parsing), and that delay is never
+    // negative. Any single request, request 0 included, carries its own delay
+    // into every truth value; the minimum over all requests carries only the
+    // smallest one. Stalls do not bias it: phantom applies them after arrival,
+    // and late sends only raise arrivals.
     let period = period_ns();
-    let origin = by_id
+    let origin = by_index
         .iter()
         .zip(0i64..)
         .map(|(&(arrival, _), i)| arrival as i64 - i * period)
         .min()
         .unwrap();
-    let truth = by_id
-        .iter()
-        .zip(0i64..)
-        .map(|(&(_, sent), i)| sent as i64 - (origin + i * period))
-        .collect();
-    (truth, by_id[0].0 as i64 - origin, stalled)
+    let intended = |i: i64| origin + i * period;
+    Truth {
+        truth_ns: by_index
+            .iter()
+            .zip(0i64..)
+            .map(|(&(_, sent), i)| sent as i64 - intended(i))
+            .collect(),
+        lateness_ns: by_index
+            .iter()
+            .zip(0i64..)
+            .map(|(&(arrival, _), i)| arrival as i64 - intended(i))
+            .collect(),
+        origin_shift_ns: by_index[0].0 as i64 - origin,
+        stalled,
+    }
 }
 
 /// Nearest rank, the definition tailbench's histogram uses (without its
