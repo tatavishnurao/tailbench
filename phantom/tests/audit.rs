@@ -11,16 +11,21 @@
 //!
 //! Truth. Request `i` carries `x-request-id: i`, which phantom logs as
 //! `client_id`. Its intended send time is `i * PERIOD` after tailbench's
-//! schedule start. tailbench's clock and phantom's are aligned at the arrival
-//! of client_id 0, so
+//! schedule start. tailbench's schedule start is placed on phantom's clock at
 //!
-//! `truth_i = sent_ns_i - (arrival_ns(client_id 0) + i * PERIOD)`.
+//! `origin = min over i of (arrival_ns_i - i * PERIOD)`
 //!
-//! The alignment has about 1 ms of error: client_id 0 arrives after
-//! tailbench's schedule start by its scheduler lag (tokio's timer has
-//! millisecond granularity) plus the loopback trip to the handler, so truth
-//! reads low by that much. tailbench's latency also includes writing and
-//! reading the response, which phantom's sent_ns does not.
+//! (see `truth_from_log` for why), so
+//!
+//! `truth_i = sent_ns_i - (origin + i * PERIOD)`.
+//!
+//! Truth still reads low by the smallest per-request delay between intended
+//! send and phantom's handler entry, and tailbench's latency also includes
+//! writing and reading the response, which phantom's sent_ns does not.
+//!
+//! Scenario C's reference is scenario B's truth: same stall script and rate,
+//! measured by an open-loop (intended-time) observer. Its own log is printed
+//! too, labelled, for information only.
 //!
 //! phantom and tailbench run on separate tokio runtimes, so the server's
 //! timers and the client's schedule do not share worker threads.
@@ -28,6 +33,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use phantom::{Script, ServiceSpec, Stall};
@@ -47,12 +53,11 @@ const STALL: Stall = Stall {
 const BODY: &str = r#"{"model":"any","messages":[{"role":"user","content":"hi"}]}"#;
 
 const NS_PER_MS: f64 = 1e6;
-/// Open-loop pass criteria: |delta| <= max(5 ms, 5% of truth) at p99, p99.9
-/// and max, and <= 3 ms at p50.
+/// Open-loop pass criteria: |delta| <= 5 ms at p99, p99.9 and max, and
+/// <= 3 ms at p50. Absolute, so a large truth earns no extra slack.
 const TAIL_ABS_NS: f64 = 5.0 * NS_PER_MS;
-const TAIL_REL: f64 = 0.05;
 const P50_ABS_NS: f64 = 3.0 * NS_PER_MS;
-/// Closed-loop criterion: tailbench's p99 is below 5% of the truth p99.
+/// Closed-loop criterion: tailbench's p99 is below 5% of scenario B's truth p99.
 const CLOSED_LOOP_MAX_RATIO: f64 = 0.05;
 
 /// A percentile to compare; `None` is the maximum.
@@ -81,8 +86,19 @@ const MAX: Pct = Pct { name: "max", q: None };
 struct Audit {
     result: RunResult,
     truth_ns: Vec<i64>,
+    /// How far the chosen origin is before client_id 0's arrival (>= 0): what
+    /// aligning on client_id 0 would have added to every truth value's error.
+    origin_shift_ns: i64,
     manifest: Value,
     stalled: usize,
+}
+
+/// Scenario B's run, shared by `b_stall_open_loop` and `c_stall_closed_loop`
+/// within one test process: whichever runs first runs it.
+static SCENARIO_B: OnceLock<Audit> = OnceLock::new();
+
+fn scenario_b() -> &'static Audit {
+    SCENARIO_B.get_or_init(|| audit(RunnerKind::OpenLoop, vec![STALL]))
 }
 
 fn runtime(name: &str) -> Runtime {
@@ -152,10 +168,11 @@ fn audit(kind: RunnerKind, stalls: Vec<Stall>) -> Audit {
     server_rt.block_on(phantom.shutdown()).unwrap();
 
     let manifest = read_manifest(&manifest_path);
-    let (truth_ns, stalled) = truth_from_log(&log_path);
+    let (truth_ns, origin_shift_ns, stalled) = truth_from_log(&log_path);
     Audit {
         result,
         truth_ns,
+        origin_shift_ns,
         manifest,
         stalled,
     }
@@ -166,8 +183,9 @@ fn read_manifest(path: &Path) -> Value {
     serde_json::from_str(&text).expect("tailbench manifest is JSON")
 }
 
-/// Truth latency per client_id, and how many requests phantom stalled.
-fn truth_from_log(path: &Path) -> (Vec<i64>, usize) {
+/// Truth latency per client_id, how far the origin is before client_id 0's
+/// arrival, and how many requests phantom stalled.
+fn truth_from_log(path: &Path) -> (Vec<i64>, i64, usize) {
     let text = std::fs::read_to_string(path).unwrap();
     let mut lines = text.lines().map(|l| serde_json::from_str::<Value>(l).unwrap());
     assert_eq!(lines.next().unwrap()["type"], "manifest");
@@ -187,14 +205,26 @@ fn truth_from_log(path: &Path) -> (Vec<i64>, usize) {
         .enumerate()
         .map(|(i, t)| t.unwrap_or_else(|| panic!("client_id {i} not in the log")))
         .collect();
-    let aligned_start = by_id[0].0 as i64;
+    // Why the least-lagged request: arrival_ns_i - i * PERIOD is tailbench's
+    // schedule start on phantom's clock PLUS request i's own delay (scheduler
+    // lag, client send, loopback, header parsing), and that delay is never
+    // negative. Any single request, client_id 0 included, carries its own
+    // delay into every truth value; the minimum over all requests carries only
+    // the smallest one. Stalls do not bias it: phantom applies them after
+    // arrival, and a closed loop's late sends only raise arrivals.
     let period = PERIOD.as_nanos() as i64;
+    let origin = by_id
+        .iter()
+        .zip(0i64..)
+        .map(|(&(arrival, _), i)| arrival as i64 - i * period)
+        .min()
+        .unwrap();
     let truth = by_id
         .iter()
         .zip(0i64..)
-        .map(|(&(_, sent), i)| sent as i64 - (aligned_start + i * period))
+        .map(|(&(_, sent), i)| sent as i64 - (origin + i * period))
         .collect();
-    (truth, stalled)
+    (truth, by_id[0].0 as i64 - origin, stalled)
 }
 
 /// Nearest rank, the definition tailbench's histogram uses (without its
@@ -220,10 +250,16 @@ fn tailbench_at(result: &RunResult, p: Pct) -> f64 {
 /// A table row: (percentile, tailbench ns, truth ns).
 type Row = (Pct, f64, f64);
 
-/// Prints percentile | tailbench | truth | delta | relative, in ms.
-fn table(title: &str, a: &Audit, pcts: &[Pct]) -> Vec<Row> {
-    let mut sorted = a.truth_ns.clone();
+fn sorted(truth_ns: &[i64]) -> Vec<i64> {
+    let mut sorted = truth_ns.to_vec();
     sorted.sort_unstable();
+    sorted
+}
+
+/// Prints percentile | tailbench | truth | delta | relative, in ms, with
+/// `a`'s tailbench numbers against `truth_ns` (normally `a`'s own truth).
+fn table(title: &str, a: &Audit, truth_ns: &[i64], truth_label: &str, pcts: &[Pct]) -> Vec<Row> {
+    let sorted = sorted(truth_ns);
     let rows: Vec<Row> = pcts
         .iter()
         .map(|&p| (p, tailbench_at(&a.result, p), truth_at(&sorted, p)))
@@ -235,7 +271,7 @@ fn table(title: &str, a: &Audit, pcts: &[Pct]) -> Vec<Row> {
     );
     println!(
         "{:<10} | {:>12} | {:>12} | {:>12} | {:>9}",
-        "percentile", "tailbench ms", "truth ms", "delta ms", "relative"
+        "percentile", "tailbench ms", truth_label, "delta ms", "relative"
     );
     for &(p, tb, truth) in &rows {
         println!(
@@ -256,7 +292,10 @@ fn table(title: &str, a: &Audit, pcts: &[Pct]) -> Vec<Row> {
         ),
         None => println!("tailbench scheduler lag: not recorded (closed_loop records none)"),
     }
-    println!("truth aligned at client_id 0's arrival: about 1 ms of alignment error");
+    println!(
+        "truth origin: least-lagged request, {:.3} ms before client_id 0's arrival",
+        a.origin_shift_ns as f64 / NS_PER_MS
+    );
     rows
 }
 
@@ -284,7 +323,7 @@ fn check_open_loop(a: &Audit, rows: &[Row]) {
             let delta = (tb - truth).abs();
             let bound = match p.name {
                 "p50" => P50_ABS_NS,
-                _ => TAIL_ABS_NS.max(TAIL_REL * truth),
+                _ => TAIL_ABS_NS,
             };
             (delta > bound).then(|| {
                 format!(
@@ -303,7 +342,13 @@ fn check_open_loop(a: &Audit, rows: &[Row]) {
 #[ignore = "timing-sensitive, 10 s on the real clock"]
 fn a_control_open_loop() {
     let a = audit(RunnerKind::OpenLoop, vec![]);
-    let rows = table("A. control, no stall, open loop", &a, &[P50, P99, MAX]);
+    let rows = table(
+        "A. control, no stall, open loop",
+        &a,
+        &a.truth_ns,
+        "truth ms",
+        &[P50, P99, MAX],
+    );
     assert_eq!(a.stalled, 0);
     check_open_loop(&a, &rows);
 }
@@ -311,27 +356,51 @@ fn a_control_open_loop() {
 #[test]
 #[ignore = "timing-sensitive, 10 s on the real clock"]
 fn b_stall_open_loop() {
-    let a = audit(RunnerKind::OpenLoop, vec![STALL]);
-    let rows = table("B. stall 2000:500, open loop", &a, &[P50, P99, P999, MAX]);
+    let a = scenario_b();
+    let rows = table(
+        "B. stall 2000:500, open loop",
+        a,
+        &a.truth_ns,
+        "truth ms",
+        &[P50, P99, P999, MAX],
+    );
     assert!(a.stalled > 0, "precondition: phantom stalled no request");
-    check_open_loop(&a, &rows);
+    check_open_loop(a, &rows);
 }
 
 #[test]
 #[ignore = "timing-sensitive, 10 s on the real clock"]
 fn c_stall_closed_loop() {
+    let reused = SCENARIO_B.get().is_some();
+    let b = scenario_b();
     let a = audit(RunnerKind::ClosedLoop, vec![STALL]);
     let rows = table(
-        "C. stall 2000:500, closed loop (truth on the open-loop schedule)",
+        "C. stall 2000:500, closed loop (reference: scenario B truth)",
         &a,
+        &b.truth_ns,
+        "B truth ms",
         &[P99, MAX],
+    );
+    println!(
+        "reference: scenario B's truth, from {} in this process (same stall script and rate, open loop)",
+        if reused {
+            "the run b_stall_open_loop made"
+        } else {
+            "a run made for this test"
+        }
+    );
+    let own = sorted(&a.truth_ns);
+    println!(
+        "C's own log, truth on the open-loop schedule (information only, not the reference): p99 {:.3} ms, max {:.3} ms",
+        truth_at(&own, P99) / NS_PER_MS,
+        truth_at(&own, MAX) / NS_PER_MS
     );
     assert!(a.stalled > 0, "precondition: phantom stalled no request");
     check_manifest(&a, "closed_loop");
     let (_, tb_p99, truth_p99) = rows[0];
     let ratio = tb_p99 / truth_p99;
     println!(
-        "closed-loop p99 is {:.2}% of the truth p99. Cause: tailbench runner {} (from its manifest) \
+        "closed-loop p99 is {:.2}% of scenario B's truth p99. Cause: tailbench runner {} (from its manifest) \
          measures latency from the ACTUAL send and sends nothing while a response is outstanding, \
          so the time requests waited to be sent during the stall is not measured (coordinated omission).",
         ratio * 100.0,
@@ -339,7 +408,7 @@ fn c_stall_closed_loop() {
     );
     assert!(
         ratio < CLOSED_LOOP_MAX_RATIO,
-        "closed-loop p99 {:.3} ms is not below {}% of truth p99 {:.3} ms",
+        "closed-loop p99 {:.3} ms is not below {}% of scenario B's truth p99 {:.3} ms",
         tb_p99 / NS_PER_MS,
         CLOSED_LOOP_MAX_RATIO * 100.0,
         truth_p99 / NS_PER_MS
