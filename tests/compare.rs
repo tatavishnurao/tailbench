@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use tailbench::compare::{CompareWarning, Comparison, RecordedRun, Verdict, compare};
+use tailbench::compare::{
+    CompareWarning, Comparison, EpisodeOutcome, RecordedRun, SplitOptions, Verdict, compare, compare_split,
+};
 use tailbench::manifest::{Manifest, Probe};
 use tailbench::stats::{CiWarning, SplitMix64};
 use tailbench::{RunConfig, RunnerKind, closed_loop, open_loop};
@@ -37,6 +39,8 @@ const P99: f64 = 0.99;
 /// - Seeded per run: the seed fixes this run's median and every service time.
 /// - Run effect: the run's median is MEDIAN_NS * exp(RUN_SIGMA * z), z ~ N(0, 1),
 ///   drawn first, so runs with different seeds differ a little as a whole.
+/// - Optional body scale: the run's median is multiplied by it, so every
+///   service time but FLOOR is that much slower (`scaled`).
 /// - Service time = FLOOR + run median * exp(SIGMA * z_i), z_i ~ N(0, 1),
 ///   drawn from `SplitMix64` when `call` is invoked (at send time).
 /// - On the paused clock a sleep ends on a whole-millisecond tick, so the
@@ -53,8 +57,12 @@ struct SeededServer {
 
 impl SeededServer {
     fn starting_now(seed: u64, stalled: bool) -> Self {
+        Self::scaled(seed, stalled, 1.0)
+    }
+
+    fn scaled(seed: u64, stalled: bool, scale: f64) -> Self {
         let mut rng = SplitMix64::new(seed);
-        let run_median_ns = MEDIAN_NS * (RUN_SIGMA * rng.normal()).exp();
+        let run_median_ns = scale * MEDIAN_NS * (RUN_SIGMA * rng.normal()).exp();
         let stall = stalled.then(|| {
             let start = Instant::now() + STALL_AT;
             (start, start + STALL_FOR)
@@ -110,9 +118,19 @@ async fn open_runs(
     seeds: impl IntoIterator<Item = u64>,
     stalled: impl Fn(usize) -> bool,
 ) -> Vec<RecordedRun> {
+    open_runs_scaled(manifest, seeds, stalled, 1.0).await
+}
+
+/// `open_runs` with every run's body slower by `scale`.
+async fn open_runs_scaled(
+    manifest: &Manifest,
+    seeds: impl IntoIterator<Item = u64>,
+    stalled: impl Fn(usize) -> bool,
+    scale: f64,
+) -> Vec<RecordedRun> {
     let mut runs = Vec::new();
     for (i, seed) in seeds.into_iter().enumerate() {
-        let mut server = SeededServer::starting_now(seed, stalled(i));
+        let mut server = SeededServer::scaled(seed, stalled(i), scale);
         let result = open_loop(INTERVAL, COUNT, || server.call()).await;
         let mut manifest = manifest.clone();
         manifest.seed = Some(seed);
@@ -282,6 +300,89 @@ async fn closed_loop_input_is_refused() {
     println!("{both_closed}");
     assert!(matches!(both_closed.verdict, Verdict::Refused { .. }), "{both_closed}");
     assert!(reason(&both_closed).contains("coordinated omission"), "{both_closed}");
+}
+
+/// R for the split tests. A stall in every B run and none in A, at R = 5
+/// and equal exposure, gives at best k_A = 0 of k = 5 episodes: two-sided
+/// p = 2 / 2^5 = 0.0625, which cannot reject at 0.05. R = 10 can
+/// (p = 2 / 2^10).
+const SPLIT_RUNS: usize = 10;
+
+/// A stall in every B run and no other change: B has more episodes per
+/// minute, and the body gives no direction. The body leaves out every
+/// request sent during the 1 s stall: the last ones before its end wait
+/// less than T (60 ms) and, left in, made the body read 1.4 ms slower.
+#[tokio::test(start_paused = true)]
+async fn split_stall_in_every_b_run_is_more_episodes_and_no_body_verdict() {
+    let m = clean_manifest(RunnerKind::OpenLoop);
+    let a = open_runs(&m, seeds(1, SPLIT_RUNS), never).await;
+    let b = open_runs(&m, seeds(101, SPLIT_RUNS), always).await;
+    let s = compare_split(&a, &b, P99, SplitOptions::default());
+    println!("{s}");
+    assert_eq!(s.episodes.outcome, EpisodeOutcome::More, "{s}");
+    assert!(s.episodes.p.unwrap() < 0.05, "{s}");
+    assert!(matches!(s.body.verdict, Verdict::Inconclusive { .. }), "{s}");
+}
+
+/// B's body 1.2x slower and no stalls: the body says Slower, and at
+/// T = 10 x median the body has no episodes of its own, so the episode test
+/// has too few to run.
+#[tokio::test(start_paused = true)]
+async fn split_body_regression_without_stalls_is_slower_body() {
+    let m = clean_manifest(RunnerKind::OpenLoop);
+    let a = open_runs(&m, seeds(1, RUNS), never).await;
+    let b = open_runs_scaled(&m, seeds(101, RUNS), never, 1.2).await;
+    let s = compare_split(&a, &b, P99, SplitOptions::default());
+    println!("{s}");
+    assert!(matches!(s.body.verdict, Verdict::Slower { .. }), "{s}");
+    let EpisodeOutcome::Inconclusive { reasons } = &s.episodes.outcome else {
+        panic!("expected Inconclusive episodes: {s}");
+    };
+    assert!(reasons.iter().any(|r| r.starts_with("too few episodes")), "{s}");
+}
+
+/// Stalls in 2 of 10 runs on both sides, and B's body 1.2x slower: the
+/// stalls fill each stalled run's p99, but the body still shows B slower.
+#[tokio::test(start_paused = true)]
+async fn split_body_regression_under_equal_stalls_is_slower_body() {
+    let m = clean_manifest(RunnerKind::OpenLoop);
+    let every_fifth = |i: usize| i.is_multiple_of(5);
+    let a = open_runs(&m, seeds(1, SPLIT_RUNS), every_fifth).await;
+    let b = open_runs_scaled(&m, seeds(101, SPLIT_RUNS), every_fifth, 1.2).await;
+    let s = compare_split(&a, &b, P99, SplitOptions::default());
+    println!("{s}");
+    println!(
+        "per-run p99 of all samples: {}",
+        compare(&a, &b, P99, Duration::from_millis(1))
+    );
+    assert!(matches!(s.body.verdict, Verdict::Slower { .. }), "{s}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn split_closed_loop_input_is_refused_for_both_parts() {
+    let open_m = clean_manifest(RunnerKind::OpenLoop);
+    let closed_m = clean_manifest(RunnerKind::ClosedLoop);
+    let mut closed = Vec::new();
+    for seed in seeds(101, RUNS) {
+        let mut server = SeededServer::starting_now(seed, true);
+        let result = closed_loop(INTERVAL, COUNT, || server.call()).await;
+        closed.push(RecordedRun {
+            result,
+            manifest: closed_m.clone(),
+        });
+    }
+    let open = open_runs(&open_m, seeds(1, RUNS), never).await;
+    let s = compare_split(&open, &closed, P99, SplitOptions::default());
+    println!("{s}");
+    assert!(
+        matches!(&s.body.verdict, Verdict::Refused { reason } if reason.contains("coordinated omission")),
+        "{s}"
+    );
+    assert!(
+        matches!(&s.episodes.outcome, EpisodeOutcome::Refused { reason } if reason.contains("coordinated omission")),
+        "{s}"
+    );
+    assert_eq!((s.threshold, s.episodes.p), (None, None));
 }
 
 /// False verdict rate: A and B from the same distribution (different seeds,
