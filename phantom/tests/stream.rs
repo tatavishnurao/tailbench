@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use phantom::{
-    Phantom, Script, ServiceSpec, Stall, StreamSpec, parse_itl_lognormal, parse_itl_ms, parse_output_tokens,
-    parse_ttft_lognormal, parse_ttft_ms,
+    Phantom, RoleChunk, Script, ServiceSpec, Stall, StreamSpec, parse_itl_lognormal, parse_itl_ms, parse_output_tokens,
+    parse_role_chunk, parse_ttft_lognormal, parse_ttft_ms,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -32,15 +32,18 @@ const OLD_KEYS: [&str; 6] = [
     "stall_wait_ns",
     "sent_ns",
 ];
-const STREAM_KEYS: [&str; 7] = [
+const STREAM_KEYS: [&str; 8] = [
     "stream",
     "endpoint",
     "scripted_ttft_ns",
     "scripted_itl_ns",
     "token_ns",
+    "scheduled_token_ns",
     "token_stall_wait_ns",
     "output_tokens",
 ];
+/// Chat streams only.
+const ROLE_CHUNK_KEY: &str = "role_chunk_ns";
 
 struct Harness {
     phantom: Phantom,
@@ -171,39 +174,53 @@ fn chat_body(extra: Value) -> Value {
 }
 
 /// What every streaming line must satisfy, whatever the script: the shape of
-/// the streaming fields, and that no token was handed off before its scripted
-/// schedule (TTFT from arrival, then each ITL from the previous hand-off, then
-/// any stall wait).
-fn check_stream_line(r: &Value, endpoint: &str, tokens: usize) {
+/// the streaming fields, the exact scripted draws and absolute schedule
+/// (token 0 at arrival + TTFT, token k at the previous scheduled time +
+/// ITL_k, shifted to a stall window's end, with every later scheduled time
+/// shifted with it), and that no token was handed off before its schedule.
+fn check_stream_line(r: &Value, script: &Script, endpoint: &str, tokens: usize) {
     let mut expected: BTreeSet<&str> = OLD_KEYS.into();
     expected.extend(STREAM_KEYS);
+    if endpoint == CHAT {
+        expected.insert(ROLE_CHUNK_KEY);
+    }
     assert_eq!(keys(r), expected, "{r}");
     assert_eq!(r["stream"], true, "{r}");
     assert_eq!(r["endpoint"], endpoint, "{r}");
     assert_eq!(field(r, "output_tokens"), tokens as u64, "{r}");
+    let seq = field(r, "seq");
     let (ttft, itl) = (field(r, "scripted_ttft_ns"), array(r, "scripted_itl_ns"));
-    let (token_ns, waits) = (array(r, "token_ns"), array(r, "token_stall_wait_ns"));
+    let (token_ns, scheduled, waits) = (
+        array(r, "token_ns"),
+        array(r, "scheduled_token_ns"),
+        array(r, "token_stall_wait_ns"),
+    );
+    assert_eq!(ttft, script.scripted_ttft_ns(seq), "{r}");
+    let expected_itl: Vec<u64> = (1..tokens as u64).map(|k| script.scripted_itl_ns(seq, k)).collect();
+    assert_eq!(itl, expected_itl, "one ITL per gap, from the script: {r}");
     assert_eq!(token_ns.len(), tokens, "{r}");
-    assert_eq!(waits.len(), tokens, "{r}");
-    assert_eq!(itl.len(), tokens - 1, "one ITL per gap: {r}");
     assert!(
         token_ns.windows(2).all(|w| w[0] < w[1]),
         "token_ns not strictly increasing: {r}"
     );
 
     let arrival = field(r, "arrival_ns");
-    let mut scheduled = arrival + ttft;
+    let (mut expected_scheduled, mut expected_waits) = (Vec::new(), Vec::new());
+    let mut at = arrival + ttft;
     for k in 0..tokens {
         if k > 0 {
-            scheduled = token_ns[k - 1] + itl[k - 1];
-            assert!(
-                token_ns[k] - token_ns[k - 1] >= itl[k - 1],
-                "gap {k} below its ITL: {r}"
-            );
+            at += itl[k - 1];
         }
-        assert!(token_ns[k] >= scheduled + waits[k], "token {k} handed off early: {r}");
+        let wait = script.stall_wait_ns(at);
+        at += wait;
+        expected_scheduled.push(at);
+        expected_waits.push(wait);
     }
-    assert!(token_ns[0] - arrival >= ttft, "{r}");
+    assert_eq!(scheduled, expected_scheduled, "scheduled_token_ns: {r}");
+    assert_eq!(waits, expected_waits, "token_stall_wait_ns: {r}");
+    for k in 0..tokens {
+        assert!(token_ns[k] >= scheduled[k], "token {k} handed off early: {r}");
+    }
     // The old fields keep their meaning for streams: the scripted total and
     // the total time stalls added.
     assert_eq!(field(r, "scripted_service_ns"), ttft + itl.iter().sum::<u64>(), "{r}");
@@ -214,6 +231,13 @@ fn check_stream_line(r: &Value, endpoint: &str, tokens: usize) {
         sent - arrival >= field(r, "stall_wait_ns") + field(r, "scripted_service_ns"),
         "{r}"
     );
+    if endpoint == CHAT {
+        let role = field(r, ROLE_CHUNK_KEY);
+        assert!(role >= arrival && role <= token_ns[0], "role chunk after token 0: {r}");
+        if script.role_chunk() == RoleChunk::WithFirstToken {
+            assert!(role >= scheduled[0], "role chunk before token 0's schedule: {r}");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -223,7 +247,8 @@ async fn chat_stream_has_scripted_ttft_and_itl() {
         itl: fixed(10),
         output_tokens: 8,
     };
-    let h = launch(script(1, vec![], stream)).await;
+    let script = script(1, vec![], stream);
+    let h = launch(script.clone()).await;
     let reply = post_json(&h, CHAT, chat_body(json!({}))).await;
     let (manifest, reqs) = h.finish().await;
 
@@ -254,7 +279,7 @@ async fn chat_stream_has_scripted_ttft_and_itl() {
 
     assert_eq!(reqs.len(), 1);
     let r = &reqs[0];
-    check_stream_line(r, CHAT, 8);
+    check_stream_line(r, &script, CHAT, 8);
     assert_eq!(field(r, "scripted_ttft_ns"), 50 * MS, "{r}");
     assert_eq!(array(r, "scripted_itl_ns"), vec![10 * MS; 7], "{r}");
     assert_eq!(array(r, "token_stall_wait_ns"), vec![0; 8], "{r}");
@@ -281,7 +306,8 @@ async fn max_tokens_truncates_and_output_tokens_is_the_default() {
         itl: fixed(2),
         output_tokens: 5,
     };
-    let h = launch(script(1, vec![], stream)).await;
+    let script = script(1, vec![], stream);
+    let h = launch(script.clone()).await;
     assert_eq!(content_chunks(&h, json!({"max_tokens": 3})).await, 3);
     assert_eq!(content_chunks(&h, json!({})).await, 5);
     assert_eq!(
@@ -299,7 +325,7 @@ async fn max_tokens_truncates_and_output_tokens_is_the_default() {
     let logged: Vec<u64> = reqs.iter().map(|r| field(r, "output_tokens")).collect();
     assert_eq!(logged, [3, 5, 5, 1, 5, 5]);
     for r in &reqs {
-        check_stream_line(r, CHAT, field(r, "output_tokens") as usize);
+        check_stream_line(r, &script, CHAT, field(r, "output_tokens") as usize);
     }
 }
 
@@ -312,7 +338,7 @@ async fn defaults_are_service_spec_ttft_10ms_itl_and_32_tokens() {
     assert_eq!(manifest["ttft"], json!({"kind": "fixed", "ms": 3}), "{manifest}");
     assert_eq!(manifest["itl"], json!({"kind": "fixed", "ms": 10}), "{manifest}");
     assert_eq!(manifest["output_tokens"], 32, "{manifest}");
-    check_stream_line(&reqs[0], CHAT, 32);
+    check_stream_line(&reqs[0], &script, CHAT, 32);
     assert_eq!(field(&reqs[0], "scripted_ttft_ns"), 3 * MS);
     assert_eq!(array(&reqs[0], "scripted_itl_ns"), vec![10 * MS; 31]);
 }
@@ -345,13 +371,9 @@ async fn scripted_by_seq(seed: u64, n: usize) -> Vec<(u64, Vec<u64>)> {
     assert_eq!(seqs, (0..n as u64).collect::<Vec<_>>());
     reqs.iter()
         .map(|r| {
-            check_stream_line(r, CHAT, 4);
-            let seq = field(r, "seq");
-            let (ttft, itl) = (field(r, "scripted_ttft_ns"), array(r, "scripted_itl_ns"));
-            assert_eq!(ttft, script.scripted_ttft_ns(seq), "{r}");
-            let expected: Vec<u64> = (1..4).map(|k| script.scripted_itl_ns(seq, k)).collect();
-            assert_eq!(itl, expected, "{r}");
-            (ttft, itl)
+            // Checks the draws against the script's pure functions.
+            check_stream_line(r, &script, CHAT, 4);
+            (field(r, "scripted_ttft_ns"), array(r, "scripted_itl_ns"))
         })
         .collect()
 }
@@ -400,11 +422,12 @@ fn ttft_itl_and_service_draws_are_distinct_streams() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stall_delays_only_the_token_scheduled_inside_it() {
-    // t0 is this request's arrival. Tokens are scheduled about 50, 70, 90,
-    // 110, ... ms after it (plus timer overshoot), so one lands inside the
-    // window [100 ms, 160 ms) and is emitted at its end.
-    let (start, end) = (100 * MS, 160 * MS);
+async fn stall_shifts_the_rest_of_the_schedule_and_keeps_its_gaps() {
+    // t0 is this request's arrival, a few µs before arrival_ns. Tokens are
+    // scheduled at arrival + 50, 70, 90, 110, ... ms, so token 3 lands inside
+    // the window [100 ms, 160 ms): it moves to 160 ms, and every later token
+    // moves with it, keeping its scripted 20 ms gap.
+    let end = 160 * MS;
     let stall = Stall {
         start_ms: 100,
         len_ms: 60,
@@ -414,47 +437,118 @@ async fn stall_delays_only_the_token_scheduled_inside_it() {
         itl: fixed(20),
         output_tokens: 10,
     };
-    let h = launch(script(1, vec![stall], stream)).await;
+    let script = script(1, vec![stall], stream);
+    let h = launch(script.clone()).await;
     content_chunks(&h, json!({})).await;
     let (_, reqs) = h.finish().await;
     let r = &reqs[0];
-    check_stream_line(r, CHAT, 10);
+    check_stream_line(r, &script, CHAT, 10);
 
-    let (token_ns, waits, itl) = (
-        array(r, "token_ns"),
-        array(r, "token_stall_wait_ns"),
-        array(r, "scripted_itl_ns"),
+    let arrival = field(r, "arrival_ns");
+    assert!(arrival < 10 * MS, "precondition: arrival close to t0: {r}");
+    let (scheduled, waits) = (array(r, "scheduled_token_ns"), array(r, "token_stall_wait_ns"));
+    let mut expected_waits = vec![0; 10];
+    expected_waits[3] = end - (arrival + 110 * MS);
+    assert_eq!(waits, expected_waits, "{r}");
+    let expected: Vec<u64> = (0..10)
+        .map(|k| {
+            if k < 3 {
+                arrival + (50 + 20 * k) * MS
+            } else {
+                end + (k - 3) * 20 * MS
+            }
+        })
+        .collect();
+    assert_eq!(scheduled, expected, "{r}");
+}
+
+/// Not a bound: prints how far behind the absolute schedule a 64-token stream
+/// at a 10 ms ITL was handed off, the overshoot the schedule no longer lets
+/// accumulate.
+#[tokio::test(flavor = "multi_thread")]
+async fn smoke_overshoot_of_a_64_token_stream_at_10ms_itl() {
+    let stream = StreamSpec {
+        ttft: Some(fixed(10)),
+        itl: fixed(10),
+        output_tokens: 64,
+    };
+    let script = script(1, vec![], stream);
+    let h = launch(script.clone()).await;
+    content_chunks(&h, json!({})).await;
+    let (_, reqs) = h.finish().await;
+    let r = &reqs[0];
+    check_stream_line(r, &script, CHAT, 64);
+    let (token_ns, scheduled) = (array(r, "token_ns"), array(r, "scheduled_token_ns"));
+    let overshoot: Vec<u64> = token_ns.iter().zip(&scheduled).map(|(t, s)| t - s).collect();
+    println!(
+        "smoke: 64 tokens at ITL 10 ms: max(token_ns - scheduled_token_ns) = {:.3} ms, last token {:.3} ms",
+        *overshoot.iter().max().unwrap() as f64 / MS as f64,
+        overshoot[63] as f64 / MS as f64
     );
-    let mut stalled = Vec::new();
-    for k in 0..10 {
-        let scheduled = if k == 0 {
-            field(r, "arrival_ns") + field(r, "scripted_ttft_ns")
-        } else {
-            token_ns[k - 1] + itl[k - 1]
-        };
-        let expected = if (start..end).contains(&scheduled) {
-            stalled.push(k);
-            end - scheduled
-        } else {
-            0
-        };
-        assert_eq!(waits[k], expected, "token {k}: {r}");
-    }
+}
+
+/// Streams one chat and one completions request with the role chunk sent
+/// `role_chunk`, and returns (chat reply's chunks, chat line, completions line).
+async fn role_chunk_run(role_chunk: RoleChunk) -> (Vec<Value>, Value, Value) {
+    let stream = StreamSpec {
+        ttft: Some(fixed(200)),
+        itl: fixed(10),
+        output_tokens: 3,
+    };
+    let script = script(1, vec![], stream).with_role_chunk(role_chunk);
+    assert_eq!(script.role_chunk(), role_chunk);
+    let h = launch(script.clone()).await;
+    let chat = sse_chunks(&post_json(&h, CHAT, chat_body(json!({}))).await);
+    let completions = post_json(&h, COMPLETIONS, json!({"prompt": "hi", "stream": true})).await;
+    assert_eq!(sse_chunks(&completions).len(), 3 + 1, "no role chunk for completions");
+    let (manifest, mut reqs) = h.finish().await;
+    let expected_manifest = match role_chunk {
+        RoleChunk::WithFirstToken => "with-first-token",
+        RoleChunk::AtArrival => "at-arrival",
+    };
+    assert_eq!(manifest["role_chunk"], expected_manifest, "{manifest}");
+    reqs.sort_by_key(|r| field(r, "seq"));
+    check_stream_line(&reqs[0], &script, CHAT, 3);
+    check_stream_line(&reqs[1], &script, COMPLETIONS, 3);
+    (chat, reqs[0].clone(), reqs[1].clone())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn role_chunk_with_first_token_is_the_default() {
     assert_eq!(
-        stalled.len(),
-        1,
-        "precondition: exactly one token scheduled inside the window: {r}"
+        Script::new(1, fixed(1), vec![]).unwrap().role_chunk(),
+        RoleChunk::WithFirstToken
     );
-    let k = stalled[0];
+    let (chunks, r, _) = role_chunk_run(RoleChunk::WithFirstToken).await;
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant", "{:?}", chunks[0]);
+    let role = field(&r, ROLE_CHUNK_KEY);
+    // Handed off just before token 0, once its schedule (arrival + TTFT) has passed.
+    assert!(role >= array(&r, "scheduled_token_ns")[0], "{r}");
+    assert!(role <= array(&r, "token_ns")[0], "{r}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn role_chunk_at_arrival_is_sent_before_ttft() {
+    let (chunks, r, _) = role_chunk_run(RoleChunk::AtArrival).await;
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant", "{:?}", chunks[0]);
+    assert_eq!(chunks.len(), 1 + 3 + 1, "role, 3 tokens, finish: {chunks:?}");
+    let (arrival, role) = (field(&r, "arrival_ns"), field(&r, ROLE_CHUNK_KEY));
+    // TTFT is 200 ms: a role chunk handed off on arrival is far ahead of it.
+    assert!(role >= arrival, "{r}");
     assert!(
-        k > 0 && k < 9,
-        "precondition: the stall covers the middle of the stream: {r}"
+        role < array(&r, "scheduled_token_ns")[0],
+        "role chunk waited for TTFT: {r}"
     );
-    assert!(token_ns[k] >= end, "{r}");
-    // After the stalled token, every gap is scheduled at its scripted ITL and
-    // nothing else waits.
-    assert!(waits[k + 1..].iter().all(|&w| w == 0), "{r}");
-    assert!(itl[k..].iter().all(|&g| g == 20 * MS), "{r}");
+}
+
+#[test]
+fn role_chunk_flag_values() {
+    assert_eq!(parse_role_chunk("with-first-token"), Ok(RoleChunk::WithFirstToken));
+    assert_eq!(parse_role_chunk("at-arrival"), Ok(RoleChunk::AtArrival));
+    for bad in ["", "arrival", "At-Arrival", "first"] {
+        let err = parse_role_chunk(bad).expect_err(bad).to_string();
+        assert!(err.contains("role chunk") && err.contains("at-arrival"), "{err}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -483,7 +577,7 @@ async fn completions_stream_has_the_same_timing_and_log_fields() {
     assert_eq!(field(&chunks[4]["usage"], "completion_tokens"), 4);
 
     let r = &reqs[0];
-    check_stream_line(r, COMPLETIONS, 4);
+    check_stream_line(r, &script, COMPLETIONS, 4);
     assert_eq!(field(r, "scripted_ttft_ns"), 50 * MS, "{r}");
     assert_eq!(array(r, "scripted_itl_ns"), vec![10 * MS; 3], "{r}");
     assert_eq!(field(r, "scripted_ttft_ns"), script.scripted_ttft_ns(0));
@@ -593,4 +687,5 @@ fn cli_refuses_invalid_stream_flags() {
     refused(&["--itl-lognormal", "2"], "2");
     refused(&["--ttft-ms", "5", "--ttft-lognormal", "5:0.5"], "--ttft-lognormal");
     refused(&["--itl-ms", "5", "--itl-lognormal", "5:0.5"], "--itl-lognormal");
+    refused(&["--role-chunk", "later"], "later");
 }

@@ -186,6 +186,15 @@ fn oha_scenario(title: &str, extra: &[&str]) {
         "oha: status codes {}, errors {}",
         json["statusCodeDistribution"], json["errorDistribution"]
     );
+    let deadline_aborts = json["errorDistribution"]["aborted due to deadline"]
+        .as_u64()
+        .unwrap_or(0);
+    println!(
+        "phantom: {} \"completed\": false lines; oha \"aborted due to deadline\": {}; equal: {}",
+        truth.abandoned,
+        deadline_aborts,
+        truth.abandoned as u64 == deadline_aborts
+    );
     println!(
         "{:<6} | {:>9} | {:>13} | {:>8} | {:>8} | {:>14} | {:>8} | {:>15} | {:>8}",
         "pct", "oha ms", "run truth ms", "delta", "relative", "truth@oha-idx", "delta", "cross-run ref", "delta"
@@ -218,7 +227,7 @@ fn oha_scenario(title: &str, extra: &[&str]) {
         lateness.len()
     );
     println!(
-        "phantom: {} requests received, largest arrival gap {:.3} ms, {} arrived in the {} ms after the stall ended, \
+        "phantom: {} requests completed, largest arrival gap {:.3} ms, {} arrived in the {} ms after the stall ended, \
          {} stalled (max stall_wait {:.3} ms)",
         truth.truth_ns.len(),
         ms(summary.largest_gap_ns as f64),

@@ -294,6 +294,8 @@ async fn log_has_a_manifest_then_one_line_per_request() {
         "{m}"
     );
     assert_eq!(m["listen"], addr, "{m}");
+    // The streaming fields are in the manifest even for a non-streaming run.
+    assert_eq!(m["role_chunk"], "with-first-token", "default role chunk: {m}");
     assert!(field(m, "start_unix_ns") > 0, "{m}");
 
     assert_eq!(log.reqs.len(), N + 7, "expected exactly one req line per chat request");

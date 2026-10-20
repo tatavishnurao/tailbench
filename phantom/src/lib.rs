@@ -10,7 +10,11 @@
 //!
 //! A request with `"stream": true` is answered as Server-Sent Events, one
 //! chunk per token, on a scripted time to first token (TTFT) and inter-token
-//! latency (ITL); its log line also records when each token was handed off.
+//! latency (ITL); its log line also records when each token was scheduled
+//! and when it was handed off.
+//!
+//! A request whose client goes away before its response is finished still
+//! gets a line, marked `"completed": false`.
 //!
 //! Times in the log are nanoseconds since t0, the arrival of the first
 //! non-healthz request, on the server's own monotonic clock.
@@ -210,6 +214,30 @@ fn split_pair(s: &str) -> Option<[&str; 2]> {
     parts.next().is_none().then_some(pair)
 }
 
+/// When a chat stream's role chunk is handed off. Completions streams have
+/// no role chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoleChunk {
+    /// Just before token 0, so the first chunk and the first content chunk
+    /// arrive together.
+    #[default]
+    WithFirstToken,
+    /// As soon as the request arrives, before TTFT.
+    AtArrival,
+}
+
+/// Parses `--role-chunk`: `with-first-token` or `at-arrival`.
+pub fn parse_role_chunk(s: &str) -> Result<RoleChunk, SpecError> {
+    match s {
+        "with-first-token" => Ok(RoleChunk::WithFirstToken),
+        "at-arrival" => Ok(RoleChunk::AtArrival),
+        _ => Err(SpecError(format!(
+            "invalid role chunk {s:?}: expected with-first-token or at-arrival"
+        ))),
+    }
+}
+
 /// How streamed responses are timed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StreamSpec {
@@ -242,6 +270,7 @@ pub struct Script {
     /// `stalls` as [start, end) in ns since t0.
     windows_ns: Vec<(u64, u64)>,
     stream: StreamSpec,
+    role_chunk: RoleChunk,
 }
 
 impl Script {
@@ -275,6 +304,7 @@ impl Script {
             stalls,
             windows_ns,
             stream: StreamSpec::default(),
+            role_chunk: RoleChunk::default(),
         })
     }
 
@@ -297,6 +327,13 @@ impl Script {
         Ok(self)
     }
 
+    /// Sets when a chat stream's role chunk is handed off (default:
+    /// `RoleChunk::WithFirstToken`).
+    pub fn with_role_chunk(mut self, role_chunk: RoleChunk) -> Self {
+        self.role_chunk = role_chunk;
+        self
+    }
+
     pub fn seed(&self) -> u64 {
         self.seed
     }
@@ -311,6 +348,10 @@ impl Script {
 
     pub fn stream(&self) -> StreamSpec {
         self.stream
+    }
+
+    pub fn role_chunk(&self) -> RoleChunk {
+        self.role_chunk
     }
 
     /// The TTFT spec in effect: `--ttft-*` if given, else the service spec.
@@ -414,6 +455,8 @@ struct Manifest<'a> {
     ttft: ServiceSpec,
     itl: ServiceSpec,
     output_tokens: u64,
+    /// When a chat stream's role chunk is sent.
+    role_chunk: RoleChunk,
     listen: String,
     /// Wall-clock start, for matching runs up; never used for intervals.
     start_unix_ns: u64,
@@ -421,17 +464,33 @@ struct Manifest<'a> {
 }
 
 /// One line per chat or completions request; all times are ns since t0.
+///
+/// A completed request has every field but `completed` and `abandoned_ns`,
+/// so its line is what it has always been. An abandoned one has
+/// `"completed": false`, `abandoned_ns` instead of `sent_ns`, and whatever
+/// else was known when it was dropped.
 #[derive(Serialize)]
 #[serde(tag = "type", rename = "req")]
 struct Record {
     seq: u64,
+    /// Abandoned lines only, and then always false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed: Option<bool>,
     arrival_ns: u64,
-    /// For a stream: scripted_ttft_ns + the sum of scripted_itl_ns.
-    scripted_service_ns: u64,
-    /// For a stream: the sum of token_stall_wait_ns.
-    stall_wait_ns: u64,
-    /// For a stream: when the [DONE] event was handed off.
-    sent_ns: u64,
+    /// For a stream: scripted_ttft_ns + the sum of scripted_itl_ns. Omitted
+    /// only if the request was dropped before its body was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scripted_service_ns: Option<u64>,
+    /// For a stream: the sum of token_stall_wait_ns. Omitted like
+    /// scripted_service_ns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stall_wait_ns: Option<u64>,
+    /// For a stream: when the [DONE] event was handed off. Completed only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sent_ns: Option<u64>,
+    /// When the drop was observed. Abandoned only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    abandoned_ns: Option<u64>,
     /// The request's `x-request-id` header, if it is a u64; omitted otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     client_id: Option<u64>,
@@ -448,11 +507,65 @@ struct StreamRecord {
     scripted_ttft_ns: u64,
     /// The scripted gap before each token after the first.
     scripted_itl_ns: Vec<u64>,
-    /// When each token's chunk was handed to the response stream.
+    /// When each token's chunk was handed to the response stream; on an
+    /// abandoned line, only the tokens handed off before the drop, and every
+    /// other per-token array matches it.
     token_ns: Vec<u64>,
-    /// How long a stall held each token past its scheduled time.
+    /// When each token was scheduled, after any stall shift.
+    scheduled_token_ns: Vec<u64>,
+    /// How far a stall shifted each token's schedule (and every later one).
     token_stall_wait_ns: Vec<u64>,
+    /// When the chat role chunk was handed off; omitted for completions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role_chunk_ns: Option<u64>,
+    /// Tokens the response was scripted to carry: on a completed line, the
+    /// tokens sent.
     output_tokens: u64,
+}
+
+/// A request's log line, written exactly once: by `finish` once the
+/// response is complete, or else on drop, as abandoned. A handler's future is
+/// dropped when its client disconnects, and a stream's task stops when the
+/// client stops reading; either way the line is written with what was known
+/// by then.
+struct LogLine {
+    shared: Arc<Shared>,
+    t0: Instant,
+    /// Some until written.
+    record: Option<Record>,
+}
+
+impl LogLine {
+    fn record(&mut self) -> &mut Record {
+        self.record.as_mut().expect("a line is written only by finish or drop")
+    }
+
+    fn stream(&mut self) -> &mut StreamRecord {
+        self.record().stream.as_mut().expect("a streamed request's line")
+    }
+
+    fn finish(mut self, sent_ns: u64) {
+        if let Some(mut record) = self.record.take() {
+            record.sent_ns = Some(sent_ns);
+            self.write(record);
+        }
+    }
+
+    /// Only fails if the writer has stopped on an I/O error, which `shutdown`
+    /// reports.
+    fn write(&self, record: Record) {
+        let _ = self.shared.log.send(record);
+    }
+}
+
+impl Drop for LogLine {
+    fn drop(&mut self) {
+        if let Some(mut record) = self.record.take() {
+            record.completed = Some(false);
+            record.abandoned_ns = Some(nanos(self.t0.elapsed()));
+            self.write(record);
+        }
+    }
 }
 
 struct Shared {
@@ -485,6 +598,7 @@ pub async fn start(listener: TcpListener, script: Script, log_path: &Path) -> io
         ttft: script.ttft_spec(),
         itl: script.stream.itl,
         output_tokens: script.stream.output_tokens,
+        role_chunk: script.role_chunk,
         listen: addr.to_string(),
         start_unix_ns: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, nanos),
         times: "ns since t0, the arrival of the first non-healthz request, on the server's monotonic clock",
@@ -711,31 +825,64 @@ async fn handle(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Bod
     // t0 is read before arrival, so arrival_ns is never negative.
     let t0 = *shared.t0.get_or_init(Instant::now);
     let arrival = Instant::now();
-    // Read so the connection can be reused; only stream and max_tokens matter.
-    let options = RequestOptions::parse(&axum::body::to_bytes(body, MAX_BODY_BYTES).await.unwrap_or_default());
-
     let client_id = headers
         .get(REQUEST_ID_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    let script = &shared.script;
     let arrival_ns = nanos(arrival - t0);
+    // From here on, the request gets a line however it ends.
+    let mut line = LogLine {
+        shared: Arc::clone(&shared),
+        t0,
+        record: Some(Record {
+            seq,
+            completed: None,
+            arrival_ns,
+            scripted_service_ns: None,
+            stall_wait_ns: None,
+            sent_ns: None,
+            abandoned_ns: None,
+            client_id,
+            stream: None,
+        }),
+    };
+    // Read so the connection can be reused; only stream and max_tokens matter.
+    let options = RequestOptions::parse(&axum::body::to_bytes(body, MAX_BODY_BYTES).await.unwrap_or_default());
+
+    let script = &shared.script;
     if options.stream {
         let n = script.stream.output_tokens;
         // min(max_tokens, N), but at least one token.
         let tokens = options.max_tokens.map_or(n, |max| max.min(n)).max(1);
+        let scripted_ttft_ns = script.scripted_ttft_ns(seq);
+        let record = line.record();
+        record.scripted_service_ns = Some(scripted_ttft_ns);
+        record.stall_wait_ns = Some(0);
+        record.stream = Some(StreamRecord {
+            stream: true,
+            endpoint: endpoint.path(),
+            scripted_ttft_ns,
+            scripted_itl_ns: Vec::new(),
+            token_ns: Vec::new(),
+            scheduled_token_ns: Vec::new(),
+            token_stall_wait_ns: Vec::new(),
+            role_chunk_ns: None,
+            output_tokens: tokens,
+        });
         let request = StreamRequest {
             endpoint,
             seq,
             t0,
             arrival_ns,
-            client_id,
             tokens,
         };
-        return stream_response(Arc::clone(&shared), request);
+        return stream_response(line, request);
     }
     let stall_wait_ns = script.stall_wait_ns(arrival_ns);
     let scripted_service_ns = script.scripted_service_ns(seq);
+    let record = line.record();
+    record.scripted_service_ns = Some(scripted_service_ns);
+    record.stall_wait_ns = Some(stall_wait_ns);
     // Held until the window ends, measured from arrival, however long the
     // body took; then serviced.
     sleep_until(arrival + Duration::from_nanos(stall_wait_ns)).await;
@@ -743,17 +890,7 @@ async fn handle(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Bod
 
     let response = Json(endpoint.completion(seq)).into_response();
     let sent_ns = nanos(t0.elapsed());
-    // Only fails if the writer has stopped on an I/O error, which `shutdown`
-    // reports.
-    let _ = shared.log.send(Record {
-        seq,
-        arrival_ns,
-        scripted_service_ns,
-        stall_wait_ns,
-        sent_ns,
-        client_id,
-        stream: None,
-    });
+    line.finish(sent_ns);
     response
 }
 
@@ -763,16 +900,15 @@ struct StreamRequest {
     seq: u64,
     t0: Instant,
     arrival_ns: u64,
-    client_id: Option<u64>,
     tokens: u64,
 }
 
 /// Answers with an event stream fed by `emit_tokens`, which runs as its own
 /// task. The channel is unbounded, so handing a chunk off never waits: the
 /// time taken just before the hand-off is the time it entered the stream.
-fn stream_response(shared: Arc<Shared>, request: StreamRequest) -> Response {
+fn stream_response(line: LogLine, request: StreamRequest) -> Response {
     let (tx, rx) = tokio_mpsc::unbounded_channel::<Event>();
-    tokio::spawn(emit_tokens(shared, request, tx));
+    tokio::spawn(emit_tokens(line, request, tx));
     let events = futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|event| (Ok::<_, Infallible>(event), rx))
     });
@@ -781,41 +917,56 @@ fn stream_response(shared: Arc<Shared>, request: StreamRequest) -> Response {
 
 /// Emits a stream on the script, then logs it.
 ///
-/// Token 0 is scheduled at arrival + TTFT, and token k at the previous
-/// token's hand-off + ITL_k, so every gap is at least its scripted ITL. A
-/// token scheduled inside a stall window is held to the window's end, and the
-/// next gap counts from there. The chat role chunk goes out just before token
-/// 0, so a client that times the first chunk and one that times the first
-/// content chunk see the same TTFT.
+/// The schedule is absolute: token 0 is scheduled at arrival + TTFT, and
+/// token k at token k-1's scheduled time + ITL_k, never at its actual
+/// hand-off, so timer overshoot does not accumulate. A token scheduled inside
+/// a stall window is moved to the window's end, and every later token moves
+/// with it, keeping its scripted gap. The chat role chunk goes out just before
+/// token 0 (`RoleChunk::WithFirstToken`), so a client that times the first
+/// chunk and one that times the first content chunk see the same TTFT, or on
+/// arrival (`RoleChunk::AtArrival`), so they do not.
 ///
-/// If the client goes away, the stream stops at the next hand-off and is not
-/// logged, as no [DONE] was handed off.
-async fn emit_tokens(shared: Arc<Shared>, request: StreamRequest, tx: tokio_mpsc::UnboundedSender<Event>) {
+/// If the client goes away (the response stream, and with it the receiver,
+/// is dropped), the wait for the next token ends at once and the line is
+/// written as abandoned, with the tokens handed off so far.
+async fn emit_tokens(mut line: LogLine, request: StreamRequest, tx: tokio_mpsc::UnboundedSender<Event>) {
     let StreamRequest {
         endpoint,
         seq,
         t0,
         arrival_ns,
-        client_id,
         tokens,
     } = request;
+    let shared = Arc::clone(&line.shared);
     let script = &shared.script;
     let event = |chunk: Value| Event::default().data(chunk.to_string());
-    let scripted_ttft_ns = script.scripted_ttft_ns(seq);
-    let (mut scripted_itl_ns, mut token_ns, mut token_stall_wait_ns) = (Vec::new(), Vec::new(), Vec::new());
-    let mut scheduled = arrival_ns.saturating_add(scripted_ttft_ns);
-    for k in 0..tokens {
-        if let Some(&previous) = token_ns.last() {
-            let itl = script.scripted_itl_ns(seq, k);
-            scripted_itl_ns.push(itl);
-            scheduled = u64::saturating_add(previous, itl);
+    // False if the client has gone.
+    let send_role = |line: &mut LogLine| match endpoint.role_chunk(seq) {
+        Some(role) => {
+            let role = event(role);
+            let handed_off = nanos(t0.elapsed());
+            let sent = tx.send(role).is_ok();
+            if sent {
+                line.stream().role_chunk_ns = Some(handed_off);
+            }
+            sent
         }
+        None => true,
+    };
+    if script.role_chunk == RoleChunk::AtArrival && !send_role(&mut line) {
+        return;
+    }
+    let mut scheduled = arrival_ns.saturating_add(line.stream().scripted_ttft_ns);
+    for k in 0..tokens {
+        let itl = (k > 0).then(|| script.scripted_itl_ns(seq, k));
+        scheduled = scheduled.saturating_add(itl.unwrap_or(0));
         let wait = script.stall_wait_ns(scheduled);
-        sleep_until(t0 + Duration::from_nanos(scheduled.saturating_add(wait))).await;
-        if k == 0
-            && let Some(role) = endpoint.role_chunk(seq)
-            && tx.send(event(role)).is_err()
-        {
+        scheduled = scheduled.saturating_add(wait);
+        tokio::select! {
+            () = sleep_until(t0 + Duration::from_nanos(scheduled)) => {}
+            () = tx.closed() => return,
+        }
+        if k == 0 && script.role_chunk == RoleChunk::WithFirstToken && !send_role(&mut line) {
             return;
         }
         let chunk = event(endpoint.token_chunk(seq));
@@ -823,8 +974,14 @@ async fn emit_tokens(shared: Arc<Shared>, request: StreamRequest, tx: tokio_mpsc
         if tx.send(chunk).is_err() {
             return;
         }
-        token_ns.push(handed_off);
-        token_stall_wait_ns.push(wait);
+        let record = line.record();
+        record.scripted_service_ns = record.scripted_service_ns.map(|ns| ns.saturating_add(itl.unwrap_or(0)));
+        record.stall_wait_ns = record.stall_wait_ns.map(|ns| ns.saturating_add(wait));
+        let stream = line.stream();
+        stream.scripted_itl_ns.extend(itl);
+        stream.token_ns.push(handed_off);
+        stream.scheduled_token_ns.push(scheduled);
+        stream.token_stall_wait_ns.push(wait);
     }
     if tx.send(event(endpoint.finish_chunk(seq, tokens))).is_err() {
         return;
@@ -834,23 +991,7 @@ async fn emit_tokens(shared: Arc<Shared>, request: StreamRequest, tx: tokio_mpsc
     if tx.send(done).is_err() {
         return;
     }
-    let _ = shared.log.send(Record {
-        seq,
-        arrival_ns,
-        scripted_service_ns: scripted_ttft_ns.saturating_add(scripted_itl_ns.iter().sum()),
-        stall_wait_ns: token_stall_wait_ns.iter().sum(),
-        sent_ns,
-        client_id,
-        stream: Some(StreamRecord {
-            stream: true,
-            endpoint: endpoint.path(),
-            scripted_ttft_ns,
-            scripted_itl_ns,
-            token_ns,
-            token_stall_wait_ns,
-            output_tokens: tokens,
-        }),
-    });
+    line.finish(sent_ns);
 }
 
 async fn healthz() -> &'static str {

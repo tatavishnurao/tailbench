@@ -189,6 +189,7 @@ pub fn audit(kind: RunnerKind, stalls: Vec<Stall>) -> Audit {
 
     let manifest = read_manifest(&manifest_path);
     let truth = truth_from_log(&log, Key::ClientId);
+    assert_eq!(truth.abandoned, 0, "tailbench abandoned no request");
     assert_eq!(truth.truth_ns.len(), COUNT as usize, "every client_id is in the log");
     Audit {
         result,
@@ -226,13 +227,17 @@ impl Key {
     }
 }
 
-/// Intended-schedule truth for one run, indexed by `i`.
+/// Intended-schedule truth for one run, over the completed requests in index
+/// order (indexed by `i` when none was abandoned).
 pub struct Truth {
     /// `sent_ns_i - (origin + i * PERIOD)`.
     pub truth_ns: Vec<i64>,
     /// `arrival_ns_i - (origin + i * PERIOD)`: how late request `i` reached
     /// phantom after its intended send time, its send lateness plus the trip.
     pub lateness_ns: Vec<i64>,
+    /// Lines with `"completed": false`: the client went away first. They keep
+    /// their index but have no sent_ns, so they are in no truth value.
+    pub abandoned: usize,
     /// How far the origin is before request 0's arrival (>= 0): what aligning
     /// on request 0 would have added to every truth value's error.
     pub origin_shift_ns: i64,
@@ -240,14 +245,15 @@ pub struct Truth {
     pub stalled: usize,
 }
 
-/// Truth for every request in phantom's log, indexed by `key`. Panics if an
-/// index in 0..=max is missing or logged twice.
+/// Truth for every completed request in phantom's log, indexed by `key`.
+/// Panics if an index in 0..=max is missing or logged twice; an abandoned
+/// line counts as present.
 pub fn truth_from_log(text: &str, key: Key) -> Truth {
     let mut lines = text.lines().map(|l| serde_json::from_str::<Value>(l).unwrap());
     assert_eq!(lines.next().unwrap()["type"], "manifest");
-    // (arrival_ns, sent_ns) by index.
-    let mut by_index: Vec<Option<(u64, u64)>> = Vec::new();
-    let mut stalled = 0;
+    // Some((arrival_ns, sent_ns)) by index, or None if abandoned.
+    let mut by_index: Vec<Option<Option<(u64, u64)>>> = Vec::new();
+    let (mut stalled, mut abandoned) = (0, 0);
     for r in lines {
         let i = r[key.field()]
             .as_u64()
@@ -255,16 +261,25 @@ pub fn truth_from_log(text: &str, key: Key) -> Truth {
         if by_index.len() <= i {
             by_index.resize(i + 1, None);
         }
-        let times = (r["arrival_ns"].as_u64().unwrap(), r["sent_ns"].as_u64().unwrap());
+        let times = if r["completed"] == false {
+            abandoned += 1;
+            None
+        } else {
+            Some((r["arrival_ns"].as_u64().unwrap(), r["sent_ns"].as_u64().unwrap()))
+        };
         assert!(by_index[i].replace(times).is_none(), "{} {i} logged twice", key.field());
         if r["stall_wait_ns"].as_u64().unwrap() > 0 {
             stalled += 1;
         }
     }
-    let by_index: Vec<(u64, u64)> = by_index
+    // (i, arrival_ns, sent_ns) for the completed requests.
+    let completed: Vec<(i64, u64, u64)> = by_index
         .into_iter()
         .enumerate()
-        .map(|(i, t)| t.unwrap_or_else(|| panic!("{} {i} not in the log", key.field())))
+        .filter_map(|(i, t)| {
+            t.unwrap_or_else(|| panic!("{} {i} not in the log", key.field()))
+                .map(|(arrival, sent)| (i as i64, arrival, sent))
+        })
         .collect();
     // Why the least-lagged request: arrival_ns_i - i * PERIOD is the schedule
     // start on phantom's clock PLUS request i's own delay (scheduler lag,
@@ -274,25 +289,24 @@ pub fn truth_from_log(text: &str, key: Key) -> Truth {
     // smallest one. Stalls do not bias it: phantom applies them after arrival,
     // and late sends only raise arrivals.
     let period = period_ns();
-    let origin = by_index
+    let origin = completed
         .iter()
-        .zip(0i64..)
-        .map(|(&(arrival, _), i)| arrival as i64 - i * period)
+        .map(|&(i, arrival, _)| arrival as i64 - i * period)
         .min()
         .unwrap();
     let intended = |i: i64| origin + i * period;
     Truth {
-        truth_ns: by_index
+        truth_ns: completed
             .iter()
-            .zip(0i64..)
-            .map(|(&(_, sent), i)| sent as i64 - intended(i))
+            .map(|&(i, _, sent)| sent as i64 - intended(i))
             .collect(),
-        lateness_ns: by_index
+        lateness_ns: completed
             .iter()
-            .zip(0i64..)
-            .map(|(&(arrival, _), i)| arrival as i64 - intended(i))
+            .map(|&(i, arrival, _)| arrival as i64 - intended(i))
             .collect(),
-        origin_shift_ns: by_index[0].0 as i64 - origin,
+        abandoned,
+        // Request 0's, or the first completed request's if 0 was abandoned.
+        origin_shift_ns: completed[0].1 as i64 - intended(completed[0].0),
         stalled,
     }
 }
