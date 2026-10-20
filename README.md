@@ -79,7 +79,37 @@ A false verdict means naming a direction when A and B come from the same distrib
 p99 in a verdict is the mean of the per-run p99s, not the p99 of all samples pooled.
 
 - **Power.** With R = 10 and no stalls, Welch detects a +10% p99 regression in 62–88% of trials at correlation 0.5, but only in 21–28% at correlation 0.9 (docs/calibration.md, power table).
-- **Stalls.** When a stall covers more than 1% of a run, that run's p99 lands inside the stall. Per-run p99 then cannot detect a regression in the rest of the distribution: Welch at R = 10 detects a +20% regression in at most 4% of trials with stalls (docs/calibration.md). A verdict that splits the body from the stall episodes is planned.
+## Split verdict: body vs stalls
+
+When stalls cover more than 1% of a run, that run's p99 is stall time. A +20% regression in normal requests is then detected in at most 4% of trials by per-run Welch at R = 10 (docs/calibration.md, power at p99, with stalls).
+
+`compare_split` reports two parts. The body is the requests sent outside any episode window, compared by per-run p99. Episodes are runs of requests at or above T (default 10 x the pooled median), compared as a rate per minute with an exposure-weighted exact test.
+
+Real output, from `cargo test --test compare split_body_regression_under_equal_stalls -- --nocapture` (equal stalls in 2 of 10 runs per side, B body x1.2, R = 10):
+
+```text
+body: B slower at p99 (mean per-run, episodes excluded) by 2.9 ms [1.9, 3.9], 10 vs 10 runs, Welch t df 12.7, nominal 95%
+episodes (>= 60.0 ms = 10 x pooled median 6.0 ms): A 2 in 10 runs, 100.0 s (1.20/min, 2.03% of time), B 2 in 10 runs, 100.0 s (1.20/min, 2.05% of time); inconclusive, p = 1.00; with 4 episodes no split between A and B is significant at 95%
+```
+
+And from `cargo test --lib split_poisson_stalls_rate_change -- --nocapture` (Poisson stalls 0.2/s vs 0.6/s, equal bodies, R = 10):
+
+```text
+body: inconclusive at p99 (mean per-run, episodes excluded): CI of delta crosses 0; effect below min_effect: |delta| < 1.0 ms (delta +0.767 ms [-1.129, +2.663]), 10 vs 10 runs, Welch t df 18.0, nominal 95%
+episodes (>= 104.7 ms = 10 x pooled median 10.5 ms): A 21 in 10 runs, 100.0 s (12.60/min, 10.24% of time), B 58 in 10 runs, 100.4 s (34.66/min, 27.60% of time); B more episodes per minute, p = 3.8e-5
+```
+
+Calibration (docs/calibration.md, split verdict sections, synthetic runs, default T factor 10; ranges are over between-run sd 0% and 10%):
+
+| what | setting | split | per-run p99 |
+|:---|:---|---:|---:|
+| Body power, B body x1.20, p 0.2 stalls per run | R = 10, phi 0.5 | 1.00 | 0.01–0.02 |
+| Body power, B body x1.20, p 0.2 stalls per run | R = 10, phi 0.9 | 0.73–0.85 | 0.03 |
+| Leak: body x1.20 reported as more episodes (a false verdict) | factor 10, R = 10, all cells | at most 0.01 | |
+| Episode power, stalls 0.2/s vs 0.6/s | R = 5, phi 0.5 and 0.9 | 0.79–0.83 | |
+| Episode power, stalls 0.2/s vs 0.6/s | R = 10, phi 0.5 and 0.9 | 0.98–1.00 | |
+
+At factor 5 the leak reaches 0.41 (R = 10, phi 0.5, body x1.20), so keep the default 10.
 
 ## Quick start
 
@@ -90,6 +120,8 @@ cargo test                                                   # everything except
 cargo test --test stall -- --nocapture                       # section 2: closed vs open loop
 cargo test --test realtime -- --nocapture                    # a real manifest and scheduler lag on your machine
 cargo test --test compare -- --nocapture --test-threads=1    # verdict lines
+cargo test --test compare split_ -- --nocapture --test-threads=1   # split verdict lines (body and episodes)
+cargo test --lib split_poisson_stalls_rate_change -- --nocapture  # split verdict, Poisson stalls
 TAILBENCH_WRITE_CALIBRATION=1 cargo test --release --lib calibration_report -- --ignored --nocapture
                                                              # regenerates docs/calibration.md (283 s on linux-x86_64-24cpu)
 ```
@@ -109,11 +141,13 @@ tailbench's focus is auditing results (provenance, calibrated verdicts that can 
 - **Skipped tests show as passed.** The git provenance tests return early when git is missing, or when the crate is not the top level of its own repository (vendored, or from a tarball). They print `skipping: ...` to stderr, but cargo still counts them as passed.
 - **Runtime git fields read the build-time source directory.** `runtime_git_sha` and `runtime_git_dirty` probe the directory the crate was compiled from, at run time. A binary copied to another machine, or run after that checkout has moved, reports `UNKNOWN` or describes whatever is now at that path.
 - **Calibration is synthetic only.** The false-verdict and power numbers come from a model: lognormal body, AR(1) correlation, per-run offsets, flat 300 ms stalls. They have not been checked against real services.
+- **T is a multiple of the median.** A slow mode of a bimodal body above T is counted as episodes, not body. If you have a stall or SLO definition, set an absolute threshold equal to it.
+- **Body bias under stalls.** The split body p99 reads +0.2% to +1.0% above the no-stall p99, rising with stall rate (docs/calibration.md, what the split estimates). In one cell the body gave a false verdict in 0.10 of trials when B stalls 3x more than A: phi 0.9, sd 0%, 0.2 vs 0.6 stalls/s, R = 10 (episode power table; target 0.05, Monte Carlo SE about 0.03).
+- **The window rule drops normal requests.** Requests sent during an episode window are excluded from the body even when they were fast: 9.6% of samples at 0.2 stalls/s (docs/calibration.md).
 - **Library only.** There is no CLI and no HTTP target yet. You supply the request as an async closure.
 
 ## Roadmap
 
-- A verdict that splits the body from stall episodes, so a stall rate and a body regression are reported separately.
 - phantom: a ground-truth OpenAI-compatible server with scripted TTFT/ITL and canary stalls, to test benchmarks against known answers.
 - Audit adapters that check the output of existing LLM benchmark tools.
 - A CLI.

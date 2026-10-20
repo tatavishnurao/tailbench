@@ -256,8 +256,8 @@ fn first_true(mut lo: u64, mut hi: u64, f: impl Fn(u64) -> bool) -> u64 {
     hi
 }
 
-/// "with 7 episodes only all 7 in B or all 7 in A is detectable at 95%",
-/// "with 20 episodes only B/A >= 3.0x or B/A <= 0.33x is detectable at 95%".
+/// "with 7 episodes only a split at least as extreme as all 7 in B or all 7 in A would be significant at 95%",
+/// "with 20 episodes only a split at least as extreme as B/A >= 3.0x or B/A <= 0.33x would be significant at 95%".
 impl fmt::Display for Detectable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let k = self.k;
@@ -285,7 +285,7 @@ impl fmt::Display for Detectable {
         } else {
             write!(
                 f,
-                "with {k} episodes only {} is detectable at {level}%",
+                "with {k} episodes only a split at least as extreme as {} would be significant at {level}%",
                 sides.join(" or ")
             )
         }
@@ -1336,14 +1336,14 @@ mod tests {
         assert_eq!((d.more, d.fewer), (Some(3.0), Some(1.0 / 3.0)));
         assert_eq!(
             d.to_string(),
-            "with 20 episodes only B/A >= 3.0x or B/A <= 0.33x is detectable at 95%"
+            "with 20 episodes only a split at least as extreme as B/A >= 3.0x or B/A <= 0.33x would be significant at 95%"
         );
         // k = 7: only 0 vs 7 (p = 0.016); 1 vs 6 has p = 0.125.
         let d = Detectable::search(7, 0.5, 1.0, 1.0, DEFAULT_LEVEL);
         assert_eq!((d.more, d.fewer), (Some(f64::INFINITY), Some(0.0)));
         assert_eq!(
             d.to_string(),
-            "with 7 episodes only all 7 in B or all 7 in A is detectable at 95%"
+            "with 7 episodes only a split at least as extreme as all 7 in B or all 7 in A would be significant at 95%"
         );
         // k = 5: even 0 vs 5 has p = 0.0625.
         let d = Detectable::search(5, 0.5, 1.0, 1.0, DEFAULT_LEVEL);
