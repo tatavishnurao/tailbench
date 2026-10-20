@@ -20,6 +20,7 @@ use tokio::time::{Instant, sleep_until};
 #[cfg(test)]
 mod calibration;
 pub mod compare;
+pub mod episodes;
 mod git;
 pub mod manifest;
 pub mod stats;
