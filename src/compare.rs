@@ -11,6 +11,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::episodes::{self, RunEpisodes, Threshold, ThresholdRule};
 use crate::manifest::{Manifest, Probe};
 use crate::stats::{self, CiWarning, DEFAULT_LEVEL, DEFAULT_RESAMPLES, MIN_EPISODES, MIN_RUNS, Pooled, SplitMix64};
 use crate::{RunResult, RunnerKind, Sample};
@@ -136,7 +137,169 @@ pub struct Comparison {
     /// PerRunWelch only: the Welch-Satterthwaite df of the CI. `None` for
     /// Hierarchical, a refusal, or a group with fewer than 2 runs.
     pub df: Option<f64>,
+    /// True for the body of `compare_split`: samples in episodes were taken
+    /// out of every run before the percentile was computed.
+    pub episodes_excluded: bool,
     pub warnings: Vec<CompareWarning>,
+}
+
+/// Options for `compare_split`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SplitOptions {
+    /// As in `compare`, for the body; usually `DEFAULT_MIN_EFFECT`.
+    pub min_effect: Duration,
+    pub threshold: ThresholdRule,
+}
+
+impl Default for SplitOptions {
+    fn default() -> Self {
+        Self {
+            min_effect: DEFAULT_MIN_EFFECT,
+            threshold: ThresholdRule::default(),
+        }
+    }
+}
+
+/// Fewest episodes, A and B together, before the episode test may name a
+/// direction.
+pub const MIN_TEST_EPISODES: usize = 3;
+
+/// What the episode counts support about B's episode rate in time against
+/// A's.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EpisodeOutcome {
+    /// B has more episodes per unit of time: the test rejects equal rates.
+    More,
+    /// B has fewer episodes per unit of time: the test rejects equal rates.
+    Fewer,
+    /// Every rule other than p < 1 - level that failed; empty when only
+    /// the p-value did.
+    Inconclusive { reasons: Vec<String> },
+    /// The runs cannot be compared (the reason `compare` gives).
+    Refused { reason: String },
+}
+
+/// The episode part of `compare_split`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EpisodeVerdict {
+    pub outcome: EpisodeOutcome,
+    /// Each run split at the threshold, in input order; empty when refused.
+    pub a: Vec<RunEpisodes>,
+    pub b: Vec<RunEpisodes>,
+    /// Two-sided p-value of the exact conditional test; `None` when refused.
+    pub p: Option<f64>,
+    /// The test names a direction only when p < 1 - level.
+    pub level: f64,
+    /// Inconclusive with k >= `MIN_TEST_EPISODES` only: what this k could
+    /// have shown.
+    pub detectable: Option<Detectable>,
+}
+
+/// The least extreme splits of k episodes between A and B that the episode
+/// test would call significant, as B's observed rate over A's (episodes
+/// per unit of exposure). `more` is the smallest ratio above 1 that is
+/// significant, `fewer` the largest below 1; infinity means only all k in
+/// B, and 0 only all k in A; `None` means no split on that side is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Detectable {
+    pub k: usize,
+    pub more: Option<f64>,
+    pub fewer: Option<f64>,
+    /// The test's level: significant means p < 1 - level.
+    pub level: f64,
+}
+
+impl Detectable {
+    /// By searching `stats::binomial_test` over k_A: its p-value only
+    /// grows as k_A moves toward k x `share_a`, so each side is a binary
+    /// search. `exposure_a` and `exposure_b` turn a split into a rate ratio.
+    fn search(k: u64, share_a: f64, exposure_a: f64, exposure_b: f64, level: f64) -> Self {
+        let significant = |ka: u64| stats::binomial_test(ka, k, share_a) < 1.0 - level;
+        let ratio = |ka: u64| ((k - ka) as f64 / exposure_b) / (ka as f64 / exposure_a);
+        let mean = k as f64 * share_a;
+        // More: k_A below the mean, from 0 up to the last integer under it.
+        let more = (mean > 0.0 && significant(0)).then(|| {
+            let last = (mean.ceil() as u64).saturating_sub(1).min(k);
+            ratio(last_true(0, last, significant))
+        });
+        // Fewer: k_A above the mean, from the first integer over it up to k.
+        let fewer = (mean < k as f64 && significant(k)).then(|| {
+            let first = ((mean.floor() as u64) + 1).min(k);
+            ratio(first_true(first, k, significant))
+        });
+        Self {
+            k: k as usize,
+            more,
+            fewer,
+            level,
+        }
+    }
+}
+
+/// The largest x in [lo, hi] with `f(x)`, given `f(lo)` and that `f` is
+/// true up to some point and false after it.
+fn last_true(mut lo: u64, mut hi: u64, f: impl Fn(u64) -> bool) -> u64 {
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if f(mid) { lo = mid } else { hi = mid - 1 }
+    }
+    lo
+}
+
+/// The smallest x in [lo, hi] with `f(x)`, given `f(hi)` and that `f` is
+/// false up to some point and true after it.
+fn first_true(mut lo: u64, mut hi: u64, f: impl Fn(u64) -> bool) -> u64 {
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if f(mid) { hi = mid } else { lo = mid + 1 }
+    }
+    hi
+}
+
+/// "with 7 episodes only all 7 in B or all 7 in A is detectable at 95%",
+/// "with 20 episodes only B/A >= 3.0x or B/A <= 0.33x is detectable at 95%".
+impl fmt::Display for Detectable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let k = self.k;
+        let more = self.more.map(|r| {
+            if r.is_infinite() {
+                format!("all {k} in B")
+            } else {
+                format!("B/A >= {r:.1}x")
+            }
+        });
+        let fewer = self.fewer.map(|r| {
+            if r == 0.0 {
+                format!("all {k} in A")
+            } else {
+                format!("B/A <= {r:.2}x")
+            }
+        });
+        let sides: Vec<String> = more.into_iter().chain(fewer).collect();
+        let level = self.level * 100.0;
+        if sides.is_empty() {
+            write!(
+                f,
+                "with {k} episodes no split between A and B is significant at {level}%"
+            )
+        } else {
+            write!(
+                f,
+                "with {k} episodes only {} is detectable at {level}%",
+                sides.join(" or ")
+            )
+        }
+    }
+}
+
+/// A two-part verdict: the body (requests sent outside episodes) by
+/// percentile, and the episodes by how often they happen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitComparison {
+    pub body: Comparison,
+    pub episodes: EpisodeVerdict,
+    /// The threshold both groups were split at; `None` when refused.
+    pub threshold: Option<Threshold>,
 }
 
 /// Compares the `q` percentile of latency between runs `a` and `b`, by the
@@ -176,7 +339,7 @@ pub fn compare_with(
     let mut warnings = manifest_warnings(a, b);
     let (verdict, df) = match refusal(a, b) {
         Some(reason) => (Verdict::Refused { reason }, None),
-        None => decide(a, b, q, min_effect, method, &mut warnings),
+        None => decide(&samples(a), &samples(b), q, min_effect, method, true, &mut warnings),
     };
     Comparison {
         verdict,
@@ -188,7 +351,239 @@ pub fn compare_with(
         resamples: DEFAULT_RESAMPLES,
         seed: DEFAULT_SEED,
         df,
+        episodes_excluded: false,
         warnings,
+    }
+}
+
+/// Compares A and B in two parts, so a regression in normal operation and a
+/// change in how often the target stalls are judged separately.
+///
+/// Every run of A and B is split at one threshold T (`Threshold::derive`
+/// on all runs, by `opts.threshold`): samples at or above T are episodes,
+/// and the requests sent while no episode was open are the body (see
+/// `episodes::windows`).
+///
+/// - body: PerRunWelch on each run's body samples, with the refusals,
+///   warnings, `MIN_RUNS` rule and `opts.min_effect` of `compare_with`, but
+///   no episode guard: the episodes were taken out. Refused if a run has no
+///   body samples.
+/// - episodes: an exact conditional test on the episode rate in time. The
+///   exposure E of a group is the sum of its runs' `span_ns` (schedule
+///   start to last completion), episode time included. Under equal rates
+///   per unit of time, given k = k_A + k_B episodes in all,
+///   k_A ~ Binomial(k, E_A / (E_A + E_B)); p is `stats::binomial_test`
+///   (two-sided). This is exact if episodes arrive as a Poisson process
+///   with the same rate in both groups. More or Fewer only if
+///   p < 1 - `DEFAULT_LEVEL`, both groups have >= `MIN_RUNS` runs, and
+///   k >= `MIN_TEST_EPISODES`; an inconclusive test with k >= 3 also says
+///   what it could have detected (`Detectable`).
+///
+/// Both parts are refused, with no threshold, when `compare` would refuse.
+pub fn compare_split(a: &[RecordedRun], b: &[RecordedRun], q: f64, opts: SplitOptions) -> SplitComparison {
+    stats::check_quantile(q);
+    let mut warnings = manifest_warnings(a, b);
+    let method = CompareMethod::PerRunWelch;
+    let body = |verdict, df, warnings| Comparison {
+        verdict,
+        q,
+        runs_a: a.len(),
+        runs_b: b.len(),
+        level: DEFAULT_LEVEL,
+        method,
+        resamples: DEFAULT_RESAMPLES,
+        seed: DEFAULT_SEED,
+        df,
+        episodes_excluded: true,
+        warnings,
+    };
+    if let Some(reason) = refusal(a, b) {
+        return SplitComparison {
+            body: body(Verdict::Refused { reason: reason.clone() }, None, warnings),
+            episodes: EpisodeVerdict {
+                outcome: EpisodeOutcome::Refused { reason },
+                a: Vec::new(),
+                b: Vec::new(),
+                p: None,
+                level: DEFAULT_LEVEL,
+                detectable: None,
+            },
+            threshold: None,
+        };
+    }
+
+    let (sa, sb) = (samples(a), samples(b));
+    let threshold = Threshold::derive(&[sa.as_slice(), sb.as_slice()].concat(), opts.threshold)
+        .expect("refusal rules out empty runs");
+    let split =
+        |runs: &[&[Sample]]| -> Vec<Vec<Sample>> { runs.iter().map(|r| episodes::body(r, threshold.ns)).collect() };
+    let (body_a, body_b) = (split(&sa), split(&sb));
+    let empty = |runs: &[Vec<Sample>]| runs.iter().filter(|r| r.is_empty()).count();
+    let (empty_a, empty_b) = (empty(&body_a), empty(&body_b));
+    let (verdict, df) = if empty_a + empty_b > 0 {
+        let reason = format!("{empty_a} A runs and {empty_b} B runs have no samples outside episodes, so no body");
+        (Verdict::Refused { reason }, None)
+    } else {
+        let (body_a, body_b): (Vec<&[Sample]>, Vec<&[Sample]>) = (
+            body_a.iter().map(Vec::as_slice).collect(),
+            body_b.iter().map(Vec::as_slice).collect(),
+        );
+        decide(&body_a, &body_b, q, opts.min_effect, method, false, &mut warnings)
+    };
+
+    let per_run = |runs: &[&[Sample]]| -> Vec<RunEpisodes> {
+        runs.iter().map(|r| episodes::run_episodes(r, threshold.ns)).collect()
+    };
+    SplitComparison {
+        body: body(verdict, df, warnings),
+        episodes: episode_verdict(per_run(&sa), per_run(&sb)),
+        threshold: Some(threshold),
+    }
+}
+
+/// The exact conditional test on per-run episode counts (see
+/// `compare_split`).
+fn episode_verdict(a: Vec<RunEpisodes>, b: Vec<RunEpisodes>) -> EpisodeVerdict {
+    let count = |runs: &[RunEpisodes]| runs.iter().map(|r| r.episodes).sum::<usize>();
+    let exposure = |runs: &[RunEpisodes]| runs.iter().map(|r| u128::from(r.span_ns)).sum::<u128>();
+    let (ka, kb) = (count(&a), count(&b));
+    let (ra, rb) = (a.len(), b.len());
+    // Exposure is 0 only if every sample was intended at 0 and took 0 ns;
+    // then fall back to counting runs.
+    let (ea, eb) = match (exposure(&a), exposure(&b)) {
+        (0, 0) => (ra as u128, rb as u128),
+        e => e,
+    };
+    let share_a = ea as f64 / (ea + eb) as f64;
+    let p = stats::binomial_test(ka as u64, (ka + kb) as u64, share_a);
+    let mut reasons = Vec::new();
+    if ra < MIN_RUNS || rb < MIN_RUNS {
+        reasons.push(format!("R < {MIN_RUNS} (A: {ra}, B: {rb})"));
+    }
+    if ka + kb < MIN_TEST_EPISODES {
+        reasons.push(format!("too few episodes ({}, want >= {MIN_TEST_EPISODES})", ka + kb));
+    }
+    let alpha = 1.0 - DEFAULT_LEVEL;
+    let outcome = if reasons.is_empty() && p < alpha {
+        // kb / eb against ka / ea, in integers.
+        if kb as u128 * ea > ka as u128 * eb {
+            EpisodeOutcome::More
+        } else {
+            EpisodeOutcome::Fewer
+        }
+    } else {
+        EpisodeOutcome::Inconclusive { reasons }
+    };
+    let detectable = (matches!(outcome, EpisodeOutcome::Inconclusive { .. }) && ka + kb >= MIN_TEST_EPISODES)
+        .then(|| Detectable::search((ka + kb) as u64, share_a, ea as f64, eb as f64, DEFAULT_LEVEL));
+    EpisodeVerdict {
+        outcome,
+        a,
+        b,
+        p: Some(p),
+        level: DEFAULT_LEVEL,
+        detectable,
+    }
+}
+
+impl EpisodeVerdict {
+    /// Episodes, summed over the group's runs.
+    pub fn episodes(&self, group: Group) -> usize {
+        self.runs(group).iter().map(|r| r.episodes).sum()
+    }
+
+    /// The group's exposure: its runs' `span_ns`, summed.
+    pub fn exposure_ns(&self, group: Group) -> u64 {
+        self.runs(group).iter().map(|r| r.span_ns).sum()
+    }
+
+    /// Episodes per minute of exposure; 0 for no exposure.
+    pub fn rate_per_min(&self, group: Group) -> f64 {
+        match self.exposure_ns(group) {
+            0 => 0.0,
+            e => self.episodes(group) as f64 / (e as f64 / 60e9),
+        }
+    }
+
+    /// Fraction of the group's wall time with an episode open: summed
+    /// `time_ns` over summed `span_ns`; 0 for no runs.
+    pub fn time_fraction(&self, group: Group) -> f64 {
+        let runs = self.runs(group);
+        let span: u64 = runs.iter().map(|r| r.span_ns).sum();
+        if span == 0 {
+            return 0.0;
+        }
+        runs.iter().map(|r| r.time_ns).sum::<u64>() as f64 / span as f64
+    }
+
+    fn runs(&self, group: Group) -> &[RunEpisodes] {
+        match group {
+            Group::A => &self.a,
+            Group::B => &self.b,
+        }
+    }
+}
+
+/// "1.00", "0.031", or "2.0e-4" below 0.001.
+fn p_value(p: f64) -> String {
+    if p >= 0.1 {
+        format!("{p:.2}")
+    } else if p >= 0.001 {
+        format!("{p:.3}")
+    } else {
+        format!("{p:.1e}")
+    }
+}
+
+/// Two lines, for example
+/// "body: B slower at p99 (mean per-run, episodes excluded) by 6.2 ms [3.1, 9.3], 10 vs 10 runs, Welch t df 17.2, nominal 95%"
+/// "episodes (>= 100.0 ms = 10 x pooled median 10.0 ms): A 2 in 10 runs, 100.1 s (1.20/min, 0.95% of time), B 3 in 10
+/// runs, 100.2 s (1.80/min, 1.43% of time); inconclusive, p = 1.00; with 5 episodes no split between A and B is
+/// significant at 95%".
+impl fmt::Display for SplitComparison {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "body: {}", self.body)?;
+        let e = &self.episodes;
+        let (Some(threshold), Some(p)) = (&self.threshold, e.p) else {
+            let reason = match &e.outcome {
+                EpisodeOutcome::Refused { reason } => reason.as_str(),
+                _ => "no threshold",
+            };
+            return write!(
+                f,
+                "episodes: refused: {reason}, {} vs {} runs",
+                self.body.runs_a, self.body.runs_b
+            );
+        };
+        let side = |group| {
+            format!(
+                "{} {} in {} runs, {:.1} s ({:.2}/min, {:.2}% of time)",
+                group_label(group),
+                e.episodes(group),
+                e.runs(group).len(),
+                e.exposure_ns(group) as f64 / 1e9,
+                e.rate_per_min(group),
+                e.time_fraction(group) * 100.0
+            )
+        };
+        let outcome = match &e.outcome {
+            EpisodeOutcome::More => "B more episodes per minute".to_owned(),
+            EpisodeOutcome::Fewer => "B fewer episodes per minute".to_owned(),
+            EpisodeOutcome::Inconclusive { reasons } if reasons.is_empty() => "inconclusive".to_owned(),
+            EpisodeOutcome::Inconclusive { reasons } => format!("inconclusive: {}", reasons.join("; ")),
+            EpisodeOutcome::Refused { reason } => format!("refused: {reason}"),
+        };
+        write!(
+            f,
+            "episodes ({threshold}): {}, {}; {outcome}, p = {}",
+            side(Group::A),
+            side(Group::B),
+            p_value(p)
+        )?;
+        match &e.detectable {
+            Some(d) => write!(f, "; {d}"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -277,22 +672,30 @@ fn welch_delta(pooled_a: &Pooled, pooled_b: &Pooled, q: f64) -> (i64, Option<(i6
 }
 
 /// The verdict for runs that passed `refusal`, and the CI's df for
-/// PerRunWelch; adds each group's CI warnings to `warnings`.
+/// PerRunWelch; adds each group's CI warnings to `warnings`. Without
+/// `episode_guard`, an episode-limited estimate is neither a reason nor a
+/// warning (the body of `compare_split`).
 fn decide(
-    a: &[RecordedRun],
-    b: &[RecordedRun],
+    a: &[&[Sample]],
+    b: &[&[Sample]],
     q: f64,
     min_effect: Duration,
     method: CompareMethod,
+    episode_guard: bool,
     warnings: &mut Vec<CompareWarning>,
 ) -> (Verdict, Option<f64>) {
-    let pooled = |runs| Pooled::new(&samples(runs), q).expect("refusal rules out empty groups and runs");
+    let pooled = |runs| Pooled::new(runs, q).expect("refusal rules out empty groups and runs");
     let (pooled_a, pooled_b) = (pooled(a), pooled(b));
     for (group, p) in [(Group::A, &pooled_a), (Group::B, &pooled_b)] {
-        warnings.extend(p.warnings.iter().map(|w| CompareWarning::Ci {
-            group,
-            warning: w.clone(),
-        }));
+        warnings.extend(
+            p.warnings
+                .iter()
+                .filter(|w| episode_guard || !matches!(w, CiWarning::EpisodeLimited { .. }))
+                .map(|w| CompareWarning::Ci {
+                    group,
+                    warning: w.clone(),
+                }),
+        );
     }
     let (delta, ci, df) = match method {
         CompareMethod::Hierarchical => {
@@ -311,7 +714,7 @@ fn decide(
             "R < {MIN_RUNS} (A: {runs_a}, B: {runs_b}): between-run variance unknown"
         ));
     }
-    if pooled_a.episodes < MIN_EPISODES || pooled_b.episodes < MIN_EPISODES {
+    if episode_guard && (pooled_a.episodes < MIN_EPISODES || pooled_b.episodes < MIN_EPISODES) {
         reasons.push(format!(
             "episode-limited: {} tail episodes at or above A's pooled {p} ({} ms) and {} at or above B's ({} ms), want >= \
              {MIN_EPISODES} each",
@@ -525,7 +928,11 @@ impl fmt::Display for Comparison {
             (CompareMethod::PerRunWelch, None) => "Welch t, no CI".to_owned(),
         };
         let level = format!("{method}, nominal {}%", self.level * 100.0);
-        let at = format!("{p} ({})", self.method.estimand());
+        let at = if self.episodes_excluded {
+            format!("{p} ({}, episodes excluded)", self.method.estimand())
+        } else {
+            format!("{p} ({})", self.method.estimand())
+        };
         match &self.verdict {
             Verdict::Slower { delta, lo, hi } => {
                 let d = decimals_for(*delta);
@@ -768,5 +1175,259 @@ mod tests {
         println!("{c}");
         assert!(c.to_string().contains("no CI of delta"), "{c}");
         assert!(c.to_string().contains(", no CI)"), "{c}");
+    }
+
+    /// Synthetic runs with a 300 ms stall over 2% of every B run (prob 1)
+    /// and none in A: the episode verdict is the exact test on the counts,
+    /// weighted by exposure in time, and the body is Welch on what is left.
+    #[test]
+    fn split_episode_verdict_is_exact_test_on_counts() {
+        let plain = Synth::new(0.5, 0.5, 0.0);
+        let mut stalled = plain;
+        stalled.stall = Some(crate::synth::Stall {
+            prob: 1.0,
+            extra_ns: 300e6,
+            fraction: 0.02,
+        });
+        let m = plain.manifest();
+        let a: Vec<RecordedRun> = (0..10).map(|i| plain.run(&m, i, 1.0)).collect();
+        let b: Vec<RecordedRun> = (0..10).map(|i| stalled.run(&m, 100 + i, 1.0)).collect();
+        let s = compare_split(&a, &b, 0.99, SplitOptions::default());
+        println!("{s}");
+
+        let t = s.threshold.expect("not refused");
+        let all: Vec<&[Sample]> = samples(&a).into_iter().chain(samples(&b)).collect();
+        assert_eq!(Some(t), Threshold::derive(&all, ThresholdRule::default()));
+        let count = |runs: &[RunEpisodes]| runs.iter().map(|r| r.episodes).sum::<usize>() as u64;
+        let (ka, kb) = (count(&s.episodes.a), count(&s.episodes.b));
+        assert!(kb >= 10, "every B run has its stall: {s}");
+        let (ea, eb) = (s.episodes.exposure_ns(Group::A), s.episodes.exposure_ns(Group::B));
+        let share_a = ea as f64 / (ea + eb) as f64;
+        assert_eq!(s.episodes.p, Some(stats::binomial_test(ka, ka + kb, share_a)));
+        assert_eq!(s.episodes.outcome, EpisodeOutcome::More, "{s}");
+
+        assert!(s.body.episodes_excluded && s.body.method == CompareMethod::PerRunWelch);
+        let lines: Vec<String> = s.to_string().lines().map(str::to_owned).collect();
+        assert_eq!(lines.len(), 2, "{s}");
+        assert!(
+            lines[0].starts_with("body: inconclusive at p99 (mean per-run, episodes excluded): "),
+            "{s}"
+        );
+        assert!(
+            lines[0].contains(", 10 vs 10 runs, Welch t df ") && lines[0].ends_with(", nominal 95%"),
+            "{s}"
+        );
+        assert!(
+            lines[1].starts_with(&format!(
+                "episodes ({t}): A {ka} in 10 runs, {:.1} s (",
+                ea as f64 / 1e9
+            )),
+            "{s}"
+        );
+        assert!(
+            lines[1].contains(&format!("B {kb} in 10 runs, {:.1} s (", eb as f64 / 1e9)),
+            "{s}"
+        );
+        assert!(lines[1].contains("; B more episodes per minute, p = "), "{s}");
+        assert_eq!(s.episodes.detectable, None, "only for an inconclusive test");
+        // The body is not held to the episode guard.
+        assert!(
+            !s.body.warnings.iter().any(|w| matches!(
+                w,
+                CompareWarning::Ci {
+                    warning: CiWarning::EpisodeLimited { .. },
+                    ..
+                }
+            )),
+            "{:?}",
+            s.body.warnings
+        );
+    }
+
+    #[test]
+    fn split_records_absolute_threshold_and_needs_runs_and_episodes() {
+        let model = model();
+        let m = model.manifest();
+        let (a, b) = (runs(&model, &m, 0, 1.0), runs(&model, &m, 100, 1.0));
+        let opts = SplitOptions {
+            min_effect: Duration::ZERO,
+            threshold: ThresholdRule::Absolute(Duration::from_secs(1)),
+        };
+        let s = compare_split(&a[..2], &b[..2], 0.99, opts);
+        println!("{s}");
+        let t = s.threshold.unwrap();
+        assert_eq!((t.ns, t.rule), (1_000_000_000, opts.threshold));
+        assert_eq!(
+            s.episodes.outcome,
+            EpisodeOutcome::Inconclusive {
+                reasons: vec![
+                    "R < 3 (A: 2, B: 2)".to_owned(),
+                    "too few episodes (0, want >= 3)".to_owned()
+                ]
+            }
+        );
+        assert_eq!(s.episodes.p, Some(1.0));
+        assert!(
+            s.to_string()
+                .contains("episodes (>= 1000.0 ms, set by caller (pooled median "),
+            "{s}"
+        );
+        assert!(
+            s.to_string().contains(
+                "(0.00/min, 0.00% of time); inconclusive: R < 3 (A: 2, B: 2); too few episodes (0, want >= 3), p = 1.00"
+            ),
+            "{s}"
+        );
+        assert_eq!(s.episodes.detectable, None, "k < 3");
+    }
+
+    fn run_episodes_of(episodes: usize, span_s: u64) -> RunEpisodes {
+        RunEpisodes {
+            episodes,
+            samples: episodes,
+            excluded: episodes,
+            time_ns: 0,
+            span_ns: span_s * 1_000_000_000,
+        }
+    }
+
+    /// The same count per run, but B's runs are half as long in time: B's
+    /// rate per minute is twice A's, and the test weighs by exposure, not
+    /// by runs.
+    #[test]
+    fn episode_test_weighs_by_exposure_in_time() {
+        let a = vec![run_episodes_of(2, 20); 5];
+        let b = vec![run_episodes_of(2, 10); 5];
+        let e = episode_verdict(a, b);
+        assert_eq!(
+            (e.exposure_ns(Group::A), e.exposure_ns(Group::B)),
+            (100_000_000_000, 50_000_000_000)
+        );
+        assert_eq!((e.rate_per_min(Group::A), e.rate_per_min(Group::B)), (6.0, 12.0));
+        assert_eq!(e.p, Some(stats::binomial_test(10, 20, 2.0 / 3.0)));
+        assert_ne!(e.p, Some(stats::binomial_test(10, 20, 0.5)), "not by runs");
+
+        // 6 in 100 s against 24 in 50 s: B's rate is 8x A's.
+        let e = episode_verdict(
+            vec![run_episodes_of(2, 20), run_episodes_of(2, 40), run_episodes_of(2, 40)],
+            vec![run_episodes_of(8, 10), run_episodes_of(8, 20), run_episodes_of(8, 20)],
+        );
+        assert_eq!(e.outcome, EpisodeOutcome::More, "{e:?}");
+        assert_eq!(e.p, Some(stats::binomial_test(6, 30, 2.0 / 3.0)));
+    }
+
+    /// Every k_A by brute force: the least extreme significant split on
+    /// each side, as B's rate over A's.
+    fn detectable_by_scan(k: u64, share_a: f64, ea: f64, eb: f64) -> (Option<f64>, Option<f64>) {
+        let mean = k as f64 * share_a;
+        let ratio = |ka: u64| ((k - ka) as f64 / eb) / (ka as f64 / ea);
+        let sig: Vec<u64> = (0..=k)
+            .filter(|&ka| stats::binomial_test(ka, k, share_a) < 0.05)
+            .collect();
+        let more = sig.iter().filter(|&&ka| (ka as f64) < mean).max().map(|&ka| ratio(ka));
+        let fewer = sig.iter().filter(|&&ka| (ka as f64) > mean).min().map(|&ka| ratio(ka));
+        (more, fewer)
+    }
+
+    #[test]
+    fn detectable_ratio_is_least_extreme_significant_split() {
+        // k = 20, equal exposure: 5 vs 15 has p = 0.041, 6 vs 14 has 0.115.
+        let d = Detectable::search(20, 0.5, 1.0, 1.0, DEFAULT_LEVEL);
+        assert_eq!((d.more, d.fewer), (Some(3.0), Some(1.0 / 3.0)));
+        assert_eq!(
+            d.to_string(),
+            "with 20 episodes only B/A >= 3.0x or B/A <= 0.33x is detectable at 95%"
+        );
+        // k = 7: only 0 vs 7 (p = 0.016); 1 vs 6 has p = 0.125.
+        let d = Detectable::search(7, 0.5, 1.0, 1.0, DEFAULT_LEVEL);
+        assert_eq!((d.more, d.fewer), (Some(f64::INFINITY), Some(0.0)));
+        assert_eq!(
+            d.to_string(),
+            "with 7 episodes only all 7 in B or all 7 in A is detectable at 95%"
+        );
+        // k = 5: even 0 vs 5 has p = 0.0625.
+        let d = Detectable::search(5, 0.5, 1.0, 1.0, DEFAULT_LEVEL);
+        assert_eq!((d.more, d.fewer), (None, None));
+        assert_eq!(
+            d.to_string(),
+            "with 5 episodes no split between A and B is significant at 95%"
+        );
+
+        for k in 3..80 {
+            for (ea, eb) in [(1.0, 1.0), (3.0, 7.0), (7.0, 3.0), (1.0, 4.0)] {
+                let share = ea / (ea + eb);
+                let d = Detectable::search(k, share, ea, eb, DEFAULT_LEVEL);
+                assert_eq!(
+                    (d.more, d.fewer),
+                    detectable_by_scan(k, share, ea, eb),
+                    "k {k}, {ea} vs {eb}"
+                );
+            }
+        }
+    }
+
+    /// Poisson stalls in time (several per run possible), bodies equal.
+    #[test]
+    fn split_poisson_stalls_rate_change_is_more_episodes() {
+        let base = Synth::new(0.5, 0.5, 0.0);
+        let with_rate = |per_s| {
+            let mut m = base;
+            m.poisson_stalls = Some(crate::synth::PoissonStalls {
+                per_s,
+                extra_ns: 300e6,
+                fraction: 0.02,
+            });
+            m
+        };
+        let m = base.manifest();
+        let (low, high) = (with_rate(0.2), with_rate(0.6));
+        let a: Vec<RecordedRun> = (0..10).map(|i| low.run(&m, i, 1.0)).collect();
+        let same: Vec<RecordedRun> = (0..10).map(|i| low.run(&m, 100 + i, 1.0)).collect();
+        let more: Vec<RecordedRun> = (0..10).map(|i| high.run(&m, 200 + i, 1.0)).collect();
+
+        let s = compare_split(&a, &more, 0.99, SplitOptions::default());
+        println!("{s}");
+        assert_eq!(s.episodes.outcome, EpisodeOutcome::More, "{s}");
+        assert!(
+            !matches!(s.body.verdict, Verdict::Slower { .. } | Verdict::Faster { .. }),
+            "{s}"
+        );
+
+        let s = compare_split(&a, &same, 0.99, SplitOptions::default());
+        println!("{s}");
+        assert!(matches!(s.episodes.outcome, EpisodeOutcome::Inconclusive { .. }), "{s}");
+        let d = s.episodes.detectable.expect("k >= 3");
+        assert!(s.to_string().ends_with(&format!("; {d}")), "{s}");
+    }
+
+    /// A run made only of episodes leaves no body to take a percentile of.
+    #[test]
+    fn split_refuses_body_when_a_run_is_all_episodes() {
+        let model = model();
+        let m = model.manifest();
+        let (a, b) = (runs(&model, &m, 0, 1.0), runs(&model, &m, 100, 1.0));
+        let opts = SplitOptions {
+            min_effect: Duration::ZERO,
+            threshold: ThresholdRule::Absolute(Duration::from_nanos(1)),
+        };
+        let s = compare_split(&a, &b, 0.99, opts);
+        println!("{s}");
+        assert!(
+            matches!(&s.body.verdict, Verdict::Refused { reason } if reason.contains("5 A runs and 5 B runs have no samples outside episodes")),
+            "{s}"
+        );
+        assert!(s.threshold.is_some());
+    }
+
+    #[test]
+    fn split_same_runs_has_no_direction() {
+        let model = model();
+        let m = model.manifest();
+        let a = runs(&model, &m, 0, 1.0);
+        let b = runs(&model, &m, 100, 1.0);
+        let s = compare_split(&a, &b, 0.99, SplitOptions::default());
+        println!("{s}");
+        assert!(matches!(s.body.verdict, Verdict::Inconclusive { .. }), "{s}");
+        assert!(matches!(s.episodes.outcome, EpisodeOutcome::Inconclusive { .. }), "{s}");
     }
 }
