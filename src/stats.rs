@@ -576,6 +576,78 @@ pub fn t_cdf(t: f64, df: f64) -> f64 {
     if t > 0.0 { 1.0 - tail } else { tail }
 }
 
+/// P(X <= x) for X ~ Binomial(n, p): I_{1-p}(n - x, x + 1), the regularized
+/// incomplete beta, so a far tail keeps its relative precision.
+///
+/// Panics if `p` is not in [0, 1].
+pub fn binomial_cdf(x: u64, n: u64, p: f64) -> f64 {
+    check_probability(p);
+    if x >= n {
+        return 1.0;
+    }
+    incomplete_beta((n - x) as f64, x as f64 + 1.0, 1.0 - p)
+}
+
+/// P(X >= x) for X ~ Binomial(n, p): I_p(x, n - x + 1), computed directly
+/// rather than as 1 - `binomial_cdf`, which would round a small tail to 0.
+///
+/// Panics if `p` is not in [0, 1].
+pub fn binomial_at_least(x: u64, n: u64, p: f64) -> f64 {
+    check_probability(p);
+    if x == 0 {
+        return 1.0;
+    }
+    if x > n {
+        return 0.0;
+    }
+    incomplete_beta(x as f64, (n - x) as f64 + 1.0, p)
+}
+
+/// Two-sided p-value of the exact binomial test of x successes in n trials
+/// against success probability `p`: the probability, under `p`, of every
+/// outcome no more likely than x. This is the rule of R's `binom.test`,
+/// including its relative tolerance of 1e-7 on "no more likely". 1 when
+/// n = 0.
+///
+/// Panics if x > n or `p` is not in [0, 1].
+pub fn binomial_test(x: u64, n: u64, p: f64) -> f64 {
+    check_probability(p);
+    assert!(x <= n, "{x} successes in {n} trials");
+    // The pmf is unimodal, so the outcomes no more likely than x are x's own
+    // tail plus the y most extreme outcomes on the other side of the mean.
+    let d = binomial_pmf(x, n, p) * (1.0 + 1e-7);
+    let mean = n as f64 * p;
+    let x_f = x as f64;
+    let p_value = if x_f < mean {
+        let y = (mean.ceil() as u64..=n).filter(|&i| binomial_pmf(i, n, p) <= d).count() as u64;
+        binomial_cdf(x, n, p) + binomial_at_least(n + 1 - y, n, p)
+    } else if x_f > mean {
+        let y = (0..=mean.floor() as u64)
+            .filter(|&i| binomial_pmf(i, n, p) <= d)
+            .count() as u64;
+        let low = if y == 0 { 0.0 } else { binomial_cdf(y - 1, n, p) };
+        low + binomial_at_least(x, n, p)
+    } else {
+        1.0
+    };
+    p_value.min(1.0)
+}
+
+/// P(X = x) for X ~ Binomial(n, p), x <= n.
+fn binomial_pmf(x: u64, n: u64, p: f64) -> f64 {
+    if p == 0.0 || p == 1.0 {
+        let certain = if p == 0.0 { 0 } else { n };
+        return if x == certain { 1.0 } else { 0.0 };
+    }
+    let (x, n) = (x as f64, n as f64);
+    let ln_choose = ln_gamma(n + 1.0) - ln_gamma(x + 1.0) - ln_gamma(n - x + 1.0);
+    (ln_choose + x * p.ln() + (n - x) * (1.0 - p).ln()).exp()
+}
+
+fn check_probability(p: f64) {
+    assert!((0.0..=1.0).contains(&p), "probability {p} is not in [0, 1]");
+}
+
 /// Regularized incomplete beta I_x(a, b), from its continued fraction
 /// (Numerical Recipes, 3rd ed., 6.4), using the symmetry
 /// I_x(a, b) = 1 - I_{1-x}(b, a) where the fraction converges slowly.
@@ -1114,5 +1186,70 @@ mod tests {
         let point = welch_ci(&[2.0, 2.0], &[5.0, 5.0, 5.0], 0.95).unwrap();
         assert_eq!((point.lo, point.hi, point.df), (3.0, 3.0, f64::INFINITY));
         assert_eq!(welch_ci(&[1.0], &[1.0, 2.0], 0.95), None);
+    }
+
+    fn close(got: f64, want: f64, rel: f64) -> bool {
+        (got - want).abs() <= rel * want.abs()
+    }
+
+    /// Exact values, from sums of C(n, i) p^i (1 - p)^(n - i) in rational
+    /// arithmetic (Python `fractions`).
+    #[test]
+    fn binomial_cdf_matches_exact_sums() {
+        let cases = [
+            (2, 10, 0.5, 0.054_687_5),
+            (5, 20, 0.3, 0.416_370_829_447_481_4),
+            (40, 100, 0.5, 0.028_443_966_820_490_395),
+            (0, 100, 0.5, 7.888_609_052_210_118e-31),
+        ];
+        for (x, n, p, want) in cases {
+            let got = binomial_cdf(x, n, p);
+            println!("P(X <= {x}), Binomial({n}, {p}) = {got:e} (exact {want:e})");
+            assert!(close(got, want, 1e-12), "cdf({x}, {n}, {p}) = {got:e}, exact {want:e}");
+            // P(X >= x + 1) = 1 - P(X <= x).
+            let upper = binomial_at_least(x + 1, n, p);
+            assert!(
+                (upper - (1.0 - want)).abs() < 1e-12,
+                "at_least({}, {n}, {p}) = {upper}",
+                x + 1
+            );
+        }
+        // A far upper tail keeps its relative precision: P(X >= 100) = 2^-100.
+        assert!(close(
+            binomial_at_least(100, 100, 0.5),
+            7.888_609_052_210_118e-31,
+            1e-12
+        ));
+        assert_eq!(binomial_cdf(10, 10, 0.3), 1.0);
+        assert_eq!(binomial_at_least(0, 10, 0.3), 1.0);
+        assert_eq!(binomial_at_least(11, 10, 0.3), 0.0);
+    }
+
+    /// R's documented `binom.test(c(682, 243), p = 3/4)` gives p-value
+    /// 0.3825; the rest are exact values of the same rule (Python
+    /// `fractions`).
+    #[test]
+    fn binomial_test_matches_r_binom_test() {
+        let cases = [
+            (682, 925, 0.75, 0.382_491_559_574_851_7),
+            (2, 10, 0.5, 0.109_375),
+            (0, 10, 0.5, 0.001_953_125),
+            (0, 5, 0.5, 0.0625),
+            (0, 6, 0.5, 0.031_25),
+            (1, 12, 1.0 / 3.0, 0.072_709_858_667_283_86),
+            (9, 12, 1.0 / 3.0, 0.003_855_554_991_052_628_6),
+            (4, 12, 1.0 / 3.0, 1.0),
+        ];
+        for (x, n, p, want) in cases {
+            let got = binomial_test(x, n, p);
+            println!("binomial_test({x}, {n}, {p:.4}) = {got:.10} (exact {want:.10})");
+            assert!(
+                close(got, want, 1e-9),
+                "binomial_test({x}, {n}, {p}) = {got}, exact {want}"
+            );
+        }
+        assert_eq!(binomial_test(0, 0, 0.5), 1.0);
+        // Symmetric at p = 1/2.
+        assert_eq!(binomial_test(3, 10, 0.5), binomial_test(7, 10, 0.5));
     }
 }
