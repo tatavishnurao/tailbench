@@ -89,3 +89,62 @@ Limits of the audit:
 - **tokio timers have 1 ms granularity**, on both sides. tailbench's sends wake up late by up to about 2 ms (its scheduler lag), and phantom's 1 ms sleep overshoots. Both are measured, but they limit how small a delta can be resolved.
 - **Loopback only.** Client and server share one machine and one kernel. Nothing here measures a real network.
 - **Request order is assumed.** Both tailbench runners call the request closure in schedule order, so request index `i` (sent as `x-request-id`) is send `i` and its intended time is `i * period`. Scenario C also assumes B is a fair reference: same script and rate, but a different run.
+
+## Audit: oha
+
+`tests/audit_oha.rs` runs [oha](https://github.com/hatoo/oha) 1.16.0 against an in-process phantom: fixed 1 ms service, seed 1, stall `2000:500`, with a fresh phantom for each scenario. oha is an external binary, not a dependency, and this is a report, not a pass/fail gate for oha. The only assertions are that oha exits 0, its JSON parses, and phantom logs at least 100 requests.
+
+```sh
+cargo install oha --locked   # without --locked, a dependency needs rustc 1.96 (this machine: 1.94.1)
+cargo test --release -p phantom --test audit_oha -- --ignored --nocapture --test-threads=1
+```
+
+Each scenario runs, against `http://127.0.0.1:<port>/v1/chat/completions`:
+
+```sh
+oha -q 100 -z 10s --no-tui --output-format json -m POST -d '{}' -H 'content-type: application/json' [extra flags] URL
+```
+
+| scenario | extra flags |
+|:---|:---|
+| O1 | none (50 connections, the default; no correction) |
+| O2 | `--latency-correction` |
+| O3 | `--latency-correction -c 10` |
+| O4 | `-c 1` |
+
+oha's JSON gives latencies in seconds (`latencyPercentiles.p50`, `p99`, `p99.9`, and `summary.slowest` for the maximum); the test converts them to ms. The reference comes from tailbench's own open-loop run against the same script and rate, with truth from phantom's log (see "Audit results" above). It is computed once per test process.
+
+Results over 3 runs (release build, linux-x86_64-24cpu, WSL2). Each cell is the min to max of oha − reference, in ms. The reference ranged over p50 4.31–4.41, p99 404.17–405.35, p99.9 493.95–494.93 and max 503.94–504.90 ms.
+
+| scenario | p50 | p99 | p99.9 | max |
+|:---|---:|---:|---:|---:|
+| O1. 50 conns, uncorrected | −0.58 to −0.36 | +1.77 to +9.45 | +1.31 to +9.47 | −8.67 to −0.51 |
+| O2. 50 conns, corrected | −0.51 to −0.40 | −0.53 to +1.00 | −0.05 to +0.30 | −10.03 to −9.68 |
+| O3. 10 conns, corrected | −0.44 to −0.44 | −1.13 to +10.27 | −0.96 to +10.19 | −10.94 to +0.22 |
+| O4. 1 conn, uncorrected | −0.52 to −0.47 | −400.79 to −399.68 | −0.95 to +0.02 | −10.93 to −9.95 |
+
+What phantom's log showed (min to max over the 3 runs):
+
+| scenario | requests received | largest arrival gap ms | arrivals in 50 ms after stall end | requests stalled | max stall_wait ms |
+|:---|---:|---:|---:|---:|---:|
+| O1 | 1000 | 12.1–15.3 | 5–6 | 50 | 490.3–500.0 |
+| O2 | 1000 | 11.9–21.2 | 5 | 50 | 489.7–490.5 |
+| O3 | 1000 | 403.4–415.7 | 45–46 | 10 | 489.8–499.7 |
+| O4 | 1000 | 493.8–494.8 | 13–14 | 1 | 490.0–490.4 |
+
+oha reported 1000 responses with status 200 and 1–2 "aborted due to deadline" in every scenario. In every row, oha's p99.9 equals its max.
+
+Candidate explanations, none of them verified:
+
+- **Connection count.** With 50 connections, the 50 requests stalled in the 500 ms window (500 ms × 100/s) take exactly 50 connections, so arrivals keep flowing (largest gap 12–21 ms). With 10 or 1 connection, every connection is held by the stall, and arrivals stop for about 400–495 ms. Then a burst follows: 45–46 arrivals in the 50 ms after the stall at `-c 10`.
+- **Rate limiter semantics.** At `-c 1`, uncorrected, the requests that could not be sent during the stall are measured from when they were actually sent, so p99 reads 4.5 ms against a reference of about 405 ms (coordinated omission). How `-q` schedules sends that are already late is oha's own design, and this audit did not examine it.
+- **Burst after the stall.** At `-c 10` the backlog arrives at once after the stall, so the response times right after the stall depend on how oha catches up.
+- **Phase of the schedule against the stall.** phantom's t0 is oha's first arrival. Whether a request lands at the very start of the window decides whether the longest stall_wait is about 490 or 500 ms. In every scenario run, oha's max was phantom's max stall_wait plus 4–5 ms. That would explain the max and p99 cells moving by about one 10 ms period between runs. tailbench's reference request lands at the start of the window by construction.
+- **Requests aborted at the deadline.** These are not in oha's percentiles, and phantom logged exactly 1000 requests, so they left no line in the log.
+
+Limits:
+
+- **The reference is intended-schedule truth from tailbench's own run,** not an independent measurement of oha's run. oha sends no per-request id, so its requests cannot be matched to log lines.
+- **Loopback only:** oha, tailbench and phantom share one machine and one kernel.
+- **Corrected latency is oha's own definition.** `oha --help` (1.16.0) describes it as: "Correct latency to avoid coordinated omission problem. It's ignored if -q is not set."
+- **Release build, one machine.** These numbers come from one machine; other machines and debug builds were not measured.
