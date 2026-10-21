@@ -113,10 +113,14 @@ pub struct Server {
 
 /// Starts phantom (fixed 1 ms service, seed SEED) with `stalls`.
 pub fn start_phantom(stalls: Vec<Stall>) -> Server {
+    start_phantom_script(Script::new(SEED, SERVICE, stalls).unwrap())
+}
+
+/// Starts phantom with `script`.
+pub fn start_phantom_script(script: Script) -> Server {
     let dir = tempfile::tempdir().unwrap();
     let log_path = dir.path().join("gt.jsonl");
     let rt = runtime("phantom");
-    let script = Script::new(SEED, SERVICE, stalls).unwrap();
     let phantom = rt.block_on(async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         phantom::start(listener, script, &log_path).await.unwrap()
@@ -281,19 +285,8 @@ pub fn truth_from_log(text: &str, key: Key) -> Truth {
                 .map(|(arrival, sent)| (i as i64, arrival, sent))
         })
         .collect();
-    // Why the least-lagged request: arrival_ns_i - i * PERIOD is the schedule
-    // start on phantom's clock PLUS request i's own delay (scheduler lag,
-    // client send, loopback, header parsing), and that delay is never
-    // negative. Any single request, request 0 included, carries its own delay
-    // into every truth value; the minimum over all requests carries only the
-    // smallest one. Stalls do not bias it: phantom applies them after arrival,
-    // and late sends only raise arrivals.
     let period = period_ns();
-    let origin = completed
-        .iter()
-        .map(|&(i, arrival, _)| arrival as i64 - i * period)
-        .min()
-        .unwrap();
+    let origin = schedule_origin(completed.iter().map(|&(i, arrival, _)| (i, arrival)), period);
     let intended = |i: i64| origin + i * period;
     Truth {
         truth_ns: completed
@@ -309,6 +302,24 @@ pub fn truth_from_log(text: &str, key: Key) -> Truth {
         origin_shift_ns: completed[0].1 as i64 - intended(completed[0].0),
         stalled,
     }
+}
+
+/// The schedule start on phantom's clock: the minimum over requests of
+/// `arrival_ns_i - i * period_ns`, for (i, arrival_ns_i) pairs.
+///
+/// Why the least-lagged request: arrival_ns_i - i * period is the schedule
+/// start on phantom's clock PLUS request i's own delay (scheduler lag, client
+/// send, loopback, header parsing), and that delay is never negative. Any
+/// single request, request 0 included, carries its own delay into every truth
+/// value; the minimum over all requests carries only the smallest one. Stalls
+/// do not bias it: phantom applies them after arrival, and late sends only
+/// raise arrivals.
+pub fn schedule_origin(arrivals: impl IntoIterator<Item = (i64, u64)>, period_ns: i64) -> i64 {
+    arrivals
+        .into_iter()
+        .map(|(i, arrival)| arrival as i64 - i * period_ns)
+        .min()
+        .expect("at least one request")
 }
 
 /// Nearest rank, the definition tailbench's histogram uses (without its
@@ -335,4 +346,147 @@ pub fn tailbench_at(result: &RunResult, p: Pct) -> f64 {
         None => h.max(),
     };
     us as f64 * 1e3
+}
+
+// Streams (audit_guidellm.rs): per-token truth from phantom's log.
+
+/// One completed streamed request in phantom's log; times in ns since t0.
+pub struct StreamLine {
+    pub seq: u64,
+    pub arrival_ns: u64,
+    pub token_ns: Vec<u64>,
+    pub sent_ns: u64,
+    /// Chat only.
+    pub role_chunk_ns: Option<u64>,
+}
+
+impl StreamLine {
+    /// Server TTFT: from handler entry to token 0's hand-off.
+    pub fn ttft_ns(&self) -> u64 {
+        self.token_ns[0] - self.arrival_ns
+    }
+
+    /// Every inter-token gap: consecutive differences of token_ns.
+    pub fn gaps_ns(&self) -> Vec<u64> {
+        self.token_ns.windows(2).map(|w| w[1] - w[0]).collect()
+    }
+
+    /// The request's mean gap, (last - first) / (tokens - 1); None for one token.
+    pub fn mean_itl_ns(&self) -> Option<f64> {
+        let n = self.token_ns.len();
+        (n > 1).then(|| (self.token_ns[n - 1] - self.token_ns[0]) as f64 / (n - 1) as f64)
+    }
+
+    /// Server end-to-end: from handler entry to the [DONE] hand-off.
+    pub fn e2e_ns(&self) -> u64 {
+        self.sent_ns - self.arrival_ns
+    }
+}
+
+/// phantom's streamed lines: the completed ones by seq, and how many were
+/// abandoned (`"completed": false`, kept out of every truth value).
+pub struct StreamLog {
+    pub completed: Vec<StreamLine>,
+    pub abandoned: usize,
+}
+
+/// Parses a log whose every request was streamed; panics on any other line.
+pub fn stream_lines(text: &str) -> StreamLog {
+    let mut lines = text.lines().map(|l| serde_json::from_str::<Value>(l).unwrap());
+    assert_eq!(lines.next().unwrap()["type"], "manifest");
+    let u64_of = |r: &Value, key: &str| r[key].as_u64().unwrap_or_else(|| panic!("no {key}: {r}"));
+    let (mut completed, mut abandoned) = (Vec::new(), 0);
+    for r in lines {
+        assert_eq!(r["stream"], true, "not a streamed line: {r}");
+        if r["completed"] == false {
+            abandoned += 1;
+            continue;
+        }
+        completed.push(StreamLine {
+            seq: u64_of(&r, "seq"),
+            arrival_ns: u64_of(&r, "arrival_ns"),
+            token_ns: r["token_ns"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no token_ns: {r}"))
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect(),
+            sent_ns: u64_of(&r, "sent_ns"),
+            role_chunk_ns: r["role_chunk_ns"].as_u64(),
+        });
+    }
+    completed.sort_by_key(|l| l.seq);
+    StreamLog { completed, abandoned }
+}
+
+/// Intended-schedule truth for streams, keyed by seq (send i is seq i; see
+/// `Key::Seq` for the ordering assumption), one value per completed line in
+/// seq order. Request i's intended send time is `origin + i * period`.
+pub struct StreamScheduleTruth {
+    pub origin_ns: i64,
+    /// `token_ns[0] - intended`.
+    pub ttft_ns: Vec<i64>,
+    /// `sent_ns - intended`.
+    pub e2e_ns: Vec<i64>,
+    /// `arrival_ns - intended`: send lateness plus the trip.
+    pub lateness_ns: Vec<i64>,
+}
+
+pub fn stream_schedule_truth(log: &StreamLog, period_ns: i64) -> StreamScheduleTruth {
+    let index = |l: &StreamLine| l.seq as i64;
+    let origin = schedule_origin(log.completed.iter().map(|l| (index(l), l.arrival_ns)), period_ns);
+    let since_intended = |l: &StreamLine, t: u64| t as i64 - (origin + index(l) * period_ns);
+    let each = |f: &dyn Fn(&StreamLine) -> i64| log.completed.iter().map(f).collect();
+    StreamScheduleTruth {
+        origin_ns: origin,
+        ttft_ns: each(&|l| since_intended(l, l.token_ns[0])),
+        e2e_ns: each(&|l| since_intended(l, l.sent_ns)),
+        lateness_ns: each(&|l| since_intended(l, l.arrival_ns)),
+    }
+}
+
+/// Nearest rank over unsorted `values` (`ceil(q * n)`-th smallest); `None` is
+/// the maximum.
+pub fn nearest_rank(values: &[f64], q: Option<f64>) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    let rank = q.map_or(n, |q| ((q * n as f64).ceil() as usize).max(1));
+    sorted[rank - 1]
+}
+
+/// GuideLLM 0.8.1's percentile of (value, weight) samples
+/// (`DistributionSummary.from_values` then `Percentiles.from_pdf`, in
+/// guidellm/schemas/base/statistics.py): sort by value, merge equal values by
+/// summing their weights, normalise the weights to probabilities, take their
+/// running sum, and return the first value whose running sum is >= q (numpy
+/// `searchsorted(..., side="left")`). The running sum is accumulated one f64
+/// addition at a time, as numpy's `cumsum` does, so it can land one rank
+/// above nearest rank. `None` is the maximum, GuideLLM's `max`.
+pub fn guidellm_percentile(samples: &[(f64, f64)], q: Option<f64>) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (value, weight) in sorted {
+        match merged.last_mut() {
+            Some(last) if last.0 == value => last.1 += weight,
+            _ => merged.push((value, weight)),
+        }
+    }
+    merged.retain(|&(_, weight)| weight > 0.0);
+    let Some(q) = q else {
+        return merged.last().expect("at least one sample").0;
+    };
+    // Integer weights in these audits, so the total is exact however numpy
+    // orders its sum.
+    let total: f64 = merged.iter().map(|&(_, weight)| weight).sum();
+    let mut cdf = 0.0;
+    for &(value, weight) in &merged {
+        cdf += weight / total;
+        if cdf >= q {
+            return value;
+        }
+    }
+    // numpy would index past the end here; it cannot happen for q <= 0.999.
+    merged.last().unwrap().0
 }
