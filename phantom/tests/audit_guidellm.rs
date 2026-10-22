@@ -49,7 +49,8 @@ const RATE: f64 = 5.0;
 const PERIOD_NS: i64 = 200_000_000;
 const TTFT_MS: u64 = 100;
 const ITL_MS: u64 = 20;
-/// phantom's ceiling; the request's max_tokens (GuideLLM's output_tokens) wins.
+/// phantom's ceiling; the request's max_completion_tokens (GuideLLM's
+/// output_tokens) wins.
 const PHANTOM_OUTPUT_TOKENS: u64 = 64;
 const GUIDELLM_OUTPUT_TOKENS: u64 = 32;
 const PROMPT_TOKENS: u64 = 16;
@@ -112,14 +113,12 @@ struct Run {
 }
 
 fn guidellm_args(base: &str, profile: Profile, json_path: &Path) -> Vec<String> {
-    // GuideLLM sends max_completion_tokens on chat; phantom reads only
-    // max_tokens, so the body carries both (see the README).
+    // GuideLLM's defaults: its health check (GET /health) and its own token
+    // limit (max_completion_tokens on chat), both of which phantom serves.
     let backend = json!({
         "kind": "openai_http",
         "target": base,
         "model": "phantom",
-        "validate_backend": false,
-        "extras": {"body": {"max_tokens": GUIDELLM_OUTPUT_TOKENS}},
     });
     let profile = match profile {
         Profile::Constant => format!("kind=constant,rate={RATE}"),
