@@ -23,8 +23,9 @@ cargo run -p phantom -- --listen 127.0.0.1:8080 --seed 1 --service-ms 20 --stall
 | `--ttft-lognormal MEDIAN_MS:SIGMA` | lognormal streaming time to first token |
 | `--itl-ms MS` | streaming inter-token latency, whole milliseconds > 0 (default: 10) |
 | `--itl-lognormal MEDIAN_MS:SIGMA` | lognormal streaming inter-token latency |
-| `--output-tokens N` | tokens per streamed response, > 0 (default 32); a request's smaller `max_tokens` wins |
+| `--output-tokens N` | tokens per streamed response, > 0 (default 32); a request's smaller token limit wins (see "Streaming") |
 | `--role-chunk WHEN` | when a chat stream's role chunk is sent: `with-first-token` (default) or `at-arrival` |
+| `--token-text TEXT` | the text every streamed token carries, not empty (default `" tok"`); one chunk is one token |
 | `--log PATH` | ground-truth log, created or truncated |
 
 Exactly one of `--service-ms` or `--lognormal` is required. At most one of each `--ttft-*` and `--itl-*` pair may be given. Invalid specs exit non-zero with a message before anything is bound or written. SIGINT or SIGTERM shuts down gracefully: in-flight requests, including streams, are answered, then the log is flushed.
@@ -33,7 +34,7 @@ Endpoints:
 
 - `POST /v1/chat/completions` returns a fixed non-streaming chat completion (`id` depends on seq; nothing else varies), or an event stream when the body has `"stream": true`.
 - `POST /v1/completions` does the same with the completions shapes: `text_completion` objects with `choices[0].text`.
-- `GET /healthz` returns 200 and is not logged.
+- `GET /healthz` and `GET /health` return 200 with the same body, are not logged, and do not start the clock.
 
 ## Streaming
 
@@ -44,12 +45,15 @@ curl -N -H 'content-type: application/json' -d '{"stream":true}' http://127.0.0.
 
 A body with `"stream": true` (the JSON boolean) gets `text/event-stream`, one `data: {...}` event per chunk, each followed by a blank line:
 
-- **chat:** a `chat.completion.chunk` with `delta.role` `"assistant"` (the role chunk), then one chunk per token with `delta.content` `" tok"`, then a chunk with `finish_reason` `"length"` and `usage` (`prompt_tokens` 8, `completion_tokens` = tokens sent), then `data: [DONE]`.
-- **completions:** one `text_completion` chunk per token with `choices[0].text` `" tok"`, the same final chunk (with `text` `""`) and usage, then `data: [DONE]`. There is no role chunk.
+- **chat:** a `chat.completion.chunk` with `delta.role` `"assistant"` (the role chunk), then one chunk per token with `delta.content` set to the token text (`--token-text`, default `" tok"`). The last token's chunk has `finish_reason` `"length"`; the others have `null`.
+- **completions:** one `text_completion` chunk per token with `choices[0].text` set to the token text, the last with `finish_reason` `"length"`. There is no role chunk.
+- **end:** if the body has `"stream_options": {"include_usage": true}` (the JSON boolean), one more chunk follows with `"choices": []` and `usage` (`prompt_tokens` 8, `completion_tokens` = tokens sent). Then `data: [DONE]`.
 
-Only `stream` and `max_tokens` are read from the body; everything else is ignored. Without `"stream": true`, including when the body is not JSON, both endpoints take the non-streaming path and log exactly the old fields.
+This ending follows vLLM 0.32.0's server: the finish reason rides on the last token's chunk, and the usage chunk, without choices, is sent only when the request asks for it ([`completion/serving.py` L458–L492](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/entrypoints/openai/completion/serving.py#L458-L492)). phantom does not send per-chunk usage (`stream_options.continuous_usage_stats`), which vLLM adds to every chunk when it is asked for along with `include_usage`.
 
-Tokens per response: `min(max_tokens, --output-tokens)` when `max_tokens` is a whole number, else `--output-tokens`. `max_tokens` 0 still gets one token: a stream always carries at least one.
+Only `stream`, `max_completion_tokens`, `max_tokens` and `stream_options.include_usage` are read from the body; everything else is ignored. Without `"stream": true`, including when the body is not JSON, both endpoints take the non-streaming path and log exactly the old fields.
+
+Tokens per response: `min(limit, --output-tokens)`, where the limit is `max_completion_tokens` if it is a whole number, else `max_tokens` if that is; with neither, `--output-tokens`. So when both are whole numbers, `max_completion_tokens` wins. A limit of 0 still gets one token: a stream always carries at least one.
 
 Timing, on the server's own clock:
 
@@ -60,7 +64,7 @@ Timing, on the server's own clock:
 
 ## Script
 
-- **t0** is the arrival of the first non-healthz request, on the server's monotonic clock. All logged times are ns since t0.
+- **t0** is the arrival of the first chat or completions request, on the server's monotonic clock. All logged times are ns since t0.
 - **seq** comes from an atomic counter at arrival: 0, 1, 2, ... with no gaps. Every seq gets exactly one log line, completed or abandoned (see "Abandoned requests").
 - **scripted_service_ns** is a pure function of (seed, seq): splitmix64 feeds Box-Muller for lognormal; fixed is `ms * 1e6`.
 - **stall_wait_ns** is `window_end - arrival_ns` if arrival falls in a stall window (start inclusive, end exclusive), else 0.
@@ -71,11 +75,11 @@ Timing, on the server's own clock:
 The first line is the manifest; then one line per chat or completions request, in the order responses were finished (not seq order):
 
 ```json
-{"type":"manifest","phantom_version":"0.1.0","seed":1,"service":{"kind":"fixed","ms":20},"stalls":[{"start_ms":2000,"len_ms":500}],"ttft":{"kind":"fixed","ms":20},"itl":{"kind":"fixed","ms":10},"output_tokens":32,"role_chunk":"with-first-token","listen":"127.0.0.1:8080","start_unix_ns":1792507757152789210,"times":"ns since t0, the arrival of the first non-healthz request, on the server's monotonic clock"}
+{"type":"manifest","phantom_version":"0.1.0","seed":1,"service":{"kind":"fixed","ms":20},"stalls":[{"start_ms":2000,"len_ms":500}],"ttft":{"kind":"fixed","ms":20},"itl":{"kind":"fixed","ms":10},"output_tokens":32,"role_chunk":"with-first-token","token_text":" tok","listen":"127.0.0.1:8080","start_unix_ns":1792507757152789210,"times":"ns since t0, the arrival of the first chat or completions request, on the server's monotonic clock"}
 {"type":"req","seq":2,"arrival_ns":2161907075,"scripted_service_ns":20000000,"stall_wait_ns":338092925,"sent_ns":2522484756,"client_id":2}
 ```
 
-The manifest's `ttft` is the TTFT spec in effect: the service-time spec unless `--ttft-*` was given. Its `role_chunk` is the `--role-chunk` mode in effect, `with-first-token` or `at-arrival`.
+The manifest's `ttft` is the TTFT spec in effect: the service-time spec unless `--ttft-*` was given. Its `role_chunk` is the `--role-chunk` mode in effect, `with-first-token` or `at-arrival`, and its `token_text` the `--token-text` in effect.
 
 `client_id` is the request's `x-request-id` header when it parses as a u64 (decimal); it is omitted when the header is absent or is not a u64. It lets a load generator match its own request index to the log line.
 
@@ -95,7 +99,7 @@ A streamed request's line has the same fields plus the per-token ground truth. H
 | `scheduled_token_ns` | when each token was scheduled, after any stall shift (see "Streaming"); `token_ns[k] >= scheduled_token_ns[k]` |
 | `token_stall_wait_ns` | how far a stall moved each token's scheduled time (later tokens move with it, but log 0) |
 | `role_chunk_ns` | chat only: when the role chunk was handed off; absent on completions lines |
-| `output_tokens` | tokens the response was scripted to carry, `min(max_tokens, --output-tokens)`; on a completed line, the tokens sent |
+| `output_tokens` | tokens the response was scripted to carry, `min(limit, --output-tokens)` (see "Streaming"); on a completed line, the tokens sent |
 | `sent_ns` | when the `[DONE]` event was handed off |
 | `scripted_service_ns` | `scripted_ttft_ns` + the sum of `scripted_itl_ns` |
 | `stall_wait_ns` | the sum of `token_stall_wait_ns` |
@@ -135,9 +139,10 @@ Records go through a channel to a dedicated writer thread, so handlers do not wa
 - **A log write error does not stop serving.** If writing the log fails, phantom keeps answering requests but stops logging them; the error is reported at shutdown and the exit status is non-zero.
 - **The log is flushed, not fsynced.** A clean shutdown leaves it complete; a host crash can lose the last unsynced writes.
 - **Overlapping stalls are refused,** not merged; windows that only touch are allowed, and each one is applied separately.
-- **The request body is read only for `stream` and `max_tokens`.** It is read (up to 16 MiB), and everything else in it is ignored: any prompt gets the same response.
+- **The request body is read only for `stream`, `max_completion_tokens`, `max_tokens` and `stream_options.include_usage`.** It is read (up to 16 MiB), and everything else in it is ignored: any prompt gets the same response.
+- **A stream reports usage only once, at the end, and only when asked.** Without `"stream_options": {"include_usage": true}` a stream carries no `usage`, as on vLLM's server. phantom never sends the per-chunk usage that vLLM sends for `continuous_usage_stats`.
 - **Chunk hand-off time is not wire time.** `token_ns` and a stream's `sent_ns` are taken immediately before each chunk is handed to the response stream. hyper's write to the socket, the kernel and the network come after them.
-- **One chunk is one "token", with fixed text.** Every token is the chunk `" tok"`. A client that re-tokenizes the text, rather than counting chunks, may count a different number of tokens.
+- **One chunk is one "token", with fixed text.** Every token is the same chunk text, `--token-text` (default `" tok"`). A client that re-tokenizes the text, rather than counting chunks, counts the tokens that text encodes to in its tokenizer, which may not be one per chunk; choose a `--token-text` that is one token in that tokenizer.
 - **tokio timers have 1 ms granularity.** Each token is handed off at or after its scheduled time, typically about 1-2 ms after it (`token_ns − scheduled_token_ns`). Because the schedule is absolute, this overshoot does not accumulate. For a 64-token stream at a 10 ms ITL, the largest overshoot was 1.5–2.0 ms over 3 runs; the old schedule, which counted each gap from the previous hand-off, drifted 69–73 ms behind the absolute schedule by the last token. The cost is that an *actual* gap can be shorter than its scripted ITL, when the previous token overshot and the current one did not. An ITL below about 5 ms is not meaningful.
 - **An abandoned request's `abandoned_ns` is when phantom saw the drop, not when the client left.** A non-streaming handler is dropped when hyper reads the closed connection. A stream notices when its response body is dropped. A client that half-closes its socket but keeps reading is not seen as gone. A connection that closes before hyper has parsed the request headers never reaches a handler, gets no seq, and has no line.
 
@@ -299,7 +304,7 @@ phantom: `--service-ms 1 --ttft-ms 100 --itl-ms 20 --output-tokens 64`, seed 1, 
 
 ```sh
 guidellm run \
-  --backend '{"kind":"openai_http","target":"http://127.0.0.1:<port>","model":"phantom","validate_backend":false,"extras":{"body":{"max_tokens":32}}}' \
+  --backend '{"kind":"openai_http","target":"http://127.0.0.1:<port>","model":"phantom"}' \
   --profile <profile> --constraint kind=max_duration,seconds=30 \
   --data kind=synthetic_text,prompt_tokens=16,output_tokens=32 \
   --tokenizer kind=huggingface_auto,model=gpt2 --seed kind=static,value=42 \
@@ -315,8 +320,8 @@ guidellm run \
 
 Notes on the command:
 
-- **`validate_backend: false`.** GuideLLM's health check requests `/health`, and phantom serves `/healthz`.
-- **`extras.body.max_tokens`.** On `/v1/chat/completions`, GuideLLM 0.8.1 puts the data's output length in `max_completion_tokens` ([`request_handlers.py` L1179–L1189](https://github.com/vllm-project/guidellm/blob/v0.8.1/src/guidellm/backends/openai/request_handlers.py#L1179-L1189)). phantom reads only `max_tokens`. Without the extra field, every response would carry phantom's 64 tokens. With it, the body carries both fields, and every response in every run had 32 tokens.
+- **GuideLLM's own health check and token limit.** The backend sets nothing but its target and model. GuideLLM's health check requests `GET /health`, which phantom serves like `/healthz`. On `/v1/chat/completions`, GuideLLM 0.8.1 puts the data's output length in `max_completion_tokens` ([`request_handlers.py` L1179–L1189](https://github.com/vllm-project/guidellm/blob/v0.8.1/src/guidellm/backends/openai/request_handlers.py#L1179-L1189)), which phantom reads (see "Streaming"), so every response carried 32 tokens.
+- **The tables come from runs with two workarounds,** made before phantom served `/health` or read `max_completion_tokens`: the backend had `"validate_backend": false` and `"extras": {"body": {"max_tokens": 32}}`. One run without them is in "Re-run without the workarounds", below the tables.
 - **gpt2 and `" tok"`.** gpt2 encodes phantom's token text `" tok"` as 2 tokens (ids 284 and 74, `" to"` and `"k"`), not 1. That does not affect the counts here: GuideLLM takes a response's output tokens from the server's `usage.completion_tokens` when the server sends it ([`request_stats.py` L237–L246](https://github.com/vllm-project/guidellm/blob/v0.8.1/src/guidellm/schemas/base/request_stats.py#L237-L246)), and phantom reports one per chunk. The tokenizer only sizes the synthetic prompts.
 
 ### What GuideLLM measures
@@ -445,7 +450,7 @@ Truth comes from phantom's log through `tests/common/mod.rs` (`stream_lines`, `s
 
 ### Results
 
-3 runs, release build. Intel(R) Core(TM) i7-14650HX, kernel 6.6.87.2-microsoft-standard-WSL2, rustc 1.94.1 (e408947bf 2026-03-25), tokio 1.53.3, release build (opt-level 3), on AC power, Windows Balanced power plan; Python 3.13.15, GuideLLM 0.8.1, httpx 0.28.1, numpy 2.5.4, transformers 5.20.2. Every cell is the min to max over the 3 runs, in ms. Deltas are GuideLLM − truth.
+3 runs with the two workarounds (see "Notes on the command"), release build. Intel(R) Core(TM) i7-14650HX, kernel 6.6.87.2-microsoft-standard-WSL2, rustc 1.94.1 (e408947bf 2026-03-25), tokio 1.53.3, release build (opt-level 3), on AC power, Windows Balanced power plan; Python 3.13.15, GuideLLM 0.8.1, httpx 0.28.1, numpy 2.5.4, transformers 5.20.2. Every cell is the min to max over the 3 runs, in ms. Deltas are GuideLLM − truth.
 
 **TTFT** (ms)
 
@@ -551,12 +556,42 @@ What the tables show:
 - **G3, closed loop.** GuideLLM's TTFT p99 and max were 102.4–103.1 ms, against G2's intended TTFT of 1822–1831 ms (p99) and 2022–2031 ms (max). In G3, GuideLLM sent nothing while a request was outstanding: 38 requests in 30 s, and the stall delayed one of them, mid-stream. With n = 38, p99 and max are the same request. GuideLLM's `request_latency` p90 was 21.5–27.4 ms below G2's intended p90.
 - **Percentile method.** Nearest rank and GuideLLM's method gave different values only in G3 at p50 (n = 38), where the running sum lands one rank higher (TTFT 101.302–101.329 ms at nearest rank, 101.304–101.368 ms at GuideLLM's).
 
+### Re-run without the workarounds
+
+Once phantom served `/health` and read `max_completion_tokens`, the audit was run once more, in release, on the same machine, with the backend as in the command above: GuideLLM's own health check and token limit.
+
+- **Exit and tokens.** All 4 scenarios exited 0. Every response carried 32 tokens: GuideLLM's output token count was 32 (mean, min and max) in every scenario, and so was phantom's per completed line.
+- **Request counts.** They matched in G1, G3 and G4 (147/4, 38/1, 147/4). In G2, GuideLLM reported 147 successful and 3 incomplete (150 requests in total), and phantom logged 147 completed lines and 4 `"completed": false` lines.
+- **Against the 3-run ranges.** 310 of the 453 printed values (truths, GuideLLM values and deltas) fell outside the ranges in the tables above, most by under 0.2 ms. The ranges are not bounds, and none of this is a failure. The values that moved most:
+  - **Send lateness** p99 was 16.3 ms in G1 and 4.7–4.8 ms in G2 and G4 (the tables: 22.3–29.3 ms); max was 17.2 ms in G1 and 5.0–5.4 ms in G2 and G4 (23.5–29.9 ms). p50 was 2.0–2.2 ms.
+  - **TTFT − intended truth** at p99 and max was −14.3 and −13.8 ms in G1 and −3.9 and −4.3 ms in G4 (the tables: −21.4 to −25.9 ms). G2 at p90 was −2.6 ms (−20.4 to −23.2 ms).
+  - **Scheduled end-to-end − intended truth** was +1.9 to +3.0 ms (the tables: +1.4 to +2.5 ms).
+  - **G2's stalled requests.** TTFT p99 was 1801.1 ms and max 2002.7 ms (the tables: 1821–1828 and 2022–2027 ms). Server truth moved with them (1800.7 and 2001.9 ms), so GuideLLM − server was +0.39 and +0.74 ms.
+  - **Against server truth,** the largest deltas were G1 TTFT max +2.25 ms and G1 end-to-end p99 +1.95 ms (the tables: up to +0.93 and +1.38 ms).
+
+### Re-run with vLLM's stream ending
+
+After phantom's stream ending was changed to vLLM's (see "Streaming"), the audit was run once more, in release, on the same machine, with the same command. On chat, GuideLLM asks for `"stream_options": {"include_usage": true, "continuous_usage_stats": true}` ([`request_handlers.py` L1174–L1177](https://github.com/vllm-project/guidellm/blob/v0.8.1/src/guidellm/backends/openai/request_handlers.py#L1174-L1177)). So each stream now ended with the last token's chunk, carrying `finish_reason`, then a usage chunk with `"choices": []`. Before, it ended with a chunk with an empty `delta`, `finish_reason` and `usage`. In GuideLLM's source, neither final chunk is a token line, since neither has `delta.content`, and GuideLLM keeps the last `usage` it sees ([L1301–L1325](https://github.com/vllm-project/guidellm/blob/v0.8.1/src/guidellm/backends/openai/request_handlers.py#L1301-L1325)). The change should therefore not move GuideLLM's measurements. phantom sends no per-chunk usage, which `continuous_usage_stats` asks for; GuideLLM would keep only the last one.
+
+- **Exit and tokens.** All 4 scenarios exited 0. GuideLLM's output token count was 32 (mean, min and max) in every scenario, and so was phantom's per completed line.
+- **Request counts.** They matched in G2, G3 and G4 (147/4, 38/1, 147/4). In G1, GuideLLM reported 147 successful and 3 incomplete, and phantom logged 147 completed lines and 4 `"completed": false` lines. In the previous re-run, the mismatch was in G2.
+- **Against the previous re-run** (one run each):
+  - **Send lateness** p99 was 5.0 ms in G1 (previously 16.3 ms), 3.5 ms in G2 (4.7 ms) and 4.1 ms in G4 (4.8 ms).
+  - **TTFT − intended truth** at p99 was −3.6 ms in G1 (−14.3 ms), −1.5 ms in G2 (−2.5 ms) and −2.6 ms in G4 (−3.9 ms).
+  - **TTFT − server truth** was +0.42 to +0.80 ms from p50 to p99 in G1, G2 and G4, and +1.33 ms at G2's maximum, a stalled request (previously +0.35 to +1.35 ms, and +2.25 ms at G1's maximum). In G3, with 38 requests, p99 is the maximum: +7.85 ms (+0.51 ms).
+  - **Per-request ITL − truth** was −0.007 to +0.008 ms (−0.017 to +0.004 ms).
+  - **End-to-end − server truth** was +0.62 to +0.93 ms (+0.63 to +1.95 ms).
+  - **Scheduled end-to-end − intended truth** was +1.46 to +2.58 ms (+1.92 to +3.00 ms).
+
 Candidate explanations, none of them verified:
 
 - **What each side's clock covers.** GuideLLM's TTFT and `request_latency` start at its header write and end when its client has read the line. phantom's truth starts at handler entry and ends at the chunk hand-off. GuideLLM's side also includes httpx writing the request, the loopback trip both ways, hyper's write, and the client reading and parsing each SSE line. That would put a small positive delta on TTFT and end-to-end, as seen.
 - **Actual send against intended send.** GuideLLM's TTFT is measured from its actual header write, and intended TTFT from the intended send time. Send lateness is in the second but not the first, which would explain the negative TTFT deltas against intended truth, largest where lateness is largest (p99). GuideLLM reports no scheduled TTFT, so there is no like-for-like column for it.
 - **The intended origin.** The origin carries the smallest send-to-handler delay of the run, and GuideLLM's `targeted_start` is its own schedule on its own clock. The two schedules can differ by a fixed offset, which would appear as a constant in the scheduled end-to-end delta (+1.4 to +2.5 ms).
 - **Send lateness of about 20–30 ms for a few requests.** GuideLLM ran 10 worker processes for the constant profile (`worker_count` 10 in its JSON). Opening a new connection, or process scheduling, could make a few sends late. This audit did not identify which requests were late or why.
+- **Lower send lateness without `validate_backend: false`.** Each GuideLLM worker process calls its backend's `validate()` at startup, before the workers synchronise ([`worker.py` L284–L289](https://github.com/vllm-project/guidellm/blob/v0.8.1/src/guidellm/scheduler/worker.py#L284-L289)), and with validation on, that is a `GET /health` through the worker's HTTP client. If that leaves a connection open, a worker's first timed request no longer opens one. This would lower the lateness of the few late sends, and with it the TTFT and scheduled end-to-end differences against intended truth. It was not checked, and one run is one sample.
+- **One request count off by one in each re-run (G2, then G1).** GuideLLM counted 150 requests and phantom logged 151. One request reached phantom's handler and was abandoned, but is not in GuideLLM's totals. A request started at the 30 s deadline and dropped by GuideLLM's measurement window is a candidate. It moved between scenarios, so it is not tied to one profile. The runs did not record which request it was.
+- **G3's TTFT maximum in the second re-run (+7.85 ms).** A single request whose first token GuideLLM recorded about 7.9 ms after phantom's hand-off. As for G1's end-to-end maximum below, event-loop or garbage-collector pauses and wall-clock steps are candidates. The change of stream ending comes after the first token, so it is not a candidate here.
 - **One late end-to-end maximum (G1, +9.21 ms).** A single request whose end GuideLLM recorded about 9 ms after phantom's `[DONE]` hand-off. Python event-loop or garbage-collector pauses in a worker are candidates. So is a step in the wall clock, since GuideLLM's timestamps are `time.time()`, not a monotonic clock.
 
 Limits:
@@ -564,9 +599,389 @@ Limits:
 - **Loopback only.** GuideLLM and phantom share one machine and one kernel. Nothing here measures a real network.
 - **One chunk = one token.** phantom sends one `" tok"` per chunk and reports one completion token per chunk. A real server may put several tokens in one chunk, and GuideLLM's per-request ITL would then divide by tokens, not chunks.
 - **GuideLLM's token counting.** GuideLLM takes the output token count from the server's `usage`, falling back to the number of token-bearing lines. gpt2 encodes `" tok"` as 2 tokens, so a count from GuideLLM's tokenizer would be twice phantom's; the tokenizer only sized prompts here.
-- **`max_tokens` was added to GuideLLM's request body** through `extras`, because phantom does not read `max_completion_tokens`. GuideLLM's own fields were left as they were.
+- **The tables come from runs with the two workarounds and phantom's earlier stream ending.** Each re-run is one run, compared with the 3-run ranges or with the previous re-run.
 - **Truth is server-side plus intended-schedule.** Server truth stops at phantom's chunk hand-off: it cannot see the response being written, carried or read. Intended truth also depends on the origin formula and on seq order (below).
 - **Intended truth for constant profiles only.** A synchronous run has no schedule, so G3 is compared with G2's intended truth, from a different run.
 - **Request order is assumed.** GuideLLM sends no request id. Request `i` is matched to phantom's `seq` `i`, assuming sends arrive in schedule order. At 5 requests/s, sends are 200 ms apart and no request was later than one period, so a reordering would need a send more than 200 ms late.
 - **Poisson is not audited.** Its intended send times are random draws inside GuideLLM, unknown to phantom, so there is no intended-schedule truth to compare with.
 - **Release build, one machine, 3 runs.**
+
+## Audit: vLLM bench serve
+
+`tests/audit_vllm.rs` runs `vllm bench serve` from [vLLM](https://github.com/vllm-project/vllm) 0.32.0 against an in-process phantom that streams. It compares vLLM's time to first token (TTFT), time per output token (TPOT), inter-token latency (ITL) and end-to-end latency (E2EL) with phantom's per-token ground truth. This is a report, not a pass/fail gate for vLLM. The only assertions are that vLLM exits 0, its result JSON parses, and phantom logs at least 20 requests.
+
+vLLM is an external Python tool. It is installed in a virtual environment outside the repo, and the repo has no Python files or Python dependencies:
+
+```sh
+cd ~/audit-tools && uv venv vllm-venv && uv pip install --python vllm-venv vllm   # installed vLLM 0.32.0
+```
+
+Run the audit with:
+
+```sh
+VLLM_BIN=~/audit-tools/vllm-venv/bin/vllm \
+    cargo test --release -p phantom --test audit_vllm -- --ignored --nocapture --test-threads=1
+```
+
+Without `VLLM_BIN`, or if it does not name a file, the scenarios fail with a message that says so. The test also has four tests that run without vLLM: the `VLLM_BIN` check, the removal of lines without a `client_id` on a hand-written log, reading Python's `Infinity` in vLLM's JSON, and the replica of numpy's percentile on values computed by numpy itself.
+
+phantom: `--service-ms 1 --ttft-ms 100 --itl-ms 20 --output-tokens 64 --token-text " the"`, seed 1, a fresh phantom for each scenario. Each scenario runs vLLM in a temporary directory:
+
+```sh
+vllm bench serve --backend openai --base-url http://127.0.0.1:<port> --endpoint /v1/completions \
+  --model phantom --tokenizer gpt2 --dataset-name random --random-input-len 16 --random-output-len 32 \
+  --ignore-eos --num-prompts 150 --request-rate <rate> [--burstiness <b>] [--max-concurrency 4] --seed 42 \
+  --request-id-prefix '' --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,99,100 \
+  --save-result --save-detailed --result-dir <tmp> --result-filename vllm.json --disable-tqdm
+```
+
+| scenario | vLLM | phantom | intended-schedule truth |
+|:---|:---|:---|:---|
+| V1 | `--request-rate 5 --burstiness inf` (constant spacing) | no stall | yes |
+| V2 | `--request-rate 5 --burstiness inf` | `--stall 10000:2000` | yes |
+| V3 | `--request-rate 5 --burstiness 1` (Poisson) | `--stall 10000:2000` | no: server truth only |
+| V4 | `--request-rate inf --max-concurrency 4` (closed loop) | `--stall 10000:2000` | no: server truth only |
+
+Notes on the command:
+
+- **Flags.** All are from `vllm bench serve --help` (0.32.0). The default `--backend openai` posts to `/v1/completions`, which has no role chunk. `--metric-percentiles` takes 100 as well; numpy's 100th percentile is the maximum, so `p100` is vLLM's maximum.
+- **`--request-id-prefix ''`.** vLLM sends request `i`'s id as the `x-request-id` header ([`endpoint_request_func.py` L139–L146](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/lib/endpoint_request_func.py#L139-L146)), and the random dataset builds it as prefix + `i` ([`datasets.py` L654–L661](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/datasets/datasets.py#L654-L661)). With an empty prefix the id is `i`, which phantom logs as `client_id`.
+- **The token text and the tokenizer.** gpt2 encodes `" the"` as 1 token (id 262), and 32 × `" the"` as 32 tokens. phantom's default `" tok"` is 2 tokens (ids 284 and 74), and 32 × `" tok"` is 64. vLLM re-tokenizes the text only when it reads no `usage` (see (d)). With phantom's current stream ending it reads phantom's `usage`, so the token text does not set the count; `" the"` is kept so that a re-tokenized count would also be 32. Two check runs with the default `" tok"` (2 requests each) show the difference. With phantom's earlier ending, vLLM reported 64 output tokens per request for 32 chunks, and TPOT p99 of 9.85 ms for a 20 ms ITL. With the current ending, it reported 32, and TPOT p99 of 20.00 ms.
+- **vLLM's result JSON** is written by Python's `json` module, which writes an infinite `--request-rate` or `--burstiness` as `Infinity`. JSON has no such literal, so the test reads it as a string before parsing.
+
+### What vLLM bench serve measures
+
+Read from the installed source. `serve.py`, `endpoint_request_func.py` and `datasets.py` are byte-identical to the same files at the `v0.32.0` tag, and numpy's `_function_base_impl.py` to numpy's `v2.4.6` tag, so the links match the quoted lines. Timestamps are `time.perf_counter()`, a monotonic clock. Results are in seconds and reported in ms (× 1000).
+
+**(a) TTFT** runs from just before the request is posted to the first SSE message whose `choices` is non-empty, whatever its text ([`endpoint_request_func.py` L227–L232](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/lib/endpoint_request_func.py#L227-L232), [L255–L266](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/lib/endpoint_request_func.py#L255-L266)):
+
+```python
+    st = time.perf_counter()
+    output.start_time = st
+    most_recent_timestamp = st
+    try:
+        async with session.post(url=api_url, json=payload, headers=headers) as response:
+```
+
+```python
+                            if choices := data.get("choices"):
+                                # Note that text could be empty here
+                                # e.g. for special tokens
+                                text = choices[0].get("text")
+                                timestamp = time.perf_counter()
+                                # First token
+                                if not first_chunk_received:
+                                    first_chunk_received = True
+                                    output.ttft = timestamp - st
+```
+
+`st` is taken inside the concurrency semaphore (see (f)), so time spent waiting for it is not in TTFT. The chat backend (`openai-chat`) has the same rule, so there a role chunk would be TTFT ([L429–L438](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/lib/endpoint_request_func.py#L429-L438)).
+
+**(b) ITL is per chunk.** Every later message with non-empty `choices` adds the gap since the previous one ([`endpoint_request_func.py` L268–L273](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/lib/endpoint_request_func.py#L268-L273)), and the gaps of all successful requests are pooled into one list ([`serve.py` L632](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L632)):
+
+```python
+                                # Decoding phase
+                                else:
+                                    output.itl.append(timestamp - most_recent_timestamp)
+
+                                most_recent_timestamp = timestamp
+                                generated_text += text or ""
+```
+
+```python
+            itls += outputs[i].itl
+```
+
+The request's latency (E2EL) is `most_recent_timestamp - st`: it ends at the last message with non-empty `choices`, not at `[DONE]` ([L287](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/lib/endpoint_request_func.py#L287)). phantom's last message with `choices` is its last token's chunk, which carries `finish_reason` (see "Streaming"), so each request has 31 ITL entries, one per token gap. phantom's earlier ending sent one more chunk with `choices` after the last token (`text` `""`, `finish_reason` `"length"`, and `usage`), and vLLM took it as one more message: 32 ITL entries per request, the last being the gap from token 31 to that chunk.
+
+**(c) TPOT is per request:** `(latency − TTFT) / (output tokens − 1)`, one value per request with more than one output token ([`serve.py` L625–L629](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L625-L629)):
+
+```python
+            tpot = 0.0
+            if output_len > 1:
+                latency_minus_ttft = outputs[i].latency - outputs[i].ttft
+                tpot = latency_minus_ttft / (output_len - 1)
+                tpots.append(tpot)
+```
+
+**(d) Output tokens.** The server's `usage.completion_tokens` is read only from a message without `choices` ([`endpoint_request_func.py` L274–L277](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/lib/endpoint_request_func.py#L274-L277)). If none was read, vLLM re-tokenizes the generated text with `--tokenizer` ([`serve.py` L609–L622](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L609-L622)):
+
+```python
+                            elif usage := data.get("usage"):
+                                output.output_tokens = usage.get("completion_tokens")
+                                if (pt := usage.get("prompt_tokens")) is not None:
+                                    output.prompt_len = pt
+```
+
+```python
+            if not output_len:
+                if tokenizer is None:
+                    output_len = 1
+                else:
+                    # We use the tokenizer to count the number of output tokens
+                    # for some serving backends instead of looking at
+                    # len(outputs[i].itl) since multiple output tokens may be
+                    # bundled together
+                    # Note : this may inflate the output token count slightly
+                    output_len = len(
+                        tokenizer(
+                            outputs[i].generated_text, add_special_tokens=False
+                        ).input_ids
+                    )
+```
+
+vLLM's completions request asks for the usage chunk with `"stream_options": {"include_usage": true}` ([`endpoint_request_func.py` L214–L217](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/lib/endpoint_request_func.py#L214-L217)). phantom then ends each stream with a chunk that has `"choices": []` and `usage`, as vLLM's server does, and vLLM reads `completion_tokens` from it: 32. phantom's earlier ending put `usage` on a chunk that also had `choices`, so vLLM never read it and re-tokenized the text instead; 32 × `" the"` is also 32 gpt2 tokens.
+
+**(e) Send times.** Each request's delay is drawn before sending. At an infinite rate it is 0. At an infinite burstiness it is exactly `1 / rate`. Otherwise it is a gamma draw with shape `burstiness` and mean `1 / rate` (exponential at burstiness 1) ([`serve.py` L468–L479](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L468-L479)):
+
+```python
+            if current_request_rate == float("inf"):
+                delay_ts.append(0)
+            elif burstiness == float("inf"):
+                # when burstiness tends to infinity, the delay time becomes constant
+                # and tends to the inverse of the request rate
+                delay_ts.append(1.0 / current_request_rate)
+            else:
+                theta = 1.0 / (current_request_rate * burstiness)
+
+                # Sample the request interval from the gamma distribution.
+                # If burstiness is 1, it follows exponential distribution.
+                delay_ts.append(np.random.gamma(shape=burstiness, scale=theta))
+```
+
+The delays are summed into send times and, with no ramp-up, rescaled so the last send is at `num_prompts / rate` ([L481–L497](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L481-L497)). With `--burstiness inf` every delay is `1 / rate`, so the rescale factor is 1 (up to float rounding) and request `i` is due at `start + (i + 1) / rate`: constant spacing. A large finite burstiness is only near-constant: the gamma draw's coefficient of variation is `1 / sqrt(burstiness)`. The sends sleep until `start_ts + delay` on `time.time()`, a wall clock ([L509–L516](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L509-L516)):
+
+```python
+    start_ts = time.time()
+    for request_index, request in enumerate(input_requests):
+        if delay_ts[request_index] > 0:
+            current_ts = time.time()
+            sleep_interval_s = start_ts + delay_ts[request_index] - current_ts
+            if sleep_interval_s > 0:
+                await asyncio.sleep(sleep_interval_s)
+        yield request, request_rates[request_index]
+```
+
+**(f) `--max-concurrency`** does not change when requests are issued, only when they run. Each issued request waits on a semaphore of that size before its request function, and so before `st` ([`serve.py` L975–L985](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L975-L985)). The time spent waiting is recorded separately as `client_queue_time` and is not in TTFT, ITL, TPOT or E2EL. The connection pool is limited to the same number ([L826–L828](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L826-L828)). With `--request-rate inf`, all 150 requests are issued at once and run 4 at a time: a closed loop.
+
+```python
+    async def limited_request_func(
+        request_func_input, session, pbar, request_arrival_time
+    ):
+        async with semaphore:
+            output = await request_func(
+                request_func_input=request_func_input, session=session, pbar=pbar
+            )
+        # Preserve start_time as the time the request was sent. It is used by
+        # throughput calculations; record client-side semaphore delay separately.
+        output.client_queue_time = output.start_time - request_arrival_time
+        return output
+```
+
+**(g) No initial test request and no warm-up by default.** The initial single-prompt test is sent only as the ready check, which runs only if `--ready-check-timeout-sec` is above 0 ([`serve.py` L876–L892](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L876-L892)). That flag defaults to 0 ([L1941–L1946](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L1941-L1946)), and `--num-warmups` defaults to 0 ([L1733–L1737](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L1733-L1737)):
+
+```python
+    if ready_check_timeout_sec > 0:
+        test_output = await wait_for_endpoint(
+            request_func,
+            test_input,
+            session,
+            timeout_seconds=ready_check_timeout_sec,
+        )
+        if not test_output.success:
+            raise ValueError(
+                "Initial test run failed - Please make sure benchmark "
+                "arguments are correctly specified. "
+                f"Error: {test_output.error}"
+            )
+        else:
+            print("Initial test run completed.")
+    else:
+        print("Skipping endpoint ready check.")
+```
+
+The test and warm-up requests are built without a `request_id` ([L861–L874](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L861-L874)), so they carry no `x-request-id`. That is how the test identifies them: a phantom line without a `client_id` is not a benchmark request, and is taken out before any truth is computed. In every run there were none. In V1, V2 and V3, every line's `client_id` equalled its `seq`. In V4 it did on 101–125 of 150 lines: 4 requests run at once and reach phantom in varying order. V4 uses no seq-keyed truth. vLLM also requests `GET /metrics`, for speculative-decoding and diffusion metrics, before and after the run ([L196–L207](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L196-L207), [L269–L281](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L269-L281)). phantom answers 404 and logs nothing, and vLLM then skips those metrics.
+
+**(h) Percentiles** are numpy's `np.percentile` with its default method, `linear`: the value at virtual index `(n − 1) × p / 100`, interpolated between its two neighbours ([`serve.py` L757–L759](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L757-L759), likewise for TPOT, ITL and E2EL; numpy's [`_function_base_impl.py` L131–L134](https://github.com/numpy/numpy/blob/v2.4.6/numpy/lib/_function_base_impl.py#L131-L134) and [`_lerp`, L4596–L4599](https://github.com/numpy/numpy/blob/v2.4.6/numpy/lib/_function_base_impl.py#L4596-L4599)):
+
+```python
+        percentiles_ttft_ms=[
+            (p, np.percentile(ttfts or 0, p) * 1000) for p in selected_percentiles
+        ],
+```
+
+```python
+    'linear': {
+        'get_virtual_index': lambda n, quantiles: (n - 1) * quantiles,
+        'fix_gamma': lambda gamma, _: gamma,
+    },
+```
+
+`common::numpy_percentile` replicates it, including `_lerp` interpolating down from the upper neighbour when the weight is at least 0.5, and matches numpy's values exactly on the test's fixtures. Unlike nearest rank, it returns a value between two samples: in a stalled run, p99 can fall between a normal request and a stalled one.
+
+### Truth
+
+Truth comes from phantom's log through `tests/common/mod.rs` (`stream_lines`, `take_untagged`, `stream_schedule_truth`). Only completed lines with a `client_id` are used.
+
+- **Server TTFT** = `token_ns[0] − arrival_ns`. **Server end-to-end** = `sent_ns − arrival_ns`.
+- **Per-gap ITL truth**: every consecutive difference of `token_ns`, pooled over requests (31 per request). Compared with vLLM's ITL.
+- **Per-request mean ITL truth**: `(token_ns[last] − token_ns[0]) / (tokens − 1)`, one value per request: the gaps after the first token. Compared with vLLM's TPOT.
+- **Intended-schedule truth**, V1 and V2 only. Request `i` is phantom's `seq` `i`, and its intended send time is `origin + i × 200 ms`, with the same origin formula as the other audits (`schedule_origin`: the least-lagged request). Intended TTFT = `token_ns[0] − intended`, intended end-to-end = `sent_ns − intended`, and send lateness = `arrival_ns − intended`. vLLM reports no corrected or scheduled latency, so its TTFT and E2EL are shown against this truth as well.
+- **V3** sends at Poisson times drawn inside vLLM, which phantom does not know, and **V4** is a closed loop with no schedule, so both have server truth only.
+
+Each truth is shown at nearest rank (NR) and at numpy's method (np), the method vLLM uses.
+
+### Results
+
+3 runs, release build, with phantom's current stream ending (the last token's chunk carries `finish_reason`, then a usage chunk with `"choices": []`). Intel(R) Core(TM) i7-14650HX, kernel 6.6.87.2-microsoft-standard-WSL2, rustc 1.94.1 (e408947bf 2026-03-25), tokio 1.53.3, release build (opt-level 3), on AC power, Windows Balanced power plan; Python 3.13.15, vLLM 0.32.0, aiohttp 3.14.5, numpy 2.4.6, transformers 5.19.0. Every cell is the min to max over the 3 runs, in ms. Deltas are vLLM − truth, at nearest rank (NR) and at numpy's method (np). The p100 row is the maximum.
+
+**TTFT** (ms)
+
+| scenario | pct | vLLM | server truth | − server (NR) | − server (np) | intended truth | − intended (NR) | − intended (np) |
+|:---|:---|---:|---:|---:|---:|---:|---:|---:|
+| V1 | p50 | 102.023–102.207 | 100.992–101.089 | +1.031 to +1.119 | +1.027 to +1.118 | 101.782–101.875 | +0.167 to +0.351 | +0.164 to +0.349 |
+|  | p90 | 102.787–102.879 | 101.651–101.769 | +1.019 to +1.227 | +1.018 to +1.226 | 102.914–103.152 | −0.364 to −0.035 | −0.365 to −0.035 |
+|  | p99 | 103.212–103.656 | 101.951–102.104 | +1.108 to +1.706 | +1.116 to +1.711 | 103.634–104.073 | −0.861 to −0.237 | −0.718 to −0.203 |
+|  | p100 | 103.453–103.907 | 102.129–102.209 | +1.294 to +1.698 | +1.294 to +1.698 | 103.690–105.209 | −1.302 to −0.236 | −1.302 to −0.236 |
+| V2 | p50 | 102.131–102.425 | 101.054–101.097 | +1.077 to +1.328 | +1.076 to +1.326 | 101.741–102.155 | +0.270 to +0.467 | +0.241 to +0.466 |
+|  | p90 | 102.932–103.229 | 101.671–101.920 | +1.196 to +1.420 | +1.194 to +1.419 | 103.321–103.689 | −0.460 to −0.205 | −0.469 to −0.211 |
+|  | p99 | 1703.195–1706.447 | 1799.842–1800.224 | −96.648 to −93.485 | +1.369 to +4.384 | 1801.041–1802.143 | −97.847 to −95.696 | +0.214 to +2.390 |
+|  | p100 | 2001.894–2005.159 | 2000.592–2001.553 | +1.302 to +3.606 | +1.302 to +3.606 | 2001.026–2002.106 | +0.868 to +3.053 | +0.868 to +3.053 |
+| V3 | p50 | 102.114–102.202 | 101.099–101.174 | +0.992 to +1.055 | +0.979 to +1.055 | — | — | — |
+|  | p90 | 102.731–103.101 | 101.679–101.800 | +1.020 to +1.301 | +1.019 to +1.301 | — | — | — |
+|  | p99 | 1010.957–1012.579 | 1249.391–1250.539 | −238.542 to −237.960 | +0.945 to +1.358 | — | — | — |
+|  | p100 | 1858.175–1859.346 | 1857.157–1858.314 | +1.017 to +1.052 | +1.017 to +1.052 | — | — | — |
+| V4 | p50 | 102.556–102.650 | 101.139–101.201 | +1.355 to +1.511 | +1.342 to +1.509 | — | — | — |
+|  | p90 | 103.540–103.839 | 101.677–101.719 | +1.863 to +2.128 | +1.861 to +2.127 | — | — | — |
+|  | p99 | 104.367–104.679 | 101.931–102.003 | +2.377 to +2.675 | +2.384 to +2.684 | — | — | — |
+|  | p100 | 104.694–105.290 | 101.942–102.081 | +2.616 to +3.349 | +2.616 to +3.349 | — | — | — |
+
+**TPOT** (ms), against the per-request mean gap
+
+| scenario | pct | vLLM | per-request mean truth | − (NR) | − (np) |
+|:---|:---|---:|---:|---:|---:|
+| V1 | p50 | 20.003–20.005 | 20.001–20.002 | +0.001 to +0.003 | +0.001 to +0.003 |
+|  | p90 | 20.020–20.023 | 20.019–20.021 | +0.001 to +0.003 | +0.001 to +0.002 |
+|  | p99 | 20.028–20.033 | 20.028–20.031 | −0.003 to +0.004 | −0.001 to +0.004 |
+|  | p100 | 20.033–20.036 | 20.030–20.035 | +0.001 to +0.003 | +0.001 to +0.003 |
+| V2 | p50 | 19.998–20.006 | 20.000–20.006 | −0.001 to +0.001 | −0.001 to +0.001 |
+|  | p90 | 20.020–20.033 | 20.020–20.029 | 0.000 to +0.004 | 0.000 to +0.004 |
+|  | p99 | 84.170–84.204 | 84.446–84.502 | −0.297 to −0.277 | +0.005 to +0.009 |
+|  | p100 | 84.517–84.523 | 84.510–84.520 | +0.001 to +0.013 | +0.001 to +0.013 |
+| V3 | p50 | 20.000–20.003 | 19.998–20.001 | +0.002 to +0.003 | +0.002 |
+|  | p90 | 20.016–20.022 | 20.014–20.019 | +0.002 to +0.004 | +0.002 to +0.003 |
+|  | p99 | 20.030–20.035 | 20.029–20.030 | +0.001 to +0.006 | +0.002 to +0.006 |
+|  | p100 | 83.904–84.487 | 83.899–84.486 | −0.002 to +0.005 | −0.002 to +0.005 |
+| V4 | p50 | 20.000–20.001 | 19.997–19.998 | +0.003 to +0.004 | +0.003 to +0.004 |
+|  | p90 | 20.020–20.024 | 20.016–20.019 | +0.003 to +0.007 | +0.003 to +0.006 |
+|  | p99 | 84.040–84.502 | 84.032–84.496 | −0.011 to +0.008 | +0.006 to +0.008 |
+|  | p100 | 84.109–84.505 | 84.102–84.500 | +0.003 to +0.007 | +0.003 to +0.007 |
+
+**ITL** (ms), against every gap
+
+| scenario | pct | vLLM | per-gap truth | − (NR) | − (np) |
+|:---|:---|---:|---:|---:|---:|
+| V1 | p50 | 20.254–20.264 | 20.268–20.282 | −0.018 to −0.013 | −0.018 to −0.013 |
+|  | p90 | 20.489–20.531 | 20.467–20.516 | +0.015 to +0.022 | +0.015 to +0.022 |
+|  | p99 | 20.709–20.799 | 20.665–20.755 | +0.036 to +0.045 | +0.037 to +0.045 |
+|  | p100 | 21.130–21.987 | 21.041–21.898 | +0.039 to +0.695 | +0.039 to +0.695 |
+| V2 | p50 | 20.238–20.277 | 20.262–20.309 | −0.032 to −0.024 | −0.032 to −0.025 |
+|  | p90 | 20.516–20.565 | 20.486–20.548 | +0.017 to +0.030 | +0.017 to +0.030 |
+|  | p99 | 20.749–20.840 | 20.736–20.776 | +0.014 to +0.064 | +0.014 to +0.064 |
+|  | p100 | 2019.109–2021.468 | 2019.034–2019.389 | +0.066 to +2.434 | +0.066 to +2.434 |
+| V3 | p50 | 19.894–19.970 | 19.892–19.965 | +0.003 to +0.005 | +0.002 to +0.005 |
+|  | p90 | 20.627–20.655 | 20.614–20.643 | +0.009 to +0.013 | +0.008 to +0.013 |
+|  | p99 | 20.918–20.967 | 20.896–20.937 | +0.022 to +0.034 | +0.022 to +0.035 |
+|  | p100 | 2000.740–2019.562 | 2000.867–2019.617 | −0.127 to −0.040 | −0.127 to −0.040 |
+| V4 | p50 | 20.206–20.285 | 20.231–20.299 | −0.025 to −0.015 | −0.025 to −0.015 |
+|  | p90 | 20.533–20.590 | 20.517–20.575 | +0.013 to +0.016 | +0.013 to +0.016 |
+|  | p99 | 20.749–20.879 | 20.697–20.830 | +0.049 to +0.067 | +0.050 to +0.067 |
+|  | p100 | 2007.454–2019.521 | 2007.430–2019.501 | −0.017 to +0.023 | −0.017 to +0.023 |
+
+**End-to-end** (ms; vLLM E2EL)
+
+| scenario | pct | vLLM | server truth | − server (NR) | − server (np) | intended truth | − intended (NR) | − intended (np) |
+|:---|:---|---:|---:|---:|---:|---:|---:|---:|
+| V1 | p50 | 722.213–722.266 | 721.078–721.186 | +1.081 to +1.145 | +1.076 to +1.145 | 721.809–722.012 | +0.201 to +0.414 | +0.200 to +0.413 |
+|  | p90 | 722.832–722.949 | 721.664–721.687 | +1.168 to +1.262 | +1.167 to +1.261 | 722.916–723.130 | −0.299 to +0.002 | −0.303 to −0.004 |
+|  | p99 | 723.248–723.781 | 721.957–722.055 | +1.193 to +1.824 | +1.261 to +1.840 | 723.972–724.742 | −1.108 to −0.551 | −1.060 to −0.318 |
+|  | p100 | 723.461–724.388 | 721.960–722.111 | +1.427 to +2.429 | +1.427 to +2.429 | 724.001–724.855 | −1.190 to −0.450 | −1.190 to −0.450 |
+| V2 | p50 | 722.312–722.411 | 721.128–721.220 | +1.113 to +1.283 | +1.112 to +1.281 | 721.886–722.184 | +0.227 to +0.465 | +0.226 to +0.454 |
+|  | p90 | 723.224–723.458 | 721.842–721.981 | +1.317 to +1.615 | +1.313 to +1.613 | 723.583–724.102 | −0.644 to −0.359 | −0.664 to −0.367 |
+|  | p99 | 2712.094–2712.410 | 2719.623–2720.383 | −8.235 to −7.530 | +1.171 to +1.396 | 2721.323–2722.166 | −10.073 to −8.993 | −0.271 to +0.591 |
+|  | p100 | 2721.816–2722.284 | 2720.294–2720.893 | +1.152 to +1.830 | +1.152 to +1.830 | 2721.546–2722.265 | −0.141 to +0.737 | −0.141 to +0.737 |
+| V3 | p50 | 722.075–722.323 | 721.081–721.204 | +0.993 to +1.171 | +0.991 to +1.170 | — | — | — |
+|  | p90 | 722.803–723.152 | 721.778–721.820 | +0.983 to +1.374 | +0.982 to +1.374 | — | — | — |
+|  | p99 | 2180.246–2181.243 | 2476.908–2477.891 | −296.662 to −296.448 | +1.145 to +1.313 | — | — | — |
+|  | p100 | 2702.503–2721.723 | 2701.201–2720.468 | +1.255 to +1.371 | +1.255 to +1.371 | — | — | — |
+| V4 | p50 | 722.568–722.739 | 721.081–721.165 | +1.467 to +1.574 | +1.461 to +1.574 | — | — | — |
+|  | p90 | 723.713–724.160 | 721.676–721.782 | +1.930 to +2.454 | +1.929 to +2.452 | — | — | — |
+|  | p99 | 2708.253–2722.396 | 2706.662–2720.073 | +0.638 to +2.324 | +0.922 to +2.333 | — | — | — |
+|  | p100 | 2709.751–2722.756 | 2708.422–2720.116 | +1.046 to +2.640 | +1.046 to +2.640 | — | — | — |
+
+**Requests, ITL samples and send lateness**
+
+| scenario | vLLM completed / failed | phantom completed / `completed: false` / no client_id | vLLM ITL samples | phantom gaps | lateness p50 ms | lateness p99 ms | lateness max ms |
+|:---|---:|---:|---:|---:|---:|---:|---:|
+| V1 | 150/0 | 150/0/0 | 4650 | 4650 | 0.731–0.752 | 2.425–2.914 | 2.611–3.350 |
+| V2 | 150/0 | 150/0/0 | 4650 | 4650 | 0.669–1.053 | 2.300–3.273 | 2.350–4.983 |
+| V3 | 150/0 | 150/0/0 | 4650 | 4650 | — | — | — |
+| V4 | 150/0 | 150/0/0 | 4650 | 4650 | — | — | — |
+
+These ranges are the observed min–max over the 3 runs, not bounds: with only 3 runs a new run falls outside the range about half the time by chance, and this audit sets no pass criteria at all — it asserts only that vLLM exited 0, its result JSON parsed, and phantom logged at least 20 requests.
+
+In every run, vLLM completed all 150 requests with none failed, and phantom logged 150 completed lines with none abandoned. Every response had 32 tokens on both sides, and vLLM's count came from phantom's `usage`. vLLM's ITL list had 31 entries per request (4650), the same as phantom's gaps. In V1 and V2, no request arrived more than one period (200 ms) after its intended send time.
+
+What the tables show:
+
+- **TTFT against server truth.** At numpy's method, vLLM − server TTFT was +0.98 to +1.71 ms in V1 and V3, +1.08 to +4.38 ms in V2, and +1.34 to +3.35 ms in V4. The V2 values above +1.5 ms are all at p99 and p100, in runs 1 and 3 (+2.49 to +4.38 ms). At nearest rank the deltas were in the same ranges, except at p99 in V2 (−93.5 to −96.6 ms) and V3 (−238.0 to −238.5 ms).
+- **Percentile method in the stall tail.** At p99, numpy's virtual index `(n − 1) × 0.99` = 147.51 lies between the 148th and 149th smallest of 150 values, and nearest rank takes the 149th. In V2 and V3 both are requests the stall delayed, by different amounts. numpy returns the point 51% of the way from the first to the second, a value no request had. vLLM's TTFT p99 was 1703.2–1706.4 ms in V2 (nearest-rank truth 1799.8–1800.2 ms). Its TTFT and E2EL p99 in V3 were 1011.0–1012.6 and 2180.2–2181.2 ms (nearest-rank truth 1249.4–1250.5 and 2476.9–2477.9 ms). The same effect, smaller, shows in V2's E2EL p99 at nearest rank (−7.5 to −8.2 ms against server truth) and V2's TPOT p99 (−0.28 to −0.30 ms). Against truth taken at numpy's method, all of these cells are within the ranges of the other cells.
+- **TTFT against intended truth (V1, V2).** vLLM − intended TTFT was −1.30 to +0.47 ms at both methods, except V2 p99 and p100 (+0.21 to +3.05 ms at numpy's method) and V2 p99 at nearest rank (−95.7 to −97.8 ms, the tail effect). Send lateness was 0.67–1.05 ms at p50, 2.30–3.27 ms at p99 and at most 4.98 ms.
+- **TPOT.** vLLM's TPOT matched the per-request mean truth within −0.001 to +0.013 ms at numpy's method in every cell. A stalled request's TPOT was about 84 ms: a per-request mean spreads its 2 s gap over 31 gaps.
+- **ITL.** vLLM's ITL matched per-gap truth within −0.127 to +0.067 ms at every percentile from p50 to p99, and at the maximum in V3 and V4. The exceptions are three maxima, one gap each: V1 +0.695 ms (run 3), and V2 +1.314 and +2.434 ms (runs 1 and 3). In V2, V3 and V4, the maximum ITL was the stall itself, 2.00–2.02 s. At p50, vLLM's ITL was 0.013–0.032 ms below truth in V1, V2 and V4, and 0.002–0.005 ms above it in V3.
+- **End-to-end against server truth.** vLLM − server was +0.92 to +2.64 ms in every cell at numpy's method. At nearest rank, V3 p99 was −296.4 to −296.7 ms and V2 p99 −7.5 to −8.2 ms, by the tail effect; the other nearest-rank cells were +0.64 to +2.64 ms.
+- **End-to-end against intended truth (V1, V2).** vLLM − intended was −1.19 to +0.74 ms at numpy's method. At nearest rank it was in the same range, except V2 p99 (−9.0 to −10.1 ms, the tail effect).
+- **Percentile method elsewhere.** Outside the cells named above (V2 TTFT, E2EL and TPOT p99; V3 TTFT and E2EL p99), nearest rank and numpy's method gave truths at most 0.46 ms apart (V1 intended end-to-end p99). At p100 both are the maximum.
+
+Against the earlier ending. An earlier set of 3 runs used phantom's earlier stream ending: after the last token, one more chunk with `choices` (`text` `""`, `finish_reason` `"length"`) and `usage`. In those runs:
+
+- vLLM's ITL list had 32 entries per request (4800 against 4650 gaps). The extra entry, the gap from the last token to that chunk, was 0.005–0.006 ms at p50 and at most 0.201 ms.
+- vLLM re-tokenized the text instead of reading `usage`. With `" the"` the count was the same, 32.
+- vLLM's ITL p50 was further below truth: −0.020 to −0.041 ms in V1 and V2 (now −0.013 to −0.032), and −0.006 to −0.020 ms in V3 (now +0.002 to +0.005).
+- The other cells had about the same ranges as now. TTFT and end-to-end against server truth were +0.92 to +3.29 ms at numpy's method, and TPOT was within −0.001 to +0.022 ms. The large V2 tail values of runs 1 and 3 above did not occur.
+
+The two sets of runs were made a day apart, 3 runs each. The ITL count and the token source changed as the source read in (a) and (d) predicts. Of the 160 delta cells in the tables, 126 have min–max ranges that overlap between the two sets, and 31 more are apart by at most 0.11 ms. The other 3 are nearest-rank cells at V2 p99 (E2EL against server and intended truth, and TPOT), by 0.27–8.3 ms. There the two values around numpy's index were further apart in the current runs, so nearest rank and numpy's method differ more (the tail effect above).
+
+Candidate explanations, none of them verified:
+
+- **What each side's clock covers.** vLLM's TTFT and E2EL start just before aiohttp posts the request and end when its client has parsed the message. phantom's truth starts at handler entry and ends at the chunk hand-off. vLLM's side also includes aiohttp writing the request, the loopback trip both ways, hyper's write, and reading and parsing each SSE message in Python. That would put a positive delta on TTFT and end-to-end, as seen (about +1 ms; GuideLLM's was about +0.5 ms). V4 has 4 requests in flight on one event loop, which would add more.
+- **TTFT and E2EL against intended truth.** vLLM's values run from its actual send, intended truth from the intended send. Intended truth therefore includes the send lateness (0.67–1.05 ms at p50, at most 4.98 ms), and vLLM's values include the client-side time in the first candidate (about 1 ms). The two partly cancel, which would put the deltas near 0, as seen.
+- **ITL p50 slightly below truth.** vLLM's gap is between the times its client parsed two messages, and phantom's between two hand-offs. A message read late lengthens one gap and shortens the next. That widens vLLM's gap distribution, which raises the upper percentiles (as seen at p90 and p99) and can lower the middle. The earlier ending's near-zero extra gaps (3% of the samples) lowered p50 further. This was not examined.
+- **V2's stall tail in runs 1 and 3.** When the stall window ends, phantom releases at once the held token of every stream in the window, so vLLM's one event loop reads many streams' messages in a burst. Messages read later in the burst get later timestamps. That would raise TTFT and the stall ITL for some stalled requests, which sit at p99 and p100. The earlier runs had the same burst without deltas this large, and it was not examined.
+- **One large ITL maximum (V1, +0.695 ms).** A single gap vLLM recorded longer than any gap phantom handed off. A pause in vLLM's event loop, or in reading the socket, between two messages is a candidate.
+
+Limits:
+
+- **Loopback only.** vLLM and phantom share one machine and one kernel. Nothing here measures a real network.
+- **One chunk = one token.** phantom sends one `" the"` per chunk and reports one completion token per chunk in `usage`, which vLLM reads. A real server may put several tokens in one chunk; vLLM's ITL would then be per chunk, not per token. The token text is one gpt2 token, so a re-tokenized count would match too.
+- **Completions endpoint only.** On the chat backend, vLLM would also take phantom's role chunk as the first token and add one more ITL entry for it (a). Chat was not run.
+- **Truth is server-side plus intended-schedule.** Server truth stops at phantom's chunk hand-off: it cannot see the response being written, carried or read. Intended truth depends on the origin formula and on seq order.
+- **Intended truth for constant spacing only.** V3's Poisson send times are drawn inside vLLM from its seed, and phantom does not know them. V4 has no schedule. Both have server truth only.
+- **Request order.** In V1 and V2, intended truth is keyed by seq, and every line's `client_id` (vLLM's request index) equalled its `seq` in every run, so seq order was vLLM's send order. In V4, with 4 requests in flight, it was 97–106 of 150 lines.
+- **The earlier ending is summarized, not tabulated.** Its 3 runs are compared above in a few figures only.
+- **Release build, one machine, 3 runs.**
+
+### oha, GuideLLM and vLLM compared
+
+Only what the three source reads above established. "Not read" means this repo's audits did not read that part of the tool, not that the tool lacks it. The oha audit was non-streaming, so oha's streaming metrics were not read.
+
+| | oha 1.16.0 | GuideLLM 0.8.1 | vLLM bench serve 0.32.0 |
+|:---|:---|:---|:---|
+| TTFT | not read | from the request's header write to the first SSE line with non-empty content (`delta.content`, reasoning or a tool call); a chat role chunk with `content` `""` is not counted | from just before the request is posted to the first SSE message with non-empty `choices`, whatever its text; on chat, a role chunk counts |
+| ITL | not read | per request: `(last token line − first token line) / (output tokens − 1)`; its distribution weights each request by `output tokens − 1` | every gap between consecutive messages with non-empty `choices`, pooled over requests; a message with `choices` counts even if its text is empty |
+| TPOT | not read | not read | per request: `(latency − TTFT) / (output tokens − 1)`, unweighted |
+| Output tokens | not applicable | asks for usage (`include_usage` and `continuous_usage_stats`); the last `usage.completion_tokens` seen, else the number of token-bearing lines | asks for usage (`include_usage`); the server's `usage.completion_tokens` from a message without `choices`, else the generated text re-tokenized with `--tokenizer` |
+| End of a request | not read | the end of the stream | the last message with non-empty `choices`, not `[DONE]` |
+| Corrected or scheduled latency | `--latency-correction`: "Correct latency to avoid coordinated omission problem. It's ignored if -q is not set." (`oha --help`) | `request_scheduled_latency`, constant profile only: request end − targeted start, `start + index / rate` | none: TTFT, TPOT, ITL and E2EL run from the actual send; the wait for `--max-concurrency` is recorded separately as `client_queue_time` |
+| Percentile | sorted values at the truncated index `(p / 100 × n) as usize`, no interpolation | first value whose weighted running sum (numpy `cumsum`) is ≥ q (`searchsorted`, `side="left"`) | `np.percentile`, linear interpolation between the two samples around `(n − 1) × p / 100` |
+| Clock | not read | `time.time()`, a wall clock | `time.perf_counter()` for request timings; `time.time()` for the send schedule |
