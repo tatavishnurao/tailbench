@@ -9,7 +9,7 @@ A latency harness that audits its own numbers, and other tools' numbers against 
 
 ## Findings
 
-Method: phantom, a scripted fake OpenAI server, logs per-request and per-token ground truth, and each tool is measured against it on one machine, over loopback, in release builds. Every number below is from [phantom/README.md](phantom/README.md), and each finding links to its evidence.
+Method: phantom, a scripted fake OpenAI server, logs per-request and per-token ground truth, and each tool is measured against it on one machine, over loopback, in release builds. Every number below is from [phantom/docs/audits/](https://github.com/tatavishnurao/tailbench/tree/main/phantom/docs/audits), and each finding links to its evidence.
 
 | tool | version | tool − phantom's truth | definitional finding |
 |:---|:---|:---|:---|

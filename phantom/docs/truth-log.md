@@ -28,10 +28,10 @@ A streamed request's line has the same fields plus the per-token ground truth. H
 | `scripted_ttft_ns` | scripted time to first token |
 | `scripted_itl_ns` | scripted gap before each token after the first (`output_tokens` − 1 entries) |
 | `token_ns` | when each token's chunk was handed to the response stream, ns since t0 |
-| `scheduled_token_ns` | when each token was scheduled, after any stall shift (see "Streaming"); `token_ns[k] >= scheduled_token_ns[k]` |
+| `scheduled_token_ns` | when each token was scheduled, after any stall shift (see [Token schedule](https://github.com/tatavishnurao/tailbench/blob/main/phantom/docs/spec.md#token-schedule)); `token_ns[k] >= scheduled_token_ns[k]` |
 | `token_stall_wait_ns` | how far a stall moved each token's scheduled time (later tokens move with it, but log 0) |
 | `role_chunk_ns` | chat only: when the role chunk was handed off; absent on completions lines |
-| `output_tokens` | tokens the response was scripted to carry, `min(limit, --output-tokens)` (see "Streaming"); on a completed line, the tokens sent |
+| `output_tokens` | tokens the response was scripted to carry, `min(limit, --output-tokens)` (see [Streaming](https://github.com/tatavishnurao/tailbench/blob/main/phantom/docs/endpoints.md#streaming)); on a completed line, the tokens sent |
 | `sent_ns` | when the `[DONE]` event was handed off |
 | `scripted_service_ns` | `scripted_ttft_ns` + the sum of `scripted_itl_ns` |
 | `stall_wait_ns` | the sum of `token_stall_wait_ns` |

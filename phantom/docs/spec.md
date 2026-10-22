@@ -5,10 +5,10 @@ The script phantom follows, fixed at startup. The flags that set it are in [endp
 ## Script
 
 - **t0** is the arrival of the first chat or completions request, on the server's monotonic clock. All logged times are ns since t0.
-- **seq** comes from an atomic counter at arrival: 0, 1, 2, ... with no gaps. Every seq gets exactly one log line, completed or abandoned (see "Abandoned requests").
+- **seq** comes from an atomic counter at arrival: 0, 1, 2, ... with no gaps. Every seq gets exactly one log line, completed or abandoned (see [Abandoned requests](https://github.com/tatavishnurao/tailbench/blob/main/phantom/docs/truth-log.md#abandoned-requests)).
 - **scripted_service_ns** is a pure function of (seed, seq): splitmix64 feeds Box-Muller for lognormal; fixed is `ms * 1e6`.
 - **stall_wait_ns** is `window_end - arrival_ns` if arrival falls in a stall window (start inclusive, end exclusive), else 0.
-- A non-streaming request is held until `arrival + stall_wait_ns`, then sleeps `scripted_service_ns`, then gets its response. Streams follow the token schedule in "Streaming" above.
+- A non-streaming request is held until `arrival + stall_wait_ns`, then sleeps `scripted_service_ns`, then gets its response. Streams follow the token schedule in [Token schedule](https://github.com/tatavishnurao/tailbench/blob/main/phantom/docs/spec.md#token-schedule) below.
 
 ## Token schedule
 

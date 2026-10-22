@@ -16,8 +16,6 @@ From source, in a checkout of the [tailbench repository](https://github.com/tata
 cargo install --path phantom
 ```
 
-Not published; it lives in the tailbench workspace as a test fixture.
-
 ## Example
 
 Start phantom with a fixed 20 ms service time and one stall window:

@@ -13,7 +13,7 @@ How phantom's log is turned into truth is indexed in [truth-log.md](../truth-log
 
 ## oha, GuideLLM and vLLM compared
 
-Only what the three source reads above established. "Not read" means this repo's audits did not read that part of the tool, not that the tool lacks it. The oha audit was non-streaming, so oha's streaming metrics were not read.
+Only what the three source reads linked below established. "Not read" means this repo's audits did not read that part of the tool, not that the tool lacks it. The oha audit was non-streaming, so oha's streaming metrics were not read.
 
 The three source reads: [oha](oha.md), [What GuideLLM measures](guidellm.md#what-guidellm-measures), [What vLLM bench serve measures](vllm.md#what-vllm-bench-serve-measures).
 
