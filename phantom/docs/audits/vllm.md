@@ -12,7 +12,7 @@ Run the audit with:
 
 ```sh
 VLLM_BIN=~/audit-tools/vllm-venv/bin/vllm \
-    cargo test --release -p phantom --test audit_vllm -- --ignored --nocapture --test-threads=1
+    cargo test --release -p tailbench-phantom --test audit_vllm -- --ignored --nocapture --test-threads=1
 ```
 
 Without `VLLM_BIN`, or if it does not name a file, the scenarios fail with a message that says so. The test also has five tests that run without vLLM: the `VLLM_BIN` check, the removal of lines without a `client_id` on a hand-written log, intended truth keyed by `client_id` on a hand-written log, reading Python's `Infinity` in vLLM's JSON, and the replica of numpy's percentile on values computed by numpy itself.

@@ -74,6 +74,7 @@ impl Default for ThresholdRule {
 pub struct Threshold {
     /// A sample with `latency_ns >= ns` is in an episode.
     pub ns: u64,
+    /// The rule `ns` was derived by.
     pub rule: ThresholdRule,
     /// Nearest-rank median of every sample of every run passed to `derive`,
     /// recorded whichever the rule.

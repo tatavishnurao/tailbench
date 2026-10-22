@@ -9,7 +9,7 @@
 //!
 //! ```sh
 //! VLLM_BIN=~/audit-tools/vllm-venv/bin/vllm \
-//!     cargo test --release -p phantom --test audit_vllm -- --ignored --nocapture --test-threads=1
+//!     cargo test --release -p tailbench-phantom --test audit_vllm -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Truth comes from phantom's log through `common` (stream_lines,

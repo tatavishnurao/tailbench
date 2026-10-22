@@ -67,13 +67,18 @@ impl CompareMethod {
 /// One run's result with the manifest written for it.
 #[derive(Debug)]
 pub struct RecordedRun {
+    /// What the runner returned.
     pub result: RunResult,
+    /// The manifest written before the run.
     pub manifest: Manifest,
 }
 
+/// One of the two groups of runs compared; deltas are B minus A.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
+    /// The `a` runs.
     A,
+    /// The `b` runs.
     B,
 }
 
@@ -81,39 +86,80 @@ pub enum Group {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
     /// delta > 0, its CI [lo, hi] excludes 0, and |delta| >= min_effect.
-    Slower { delta: i64, lo: i64, hi: i64 },
+    Slower {
+        /// q(B) - q(A).
+        delta: i64,
+        /// Lower end of delta's CI.
+        lo: i64,
+        /// Upper end of delta's CI.
+        hi: i64,
+    },
     /// delta < 0, its CI [lo, hi] excludes 0, and |delta| >= min_effect.
-    Faster { delta: i64, lo: i64, hi: i64 },
+    Faster {
+        /// q(B) - q(A).
+        delta: i64,
+        /// Lower end of delta's CI.
+        lo: i64,
+        /// Upper end of delta's CI.
+        hi: i64,
+    },
     /// The CIs were computed but do not support a direction; `reason` says
     /// every rule that failed, with delta and its CI.
-    Inconclusive { reason: String },
+    Inconclusive {
+        /// Every rule that failed.
+        reason: String,
+    },
     /// The runs cannot be compared; no CI was computed.
-    Refused { reason: String },
+    Refused {
+        /// Why the runs cannot be compared.
+        reason: String,
+    },
 }
 
 /// Something that does not stop a verdict but should be read with it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompareWarning {
     /// A warning on one group's `hier_ci`.
-    Ci { group: Group, warning: CiWarning },
+    Ci {
+        /// The group the warning is on.
+        group: Group,
+        /// The warning.
+        warning: CiWarning,
+    },
     /// A manifest field takes more than one value across all runs. `a` and
     /// `b` are the distinct values in each group, sorted.
     ManifestDiffers {
+        /// The manifest field's name.
         field: &'static str,
+        /// The distinct values in A.
         a: Vec<String>,
+        /// The distinct values in B.
         b: Vec<String>,
     },
     /// Runs whose `build_git_dirty` is true: the binary is not its commit.
-    GitDirty { a: usize, b: usize },
+    GitDirty {
+        /// How many runs of A.
+        a: usize,
+        /// How many runs of B.
+        b: usize,
+    },
     /// Runs whose `sha_mismatch` is true: the checkout moved after the build.
-    ShaMismatch { a: usize, b: usize },
+    ShaMismatch {
+        /// How many runs of A.
+        a: usize,
+        /// How many runs of B.
+        b: usize,
+    },
     /// `interval_ns` or `count` takes more than one value across all runs,
     /// so the runs were not offered the same load: a different request rate
     /// changes queueing, and a different count changes how long the load
     /// lasted. `a` and `b` are the distinct values in each group, sorted.
     OfferedLoadDiffers {
+        /// `interval_ns` or `count`.
         field: &'static str,
+        /// The distinct values in A.
         a: Vec<String>,
+        /// The distinct values in B.
         b: Vec<String>,
     },
 }
@@ -121,18 +167,23 @@ pub enum CompareWarning {
 /// A verdict with what it was computed from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Comparison {
+    /// What the runs support.
     pub verdict: Verdict,
+    /// The percentile compared, as a fraction (0.99 for p99).
     pub q: f64,
     /// R for each group.
     pub runs_a: usize,
+    /// See `runs_a`.
     pub runs_b: usize,
     /// Nominal confidence level of the delta CI.
     pub level: f64,
+    /// How the CI was computed.
     pub method: CompareMethod,
     /// Hierarchical only: bootstrap resamples per group, and the seed (see
     /// `DEFAULT_SEED`). Rerunning `compare` on the same runs reproduces the
     /// same CI.
     pub resamples: usize,
+    /// See `resamples`.
     pub seed: u64,
     /// PerRunWelch only: the Welch-Satterthwaite df of the CI. `None` for
     /// Hierarchical, a refusal, or a group with fewer than 2 runs.
@@ -140,6 +191,7 @@ pub struct Comparison {
     /// True for the body of `compare_split`: samples in episodes were taken
     /// out of every run before the percentile was computed.
     pub episodes_excluded: bool,
+    /// Everything that should be read with the verdict.
     pub warnings: Vec<CompareWarning>,
 }
 
@@ -148,6 +200,7 @@ pub struct Comparison {
 pub struct SplitOptions {
     /// As in `compare`, for the body; usually `DEFAULT_MIN_EFFECT`.
     pub min_effect: Duration,
+    /// How the episode threshold T is derived.
     pub threshold: ThresholdRule,
 }
 
@@ -174,17 +227,25 @@ pub enum EpisodeOutcome {
     Fewer,
     /// Every rule other than p < 1 - level that failed; empty when only
     /// the p-value did.
-    Inconclusive { reasons: Vec<String> },
+    Inconclusive {
+        /// The failed rules.
+        reasons: Vec<String>,
+    },
     /// The runs cannot be compared (the reason `compare` gives).
-    Refused { reason: String },
+    Refused {
+        /// Why the runs cannot be compared.
+        reason: String,
+    },
 }
 
 /// The episode part of `compare_split`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EpisodeVerdict {
+    /// What the episode test supports.
     pub outcome: EpisodeOutcome,
     /// Each run split at the threshold, in input order; empty when refused.
     pub a: Vec<RunEpisodes>,
+    /// See `a`.
     pub b: Vec<RunEpisodes>,
     /// Two-sided p-value of the exact conditional test; `None` when refused.
     pub p: Option<f64>,
@@ -202,8 +263,11 @@ pub struct EpisodeVerdict {
 /// B, and 0 only all k in A; `None` means no split on that side is.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Detectable {
+    /// Episodes in A and B together.
     pub k: usize,
+    /// See the type's description.
     pub more: Option<f64>,
+    /// See the type's description.
     pub fewer: Option<f64>,
     /// The test's level: significant means p < 1 - level.
     pub level: f64,
@@ -296,7 +360,9 @@ impl fmt::Display for Detectable {
 /// percentile, and the episodes by how often they happen.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SplitComparison {
+    /// The body: `compare` on the samples outside episodes.
     pub body: Comparison,
+    /// The episodes: how often they happen in B against A.
     pub episodes: EpisodeVerdict,
     /// The threshold both groups were split at; `None` when refused.
     pub threshold: Option<Threshold>,

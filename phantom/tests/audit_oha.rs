@@ -6,7 +6,7 @@
 //! dependency. Every test is #[ignore]; run them with
 //!
 //! ```sh
-//! cargo test --release -p phantom --test audit_oha -- --ignored --nocapture --test-threads=1
+//! cargo test --release -p tailbench-phantom --test audit_oha -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Primary comparison: per-run truth. oha sends no per-request id, so its

@@ -2,12 +2,18 @@
 name = "tailbench"
 version = "0.1.0"
 edition = "2024"
+# The lowest toolchain that checks the workspace (--all-targets) with Cargo.lock.
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "Latency benchmark harness that audits itself: provenance manifest, calibrated verdicts that can refuse"
 repository = "https://github.com/tatavishnurao/tailbench"
+homepage = "https://github.com/tatavishnurao/tailbench"
+documentation = "https://docs.rs/tailbench"
 readme = "README.md"
 keywords = ["benchmark", "latency", "coordinated-omission", "async"]
 categories = ["development-tools::profiling", "asynchronous"]
+# Tests and docs/ stay in the repository.
+include = ["/src/**", "/build.rs", "/README.md", "/LICENSE", "/Cargo.toml", "/CHANGELOG.md"]
 
 [dependencies]
 # Default features (serialization, sync) are not needed: we only record and query.

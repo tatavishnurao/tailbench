@@ -6,6 +6,27 @@
 //!
 //! Timestamps use `tokio::time::Instant` so the runners follow tokio's paused
 //! clock in tests; outside of tests it behaves like `std::time::Instant`.
+//!
+//! # Example
+//!
+//! Send 100 requests on a 1 ms schedule with the open-loop runner, against a
+//! stand-in request that takes about 200 us, and read p99 latency, measured
+//! from each request's intended send time:
+//!
+//! ```
+//! use std::time::Duration;
+//!
+//! let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+//! let result = rt.block_on(tailbench::open_loop(Duration::from_millis(1), 100, || async {
+//!     tokio::time::sleep(Duration::from_micros(200)).await;
+//! }));
+//! assert_eq!(result.latency.hist.len(), 100);
+//! println!("p99: {} us", result.latency.hist.value_at_quantile(0.99));
+//! ```
+//!
+//! `run` does the same after writing the run manifest.
+
+#![warn(missing_docs)]
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -50,6 +71,7 @@ const NANOS_PER_SEC: u128 = 1_000_000_000;
 /// altered silently.
 #[derive(Debug)]
 pub struct CountedHistogram {
+    /// Every sample, in microseconds, out-of-range ones at the nearest bound.
     pub hist: LatencyHistogram,
     /// Samples under this histogram's minimum (recorded as the minimum).
     pub below_min: u64,
@@ -128,15 +150,20 @@ pub struct RunResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunnerKind {
+    /// `closed_loop`: at most one request in flight.
     ClosedLoop,
+    /// `open_loop`: every request sent at its intended time.
     OpenLoop,
 }
 
 /// Parameters of one run; everything here is copied into the manifest.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
+    /// The runner `run` starts.
     pub kind: RunnerKind,
+    /// Gap between intended send times: send `i` is due at `start + i * interval`.
     pub interval: Duration,
+    /// Number of requests to send.
     pub count: u64,
     /// Recorded in the manifest only; no runner uses randomness yet.
     pub seed: Option<u64>,

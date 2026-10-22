@@ -4,7 +4,7 @@
 
 ```sh
 cargo install oha --locked   # without --locked, a dependency needs rustc 1.96 (this machine: 1.94.1)
-cargo test --release -p phantom --test audit_oha -- --ignored --nocapture --test-threads=1
+cargo test --release -p tailbench-phantom --test audit_oha -- --ignored --nocapture --test-threads=1
 ```
 
 Each scenario runs, against `http://127.0.0.1:<port>/v1/chat/completions`:

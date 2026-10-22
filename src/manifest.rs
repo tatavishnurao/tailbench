@@ -23,7 +23,9 @@ const UNKNOWN: &str = "UNKNOWN";
 /// Serializes as the value itself, or as the string "UNKNOWN".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Probe<T> {
+    /// The value read.
     Known(T),
+    /// Reading it failed.
     Unknown,
 }
 
@@ -42,6 +44,8 @@ impl<T: Serialize> Serialize for Probe<T> {
     }
 }
 
+/// The run manifest: the build, the machine and the run's parameters,
+/// written as JSON before the first request.
 #[derive(Debug, Clone, Serialize)]
 pub struct Manifest {
     /// tailbench crate version.
@@ -75,11 +79,14 @@ pub struct Manifest {
     pub sha_mismatch: Probe<bool>,
     /// `std::env::consts::OS` / `ARCH` of the running binary.
     pub os: &'static str,
+    /// See `os`.
     pub arch: &'static str,
     /// `uname -r`.
     pub kernel: Probe<String>,
+    /// The CPU's model name: `model name` in /proc/cpuinfo on Linux,
+    /// `sysctl -n machdep.cpu.brand_string` on macOS; Unknown elsewhere.
     pub cpu_model: Probe<String>,
-    /// TAILBENCH_MACHINE_LABEL if set, else "<os>-<arch>-<n>cpu". Never the hostname.
+    /// TAILBENCH_MACHINE_LABEL if set, else `"<os>-<arch>-<n>cpu"`. Never the hostname.
     pub machine_label: String,
     /// `rustc --version` of the compiler that built this binary (from build.rs).
     pub rust_version: &'static str,
@@ -90,9 +97,13 @@ pub struct Manifest {
     /// Cargo's OPT_LEVEL when this binary was built ("0".."3", "s", "z"): the
     /// profile's real optimization level. Unknown if cargo did not set it.
     pub opt_level: Probe<String>,
+    /// `RunConfig::kind`.
     pub runner: RunnerKind,
+    /// `RunConfig::interval`, in nanoseconds.
     pub interval_ns: u128,
+    /// `RunConfig::count`.
     pub count: u64,
+    /// `RunConfig::seed`.
     pub seed: Option<u64>,
     /// Wall-clock start, nanoseconds since the Unix epoch. For the record
     /// only: no measurement uses it.

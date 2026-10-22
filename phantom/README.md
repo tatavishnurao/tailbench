@@ -7,7 +7,7 @@ phantom follows a script fixed at startup and writes what it did for each reques
 ## Install
 
 ```sh
-cargo install tailbench-phantom
+cargo install --locked tailbench-phantom
 ```
 
 From source, in a checkout of the [tailbench repository](https://github.com/tatavishnurao/tailbench):

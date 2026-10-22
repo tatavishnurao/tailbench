@@ -154,7 +154,9 @@ pub enum CiWarning {
     /// bootstrap can only reshuffle a handful of tail values and its interval
     /// is mostly an artefact of which few samples happened to be slow.
     InsufficientSamples {
+        /// The percentile, as a fraction.
         q: f64,
+        /// The number of samples.
         n: usize,
         /// `tail_support(n, q)`.
         support: usize,
@@ -169,16 +171,29 @@ pub enum CiWarning {
     /// over runs) lie at or above the estimate. However many samples the
     /// tail holds, they came from that few events, so the estimate says how
     /// slow those events were, not how often they happen.
-    EpisodeLimited { q: f64, episodes: usize },
+    EpisodeLimited {
+        /// The percentile, as a fraction.
+        q: f64,
+        /// Episodes at or above the estimate.
+        episodes: usize,
+    },
     /// `hier_ci` only: fewer than `MIN_RUNS` runs. Resampling one or two runs
     /// cannot show how far a rerun would move the percentile, so the
     /// interval is within-run noise only.
-    BetweenRunVarianceUnknown { runs: usize },
+    BetweenRunVarianceUnknown {
+        /// The number of runs.
+        runs: usize,
+    },
     /// `hier_ci` only: the longest run has more than `MAX_RUN_LENGTH_RATIO`
     /// times the samples of the shortest. Runs are pooled as they are, so
     /// each run weighs by its length and the long runs dominate both the
     /// estimate and the interval.
-    RunLengthsUneven { shortest: usize, longest: usize },
+    RunLengthsUneven {
+        /// Samples in the shortest run.
+        shortest: usize,
+        /// Samples in the longest run.
+        longest: usize,
+    },
 }
 
 impl fmt::Display for CiWarning {
@@ -227,7 +242,9 @@ pub(crate) fn quantile_label(q: f64) -> String {
 pub struct PercentileCi {
     /// `percentile(samples, q)` of the samples as given (not of a resample).
     pub estimate: u64,
+    /// Lower end of the CI.
     pub lo: u64,
+    /// Upper end of the CI.
     pub hi: u64,
     /// Empty if nothing looked wrong.
     pub warnings: Vec<CiWarning>,
@@ -345,7 +362,9 @@ pub fn iid_ci(samples: &[u64], q: f64, resamples: usize, seed: u64, level: f64) 
 pub struct HierCi {
     /// `percentile` of all runs' latencies pooled (not of a resample).
     pub estimate: u64,
+    /// Lower end of the CI.
     pub lo: u64,
+    /// Upper end of the CI.
     pub hi: u64,
     /// Number of runs, R.
     pub runs: usize,
@@ -490,8 +509,11 @@ impl Pooled {
 /// A Welch t interval for mean(b) - mean(a).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WelchCi {
+    /// mean(b) - mean(a).
     pub delta: f64,
+    /// Lower end of the interval.
     pub lo: f64,
+    /// Upper end of the interval.
     pub hi: f64,
     /// Welch-Satterthwaite degrees of freedom; infinite when both groups
     /// have zero variance (the interval is then the point `delta`).
@@ -726,10 +748,12 @@ fn ln_gamma(x: f64) -> f64 {
 pub struct SplitMix64(u64);
 
 impl SplitMix64 {
+    /// A generator whose state starts at `seed`.
     pub fn new(seed: u64) -> Self {
         Self(seed)
     }
 
+    /// Advances the state and returns the next value.
     pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;

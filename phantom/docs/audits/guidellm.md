@@ -14,7 +14,7 @@ Run the audit with:
 
 ```sh
 GUIDELLM_BIN=~/audit-tools/guidellm-venv/bin/guidellm \
-    cargo test --release -p phantom --test audit_guidellm -- --ignored --nocapture --test-threads=1
+    cargo test --release -p tailbench-phantom --test audit_guidellm -- --ignored --nocapture --test-threads=1
 ```
 
 Without `GUIDELLM_BIN`, or if it does not name a file, the scenarios fail with a message that says so. The test also has three tests that run without GuideLLM: the `GUIDELLM_BIN` check, the stream-truth helper on a hand-written log, and the replica of GuideLLM's percentile method on values computed by GuideLLM itself.

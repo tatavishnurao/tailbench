@@ -1,10 +1,27 @@
 [package]
-name = "phantom"
+name = "tailbench-phantom"
 version = "0.1.0"
 edition = "2024"
+# The lowest toolchain that checks the workspace (--all-targets) with Cargo.lock.
+rust-version = "1.88"
 license = "Apache-2.0"
-description = "Deterministic fake OpenAI-compatible server that logs ground truth for every request"
-publish = false
+description = "Scripted fake OpenAI-compatible LLM server that logs per-request and per-token ground truth, for auditing latency benchmarks."
+repository = "https://github.com/tatavishnurao/tailbench"
+homepage = "https://github.com/tatavishnurao/tailbench"
+readme = "README.md"
+keywords = ["llm", "benchmark", "latency", "sse", "ground-truth"]
+categories = ["development-tools::testing", "command-line-utilities"]
+# Tests, audits and docs/ stay in the repository. Leading / anchors a pattern
+# at the package root: a bare "README.md" would also match docs/audits/README.md.
+include = ["/src/**", "/README.md", "/LICENSE", "/Cargo.toml"]
+
+# The library keeps its old name, so `use phantom::...` is unchanged.
+[lib]
+name = "phantom"
+
+[[bin]]
+name = "phantom"
+path = "src/main.rs"
 
 [dependencies]
 axum = "0.8.9"

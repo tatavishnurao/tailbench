@@ -3,9 +3,23 @@
 [![CI](https://github.com/tatavishnurao/tailbench/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tatavishnurao/tailbench/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-status: pre-release
+status: 0.1.0, the first release; the API may change before 1.0.
 
 A latency harness that audits its own numbers, and other tools' numbers against a server that logs the truth.
+
+## Install
+
+The library:
+
+```sh
+cargo add tailbench
+```
+
+phantom, the ground-truth server, as the `phantom` binary:
+
+```sh
+cargo install --locked tailbench-phantom
+```
 
 ## Findings
 
@@ -98,7 +112,7 @@ The closed loop reports a perfect p99. The open loop shows that at least 1 in 10
 - with and without stalls;
 - R = 3, 5 and 10 runs per side.
 
-A false verdict means naming a direction when A and B come from the same distribution. The target is at most 0.05. The hierarchical bootstrap of the pooled percentile (`CompareMethod::Hierarchical`) has a worst false-verdict rate of 0.187 at R = 3 and 0.123 at R = 5 (Summary in docs/calibration.md); that is why per-run Welch is the default. Results for the default method (per-run Welch), from the Summary in [docs/calibration.md](docs/calibration.md) (linux-x86_64-24cpu, 300 trials per cell, Monte Carlo SE 0.013):
+A false verdict means naming a direction when A and B come from the same distribution. The target is at most 0.05. The hierarchical bootstrap of the pooled percentile (`CompareMethod::Hierarchical`) has a worst false-verdict rate of 0.187 at R = 3 and 0.123 at R = 5 (Summary in docs/calibration.md); that is why per-run Welch is the default. Results for the default method (per-run Welch), from the Summary in [docs/calibration.md](https://github.com/tatavishnurao/tailbench/blob/main/docs/calibration.md) (linux-x86_64-24cpu, 300 trials per cell, Monte Carlo SE 0.013):
 
 | method | R | worst false-verdict rate | where | cells significantly above 0.05 |
 |:---|---:|---:|:---|---:|
@@ -184,4 +198,4 @@ tailbench's focus is auditing results (provenance, calibrated verdicts that can 
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](https://github.com/tatavishnurao/tailbench/blob/main/LICENSE).

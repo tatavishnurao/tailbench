@@ -5,7 +5,7 @@ How to start phantom, its flags, the endpoints it serves and the event stream it
 ## Usage
 
 ```sh
-cargo run -p phantom -- --listen 127.0.0.1:8080 --seed 1 --service-ms 20 --stall 2000:500 --log /tmp/gt.jsonl
+cargo run -p tailbench-phantom -- --listen 127.0.0.1:8080 --seed 1 --service-ms 20 --stall 2000:500 --log /tmp/gt.jsonl
 ```
 
 | flag | meaning |
@@ -35,7 +35,7 @@ Endpoints:
 ## Streaming
 
 ```sh
-cargo run -p phantom -- --service-ms 1 --ttft-ms 100 --itl-ms 20 --output-tokens 5 --log /tmp/gt.jsonl
+cargo run -p tailbench-phantom -- --service-ms 1 --ttft-ms 100 --itl-ms 20 --output-tokens 5 --log /tmp/gt.jsonl
 curl -N -H 'content-type: application/json' -d '{"stream":true}' http://127.0.0.1:8080/v1/chat/completions
 ```
 

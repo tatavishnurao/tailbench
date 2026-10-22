@@ -6,7 +6,7 @@
 //! results depend on the machine. Run them with
 //!
 //! ```sh
-//! cargo test -p phantom --test audit -- --ignored --nocapture --test-threads=1
+//! cargo test -p tailbench-phantom --test audit -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! Truth is the intended-schedule truth defined in `common` (origin at the

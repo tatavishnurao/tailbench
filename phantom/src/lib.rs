@@ -18,6 +18,48 @@
 //!
 //! Times in the log are nanoseconds since t0, the arrival of the first chat
 //! or completions request, on the server's own monotonic clock.
+//!
+//! # Running the binary
+//!
+//! The `phantom` binary (`cargo install --locked tailbench-phantom`) serves on an
+//! address and logs to a file until SIGINT or SIGTERM:
+//!
+//! ```sh
+//! phantom --listen 127.0.0.1:8080 --seed 1 --service-ms 20 --stall 2000:500 --log /tmp/gt.jsonl
+//! ```
+//!
+//! After two chat requests and Ctrl-C, the log holds the manifest and one line
+//! per request:
+//!
+//! ```json
+//! {"type":"manifest","phantom_version":"0.1.0","seed":1,"service":{"kind":"fixed","ms":20},"stalls":[{"start_ms":2000,"len_ms":500}],"ttft":{"kind":"fixed","ms":20},"itl":{"kind":"fixed","ms":10},"output_tokens":32,"role_chunk":"with-first-token","token_text":" tok","listen":"127.0.0.1:8080","start_unix_ns":1792675346756144385,"times":"ns since t0, the arrival of the first chat or completions request, on the server's monotonic clock"}
+//! {"type":"req","seq":0,"arrival_ns":148,"scripted_service_ns":20000000,"stall_wait_ns":0,"sent_ns":22616234}
+//! {"type":"req","seq":1,"arrival_ns":29606223,"scripted_service_ns":20000000,"stall_wait_ns":0,"sent_ns":52109987}
+//! ```
+//!
+//! # Example
+//!
+//! Start a server in-process on a free port, then shut it down, which flushes
+//! the log:
+//!
+//! ```
+//! # #[tokio::main]
+//! # async fn main() -> std::io::Result<()> {
+//! use phantom::{Script, ServiceSpec};
+//!
+//! let dir = tempfile::tempdir()?;
+//! let log = dir.path().join("gt.jsonl");
+//! let script = Script::new(1, ServiceSpec::Fixed { ms: 20 }, vec![]).expect("valid script");
+//! let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+//! let server = phantom::start(listener, script, &log).await?;
+//! println!("listening on {}", server.local_addr());
+//! server.shutdown().await?;
+//! assert!(std::fs::read_to_string(&log)?.starts_with(r#"{"type":"manifest""#));
+//! # Ok(())
+//! # }
+//! ```
+
+#![warn(missing_docs)]
 
 use std::convert::Infallible;
 use std::fmt;
@@ -45,6 +87,8 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until};
 
+/// This package's version, from Cargo.toml: the manifest's `phantom_version`
+/// and the startup line's version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Tokens per streamed response when neither `--output-tokens` nor the
 /// request says otherwise.
@@ -74,9 +118,17 @@ const REQUEST_ID_HEADER: &str = "x-request-id";
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum ServiceSpec {
     /// The same whole number of milliseconds for every request.
-    Fixed { ms: u64 },
+    Fixed {
+        /// Milliseconds, > 0.
+        ms: u64,
+    },
     /// `median_ms * exp(sigma * Z)` with Z standard normal, drawn per request.
-    Lognormal { median_ms: f64, sigma: f64 },
+    Lognormal {
+        /// The median, in milliseconds; finite and > 0.
+        median_ms: f64,
+        /// The standard deviation of the underlying normal; finite and > 0.
+        sigma: f64,
+    },
 }
 
 impl ServiceSpec {
@@ -98,7 +150,9 @@ impl ServiceSpec {
 /// held until the window ends. Start inclusive, end exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Stall {
+    /// Start of the window, in milliseconds after t0.
     pub start_ms: u64,
+    /// Length of the window, in milliseconds; > 0.
     pub len_ms: u64,
 }
 
@@ -357,26 +411,32 @@ impl Script {
         Ok(self)
     }
 
+    /// The seed for lognormal draws.
     pub fn seed(&self) -> u64 {
         self.seed
     }
 
+    /// The service-time spec.
     pub fn service(&self) -> ServiceSpec {
         self.service
     }
 
+    /// The stall windows, sorted by start.
     pub fn stalls(&self) -> &[Stall] {
         &self.stalls
     }
 
+    /// How streamed responses are timed.
     pub fn stream(&self) -> StreamSpec {
         self.stream
     }
 
+    /// When a chat stream's role chunk is sent.
     pub fn role_chunk(&self) -> RoleChunk {
         self.role_chunk
     }
 
+    /// The text every streamed token carries.
     pub fn token_text(&self) -> &str {
         &self.token_text
     }
@@ -675,6 +735,7 @@ pub async fn start(listener: TcpListener, script: Script, log_path: &Path) -> io
 }
 
 impl Phantom {
+    /// The address the server is listening on.
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }

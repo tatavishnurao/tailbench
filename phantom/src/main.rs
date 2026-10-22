@@ -18,7 +18,8 @@ use tokio::net::TcpListener;
 
 /// Deterministic fake OpenAI-compatible server that logs ground truth for every request.
 #[derive(Parser)]
-#[command(version)]
+// The package is tailbench-phantom; keep the command's name the binary's.
+#[command(name = "phantom", version)]
 #[command(group(ArgGroup::new("service").required(true).args(["service_ms", "lognormal"])))]
 struct Cli {
     /// Address to listen on.
