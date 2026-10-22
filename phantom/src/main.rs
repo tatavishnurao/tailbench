@@ -10,9 +10,9 @@ use std::process::ExitCode;
 use clap::error::ErrorKind;
 use clap::{ArgGroup, CommandFactory, Parser};
 use phantom::{
-    DEFAULT_ITL, DEFAULT_OUTPUT_TOKENS, RoleChunk, Script, ServiceSpec, Stall, StreamSpec, parse_itl_lognormal,
-    parse_itl_ms, parse_lognormal, parse_output_tokens, parse_role_chunk, parse_service_ms, parse_stall,
-    parse_ttft_lognormal, parse_ttft_ms,
+    DEFAULT_ITL, DEFAULT_OUTPUT_TOKENS, DEFAULT_TOKEN_TEXT, RoleChunk, Script, ServiceSpec, Stall, StreamSpec,
+    parse_itl_lognormal, parse_itl_ms, parse_lognormal, parse_output_tokens, parse_role_chunk, parse_service_ms,
+    parse_stall, parse_token_text, parse_ttft_lognormal, parse_ttft_ms,
 };
 use tokio::net::TcpListener;
 
@@ -47,13 +47,17 @@ struct Cli {
     #[arg(long, value_name = "MEDIAN_MS:SIGMA", value_parser = parse_itl_lognormal, allow_hyphen_values = true,
           conflicts_with = "itl_ms")]
     itl_lognormal: Option<ServiceSpec>,
-    /// Tokens per streamed response; a request's smaller max_tokens wins.
+    /// Tokens per streamed response; a request's smaller max_completion_tokens (else max_tokens) wins.
     #[arg(long, value_name = "N", value_parser = parse_output_tokens, default_value_t = DEFAULT_OUTPUT_TOKENS,
           allow_hyphen_values = true)]
     output_tokens: u64,
     /// When a chat stream's role chunk is sent: with-first-token or at-arrival.
     #[arg(long, value_name = "WHEN", value_parser = parse_role_chunk, default_value = "with-first-token")]
     role_chunk: RoleChunk,
+    /// The text every streamed token carries: one chunk is one token.
+    #[arg(long, value_name = "TEXT", value_parser = parse_token_text, default_value = DEFAULT_TOKEN_TEXT,
+          allow_hyphen_values = true)]
+    token_text: String,
     /// Freeze from START_MS to START_MS + LEN_MS after the first request's arrival. Repeatable.
     #[arg(long, value_name = "START_MS:LEN_MS", value_parser = parse_stall, allow_hyphen_values = true)]
     stall: Vec<Stall>,
@@ -77,6 +81,7 @@ async fn main() -> ExitCode {
     let script = Script::new(cli.seed, service, cli.stall)
         .and_then(|script| script.with_stream(stream))
         .map(|script| script.with_role_chunk(cli.role_chunk))
+        .and_then(|script| script.with_token_text(&cli.token_text))
         .unwrap_or_else(|err| Cli::command().error(ErrorKind::ValueValidation, err).exit());
     match run(cli.listen, script, cli.log).await {
         Ok(()) => ExitCode::SUCCESS,
