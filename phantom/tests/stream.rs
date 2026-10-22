@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use phantom::{
-    Phantom, RoleChunk, Script, ServiceSpec, Stall, StreamSpec, parse_itl_lognormal, parse_itl_ms, parse_output_tokens,
-    parse_role_chunk, parse_ttft_lognormal, parse_ttft_ms,
+    DEFAULT_TOKEN_TEXT, Phantom, RoleChunk, Script, ServiceSpec, Stall, StreamSpec, parse_itl_lognormal, parse_itl_ms,
+    parse_output_tokens, parse_role_chunk, parse_token_text, parse_ttft_lognormal, parse_ttft_ms,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -167,8 +167,15 @@ fn fixed(ms: u64) -> ServiceSpec {
     ServiceSpec::Fixed { ms }
 }
 
+/// A streaming chat body that asks for the usage chunk, as vLLM's and
+/// GuideLLM's clients do.
 fn chat_body(extra: Value) -> Value {
-    let mut body = json!({"model": "any", "messages": [{"role": "user", "content": "hi"}], "stream": true});
+    let mut body = json!({
+        "model": "any",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
     body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
     body
 }
@@ -253,7 +260,7 @@ async fn chat_stream_has_scripted_ttft_and_itl() {
     let (manifest, reqs) = h.finish().await;
 
     let chunks = sse_chunks(&reply);
-    assert_eq!(chunks.len(), 1 + 8 + 1, "role, 8 tokens, finish: {chunks:?}");
+    assert_eq!(chunks.len(), 1 + 8 + 1, "role, 8 tokens, usage: {chunks:?}");
     for c in &chunks {
         assert_eq!(c["object"], "chat.completion.chunk", "{c}");
         assert_eq!(c["model"], "phantom", "{c}");
@@ -262,10 +269,13 @@ async fn chat_stream_has_scripted_ttft_and_itl() {
     assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
     for c in &chunks[1..9] {
         assert_eq!(c["choices"][0]["delta"]["content"], " tok", "{c}");
+    }
+    for c in &chunks[1..8] {
         assert!(c["choices"][0]["finish_reason"].is_null(), "{c}");
     }
+    assert_eq!(chunks[8]["choices"][0]["finish_reason"], "length", "{:?}", chunks[8]);
     let last = &chunks[9];
-    assert_eq!(last["choices"][0]["finish_reason"], "length", "{last}");
+    assert_eq!(last["choices"], json!([]), "{last}");
     assert_eq!(field(&last["usage"], "completion_tokens"), 8, "{last}");
     assert_eq!(
         field(&last["usage"], "total_tokens"),
@@ -330,6 +340,103 @@ async fn max_tokens_truncates_and_output_tokens_is_the_default() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn max_completion_tokens_truncates_and_wins_over_max_tokens() {
+    let stream = StreamSpec {
+        ttft: Some(fixed(2)),
+        itl: fixed(2),
+        output_tokens: 5,
+    };
+    let script = script(1, vec![], stream);
+    let h = launch(script.clone()).await;
+    assert_eq!(content_chunks(&h, json!({"max_completion_tokens": 3})).await, 3);
+    assert_eq!(
+        content_chunks(&h, json!({"max_completion_tokens": 100})).await,
+        5,
+        "min(max_completion_tokens, N)"
+    );
+    assert_eq!(content_chunks(&h, json!({"max_completion_tokens": 0})).await, 1);
+    // Both present: max_completion_tokens wins, whether smaller or larger.
+    assert_eq!(
+        content_chunks(&h, json!({"max_tokens": 4, "max_completion_tokens": 2})).await,
+        2
+    );
+    assert_eq!(
+        content_chunks(&h, json!({"max_tokens": 2, "max_completion_tokens": 4})).await,
+        4
+    );
+    // Anything but a whole number is not a max_completion_tokens, so max_tokens applies.
+    assert_eq!(
+        content_chunks(&h, json!({"max_tokens": 2, "max_completion_tokens": "4"})).await,
+        2
+    );
+    let completions = post_json(
+        &h,
+        COMPLETIONS,
+        json!({"prompt": "hi", "stream": true, "max_tokens": 4, "max_completion_tokens": 3}),
+    )
+    .await;
+    assert_eq!(sse_chunks(&completions).len(), 3, "3 tokens, no usage chunk");
+    let (_, mut reqs) = h.finish().await;
+    reqs.sort_by_key(|r| field(r, "seq"));
+    let logged: Vec<u64> = reqs.iter().map(|r| field(r, "output_tokens")).collect();
+    assert_eq!(logged, [3, 5, 1, 2, 4, 2, 3]);
+    for r in &reqs[..6] {
+        check_stream_line(r, &script, CHAT, field(r, "output_tokens") as usize);
+    }
+    check_stream_line(&reqs[6], &script, COMPLETIONS, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_text_is_carried_by_every_content_chunk_and_recorded() {
+    let stream = StreamSpec {
+        ttft: Some(fixed(2)),
+        itl: fixed(2),
+        output_tokens: 3,
+    };
+    let script = script(1, vec![], stream).with_token_text(" the").unwrap();
+    assert_eq!(script.token_text(), " the");
+    let h = launch(script.clone()).await;
+    let chat = sse_chunks(&post_json(&h, CHAT, chat_body(json!({}))).await);
+    let completions = sse_chunks(&post_json(&h, COMPLETIONS, json!({"prompt": "hi", "stream": true})).await);
+    let (manifest, mut reqs) = h.finish().await;
+
+    assert_eq!(chat.len(), 1 + 3 + 1, "role, 3 tokens, usage: {chat:?}");
+    assert_eq!(
+        chat[0]["choices"][0]["delta"]["content"], "",
+        "role chunk: {:?}",
+        chat[0]
+    );
+    for c in &chat[1..4] {
+        assert_eq!(c["choices"][0]["delta"]["content"], " the", "{c}");
+    }
+    assert_eq!(completions.len(), 3, "3 tokens, no usage chunk: {completions:?}");
+    for c in &completions[..3] {
+        assert_eq!(c["choices"][0]["text"], " the", "{c}");
+    }
+    assert_eq!(field(&chat[4]["usage"], "completion_tokens"), 3);
+    assert_eq!(manifest["token_text"], " the", "{manifest}");
+    reqs.sort_by_key(|r| field(r, "seq"));
+    check_stream_line(&reqs[0], &script, CHAT, 3);
+    check_stream_line(&reqs[1], &script, COMPLETIONS, 3);
+}
+
+#[test]
+fn token_text_is_validated() {
+    assert_eq!(DEFAULT_TOKEN_TEXT, " tok");
+    assert_eq!(
+        Script::new(1, fixed(1), vec![]).unwrap().token_text(),
+        DEFAULT_TOKEN_TEXT
+    );
+    assert_eq!(parse_token_text(" the"), Ok(" the".to_owned()));
+    let err = parse_token_text("").expect_err("empty").to_string();
+    assert!(err.contains("token text"), "{err}");
+    Script::new(1, fixed(1), vec![])
+        .unwrap()
+        .with_token_text("")
+        .expect_err("empty token text");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn defaults_are_service_spec_ttft_10ms_itl_and_32_tokens() {
     let script = Script::new(1, fixed(3), vec![]).unwrap();
     let h = launch(script.clone()).await;
@@ -338,6 +445,7 @@ async fn defaults_are_service_spec_ttft_10ms_itl_and_32_tokens() {
     assert_eq!(manifest["ttft"], json!({"kind": "fixed", "ms": 3}), "{manifest}");
     assert_eq!(manifest["itl"], json!({"kind": "fixed", "ms": 10}), "{manifest}");
     assert_eq!(manifest["output_tokens"], 32, "{manifest}");
+    assert_eq!(manifest["token_text"], " tok", "{manifest}");
     check_stream_line(&reqs[0], &script, CHAT, 32);
     assert_eq!(field(&reqs[0], "scripted_ttft_ns"), 3 * MS);
     assert_eq!(array(&reqs[0], "scripted_itl_ns"), vec![10 * MS; 31]);
@@ -500,7 +608,7 @@ async fn role_chunk_run(role_chunk: RoleChunk) -> (Vec<Value>, Value, Value) {
     let h = launch(script.clone()).await;
     let chat = sse_chunks(&post_json(&h, CHAT, chat_body(json!({}))).await);
     let completions = post_json(&h, COMPLETIONS, json!({"prompt": "hi", "stream": true})).await;
-    assert_eq!(sse_chunks(&completions).len(), 3 + 1, "no role chunk for completions");
+    assert_eq!(sse_chunks(&completions).len(), 3, "no role chunk for completions");
     let (manifest, mut reqs) = h.finish().await;
     let expected_manifest = match role_chunk {
         RoleChunk::WithFirstToken => "with-first-token",
@@ -531,7 +639,7 @@ async fn role_chunk_with_first_token_is_the_default() {
 async fn role_chunk_at_arrival_is_sent_before_ttft() {
     let (chunks, r, _) = role_chunk_run(RoleChunk::AtArrival).await;
     assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant", "{:?}", chunks[0]);
-    assert_eq!(chunks.len(), 1 + 3 + 1, "role, 3 tokens, finish: {chunks:?}");
+    assert_eq!(chunks.len(), 1 + 3 + 1, "role, 3 tokens, usage: {chunks:?}");
     let (arrival, role) = (field(&r, "arrival_ns"), field(&r, ROLE_CHUNK_KEY));
     // TTFT is 200 ms: a role chunk handed off on arrival is far ahead of it.
     assert!(role >= arrival, "{r}");
@@ -560,20 +668,24 @@ async fn completions_stream_has_the_same_timing_and_log_fields() {
     };
     let script = script(1, vec![], stream);
     let h = launch(script.clone()).await;
-    let reply = post_json(&h, COMPLETIONS, json!({"model": "any", "prompt": "hi", "stream": true})).await;
+    let body = json!({"model": "any", "prompt": "hi", "stream": true, "stream_options": {"include_usage": true}});
+    let reply = post_json(&h, COMPLETIONS, body).await;
     let (_, reqs) = h.finish().await;
 
     let chunks = sse_chunks(&reply);
-    assert_eq!(chunks.len(), 4 + 1, "4 tokens, finish: {chunks:?}");
+    assert_eq!(chunks.len(), 4 + 1, "4 tokens, usage: {chunks:?}");
     for c in &chunks {
         assert_eq!(c["object"], "text_completion", "{c}");
         assert_eq!(c["model"], "phantom", "{c}");
     }
     for c in &chunks[..4] {
         assert_eq!(c["choices"][0]["text"], " tok", "{c}");
+    }
+    for c in &chunks[..3] {
         assert!(c["choices"][0]["finish_reason"].is_null(), "{c}");
     }
-    assert_eq!(chunks[4]["choices"][0]["finish_reason"], "length");
+    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "length");
+    assert_eq!(chunks[4]["choices"], json!([]));
     assert_eq!(field(&chunks[4]["usage"], "completion_tokens"), 4);
 
     let r = &reqs[0];
@@ -581,6 +693,76 @@ async fn completions_stream_has_the_same_timing_and_log_fields() {
     assert_eq!(field(r, "scripted_ttft_ns"), 50 * MS, "{r}");
     assert_eq!(array(r, "scripted_itl_ns"), vec![10 * MS; 3], "{r}");
     assert_eq!(field(r, "scripted_ttft_ns"), script.scripted_ttft_ns(0));
+}
+
+/// The end of a stream follows vLLM's server: the last token's chunk carries
+/// `finish_reason`, and a chunk with `"choices": []` and `usage` follows only
+/// when `stream_options.include_usage` is exactly `true`. Per-chunk usage
+/// (`continuous_usage_stats`) is not sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_ends_like_a_vllm_server() {
+    let stream = StreamSpec {
+        ttft: Some(fixed(2)),
+        itl: fixed(2),
+        output_tokens: 3,
+    };
+    let script = script(1, vec![], stream);
+    let h = launch(script.clone()).await;
+    let cases = [
+        (None, false),
+        (Some(json!({"include_usage": true})), true),
+        (Some(json!({"include_usage": false})), false),
+        (Some(json!({"include_usage": "true"})), false),
+        (Some(json!({})), false),
+        (
+            Some(json!({"include_usage": true, "continuous_usage_stats": true})),
+            true,
+        ),
+    ];
+    for endpoint in [CHAT, COMPLETIONS] {
+        for (options, usage) in &cases {
+            let mut body = match endpoint {
+                CHAT => json!({"messages": [{"role": "user", "content": "hi"}], "stream": true}),
+                _ => json!({"prompt": "hi", "stream": true}),
+            };
+            if let Some(options) = options {
+                body["stream_options"] = options.clone();
+            }
+            let chunks = sse_chunks(&post_json(&h, endpoint, body).await);
+            let case = format!("{endpoint} {options:?}: {chunks:?}");
+            let role = usize::from(endpoint == CHAT);
+            assert_eq!(chunks.len(), role + 3 + usize::from(*usage), "{case}");
+            let tokens = &chunks[role..role + 3];
+            for c in tokens {
+                assert!(c.get("usage").is_none(), "{case}");
+                assert_eq!(c["choices"].as_array().unwrap().len(), 1, "{case}");
+            }
+            for c in &tokens[..2] {
+                assert!(c["choices"][0]["finish_reason"].is_null(), "{case}");
+            }
+            assert_eq!(tokens[2]["choices"][0]["finish_reason"], "length", "{case}");
+            if *usage {
+                let last = chunks.last().unwrap();
+                assert_eq!(last["choices"], json!([]), "{case}");
+                assert_eq!(last["id"], tokens[0]["id"], "{case}");
+                assert_eq!(last["object"], tokens[0]["object"], "{case}");
+                assert_eq!(last["model"], "phantom", "{case}");
+                assert_eq!(field(&last["usage"], "completion_tokens"), 3, "{case}");
+                assert_eq!(
+                    field(&last["usage"], "total_tokens"),
+                    field(&last["usage"], "prompt_tokens") + 3,
+                    "{case}"
+                );
+            }
+        }
+    }
+    let (_, mut reqs) = h.finish().await;
+    assert_eq!(reqs.len(), 2 * cases.len());
+    reqs.sort_by_key(|r| field(r, "seq"));
+    for (i, r) in reqs.iter().enumerate() {
+        let endpoint = if i < cases.len() { CHAT } else { COMPLETIONS };
+        check_stream_line(r, &script, endpoint, 3);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -688,4 +870,5 @@ fn cli_refuses_invalid_stream_flags() {
     refused(&["--ttft-ms", "5", "--ttft-lognormal", "5:0.5"], "--ttft-lognormal");
     refused(&["--itl-ms", "5", "--itl-lognormal", "5:0.5"], "--itl-lognormal");
     refused(&["--role-chunk", "later"], "later");
+    refused(&["--token-text", ""], "token text");
 }
