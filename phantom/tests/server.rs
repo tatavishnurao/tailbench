@@ -325,6 +325,30 @@ async fn log_has_a_manifest_then_one_line_per_request() {
     assert_seqs_are_dense(&log.reqs);
 }
 
+/// GET /health is answered exactly like GET /healthz: 200, the same body, no
+/// log line, and it does not start the clock.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_is_served_like_healthz() {
+    let h = launch(Script::new(1, ServiceSpec::Fixed { ms: 1 }, vec![]).unwrap()).await;
+    let mut bodies = Vec::new();
+    for path in ["/healthz", "/health", "/health", "/healthz"] {
+        let resp = h.client.get(format!("{}{path}", h.base)).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{path}");
+        bodies.push((path, resp.text().await.unwrap()));
+    }
+    assert!(bodies.iter().all(|(_, b)| *b == bodies[0].1), "{bodies:?}");
+    sleep(Duration::from_millis(50)).await;
+    chat(&h.client, &h.base).await;
+    let resp = h.client.get(format!("{}/health", h.base)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let log = h.finish().await;
+
+    assert_eq!(log.reqs.len(), 1, "health checks must not be logged: {:?}", log.reqs);
+    // t0 is the chat request's arrival, not a health check's 50 ms earlier.
+    assert!(field(&log.reqs[0], "arrival_ns") < 50 * MS, "{}", log.reqs[0]);
+    assert_eq!(field(&log.reqs[0], "seq"), 0);
+}
+
 /// The log is written while the server runs, not only at shutdown.
 #[tokio::test(flavor = "multi_thread")]
 async fn log_is_flushed_while_running() {
