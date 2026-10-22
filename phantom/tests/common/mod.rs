@@ -1,4 +1,5 @@
-//! Shared by the audits (audit.rs, audit_oha.rs): starting phantom, running
+//! Shared by the audits (audit.rs, audit_oha.rs, audit_guidellm.rs,
+//! audit_vllm.rs): starting phantom, running
 //! tailbench against it, and computing intended-schedule truth from
 //! phantom's log. Each test binary uses a different subset.
 //!
@@ -358,6 +359,8 @@ pub struct StreamLine {
     pub sent_ns: u64,
     /// Chat only.
     pub role_chunk_ns: Option<u64>,
+    /// The request's `x-request-id`, when phantom logged one (a u64).
+    pub client_id: Option<u64>,
 }
 
 impl StreamLine {
@@ -390,6 +393,19 @@ pub struct StreamLog {
     pub abandoned: usize,
 }
 
+impl StreamLog {
+    /// Removes and returns the completed lines without a `client_id`: requests
+    /// the load generator sent without its per-request id, such as vLLM's
+    /// initial test and warm-up requests.
+    pub fn take_untagged(&mut self) -> Vec<StreamLine> {
+        let (tagged, untagged) = std::mem::take(&mut self.completed)
+            .into_iter()
+            .partition(|l| l.client_id.is_some());
+        self.completed = tagged;
+        untagged
+    }
+}
+
 /// Parses a log whose every request was streamed; panics on any other line.
 pub fn stream_lines(text: &str) -> StreamLog {
     let mut lines = text.lines().map(|l| serde_json::from_str::<Value>(l).unwrap());
@@ -413,6 +429,7 @@ pub fn stream_lines(text: &str) -> StreamLog {
                 .collect(),
             sent_ns: u64_of(&r, "sent_ns"),
             role_chunk_ns: r["role_chunk_ns"].as_u64(),
+            client_id: r["client_id"].as_u64(),
         });
     }
     completed.sort_by_key(|l| l.seq);
@@ -489,4 +506,24 @@ pub fn guidellm_percentile(samples: &[(f64, f64)], q: Option<f64>) -> f64 {
     }
     // numpy would index past the end here; it cannot happen for q <= 0.999.
     merged.last().unwrap().0
+}
+
+/// numpy's `np.percentile(values, p)` with its default method, "linear", as
+/// vLLM's benchmark calls it (numpy/lib/_function_base_impl.py, `_quantile`
+/// and `_lerp`): sort, take the virtual index `(n - 1) * p / 100`, and
+/// interpolate between its two neighbours. Like numpy's `_lerp`, it
+/// interpolates down from the upper neighbour when the weight is >= 0.5, so
+/// the result matches numpy's to the bit. p = 100 is the maximum.
+pub fn numpy_percentile(values: &[f64], p: f64) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let last = sorted.len().checked_sub(1).expect("at least one value");
+    let index = last as f64 * (p / 100.0);
+    if index >= last as f64 {
+        return sorted[last];
+    }
+    let below = index.floor();
+    let (a, b) = (sorted[below as usize], sorted[below as usize + 1]);
+    let (t, diff) = (index - below, b - a);
+    if t >= 0.5 { b - diff * (1.0 - t) } else { a + diff * t }
 }
