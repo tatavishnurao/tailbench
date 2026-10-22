@@ -15,7 +15,8 @@
 //! Truth comes from phantom's log through `common` (stream_lines,
 //! stream_schedule_truth): server-side truth from phantom's own timestamps,
 //! and, for the scenarios sent at constant spacing, intended-schedule truth
-//! keyed by seq with the same origin formula as the other audits.
+//! with the same origin formula as the other audits, keyed by seq (V1, V2)
+//! or, behind `--max-concurrency`, by client_id (V5).
 //!
 //! What vLLM 0.32.0 measures (read from its source; see the README): TTFT
 //! runs from just before the request is posted to the first SSE message with
@@ -37,8 +38,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use common::{
-    StreamLog, StreamScheduleTruth, nearest_rank, numpy_percentile, start_phantom_script, stream_lines,
-    stream_schedule_truth,
+    StreamLine, StreamLog, StreamScheduleTruth, nearest_rank, numpy_percentile, schedule_origin, start_phantom_script,
+    stream_lines, stream_schedule_truth,
 };
 use phantom::{Script, ServiceSpec, Stall, StreamSpec};
 use serde_json::Value;
@@ -99,8 +100,22 @@ struct Scenario {
     /// `--max-concurrency`, if set.
     max_concurrency: Option<u32>,
     stall: Option<Stall>,
-    /// Sent at constant spacing, so intended-schedule truth applies.
-    constant: bool,
+    schedule: Schedule,
+}
+
+/// Whether intended-schedule truth applies, and how requests are matched to
+/// their intended send times.
+#[derive(Clone, Copy, PartialEq)]
+enum Schedule {
+    /// No schedule phantom knows: Poisson times drawn inside vLLM, or a
+    /// closed loop.
+    None,
+    /// Constant spacing; request i is phantom's seq i.
+    BySeq,
+    /// Constant spacing; request i is client_id i (vLLM's request index).
+    /// Behind `--max-concurrency`, requests can reach phantom out of index
+    /// order, so seq is not used.
+    ByClientId,
 }
 
 /// What one scenario produced.
@@ -163,7 +178,20 @@ fn vllm_args(base: &str, s: &Scenario, result_dir: &str) -> Vec<String> {
     if let Some(c) = s.max_concurrency {
         args.extend(["--max-concurrency".to_owned(), c.to_string()]);
     }
+    if s.reports_queue() {
+        // vLLM reports these two only with --max-concurrency at a finite rate.
+        let metrics = args.iter().position(|a| a == "--percentile-metrics").unwrap() + 1;
+        args[metrics] = "ttft,tpot,itl,e2el,client_queue_time,e2el_including_client_queue".to_owned();
+    }
     args
+}
+
+impl Scenario {
+    /// Requests sent on a schedule can wait for a `--max-concurrency` slot:
+    /// vLLM records that wait as client_queue_time.
+    fn reports_queue(&self) -> bool {
+        self.max_concurrency.is_some() && self.schedule != Schedule::None
+    }
 }
 
 /// Runs vLLM against a fresh phantom (TTFT 100 ms, ITL 20 ms, token text
@@ -212,12 +240,32 @@ fn run_scenario(s: &Scenario) -> Run {
     // vLLM's benchmark requests carry x-request-id; its initial test and
     // warm-up requests do not, so they are the lines without a client_id.
     let untagged = log.take_untagged().len();
-    let schedule = s.constant.then(|| stream_schedule_truth(&log, PERIOD_NS));
+    let schedule = match s.schedule {
+        Schedule::None => None,
+        Schedule::BySeq => Some(stream_schedule_truth(&log, PERIOD_NS)),
+        Schedule::ByClientId => Some(schedule_by_client_id(&log)),
+    };
     Run {
         json,
         log,
         untagged,
         schedule,
+    }
+}
+
+/// `stream_schedule_truth` keyed by client_id instead of seq: the same origin
+/// formula (`schedule_origin`), with request i intended at origin + i ×
+/// period. Values are in `log.completed` order.
+fn schedule_by_client_id(log: &StreamLog) -> StreamScheduleTruth {
+    let index = |l: &StreamLine| l.client_id.expect("untagged lines are taken out") as i64;
+    let origin = schedule_origin(log.completed.iter().map(|l| (index(l), l.arrival_ns)), PERIOD_NS);
+    let since_intended = |l: &StreamLine, t: u64| t as i64 - (origin + index(l) * PERIOD_NS);
+    let each = |f: &dyn Fn(&StreamLine) -> i64| log.completed.iter().map(f).collect();
+    StreamScheduleTruth {
+        origin_ns: origin,
+        ttft_ns: each(&|l| since_intended(l, l.token_ns[0])),
+        e2e_ns: each(&|l| since_intended(l, l.sent_ns)),
+        lateness_ns: each(&|l| since_intended(l, l.arrival_ns)),
     }
 }
 
@@ -397,6 +445,68 @@ fn report(id: &str, run: &Run) {
     }
 }
 
+/// For a scheduled scenario behind `--max-concurrency`: vLLM's
+/// client_queue_time, its queue-inclusive E2EL, and, per request, vLLM's
+/// TTFT and E2EL plus its client_queue_time against intended truth.
+fn report_queue(id: &str, run: &Run) {
+    let json = &run.json;
+    let lines = &run.log.completed;
+    let schedule = run.schedule.as_ref().expect("a scheduled scenario");
+    // vLLM's per-request lists are in request order: index i is client_id i.
+    let seconds = |key: &str| -> Vec<f64> { vllm_list(json, key).iter().map(|v| v.as_f64().unwrap()).collect() };
+    let (queue, ttfts, latencies) = (seconds("queue_times"), seconds("ttfts"), seconds("latencies"));
+    let at = |list: &[f64], l: &StreamLine| list[l.client_id.unwrap() as usize] * 1e3;
+    let intended = |values: &[i64]| Truth {
+        label: "intended",
+        values: values.iter().map(|&v| ms(v as f64)).collect(),
+    };
+    let lateness = Truth {
+        label: "lateness",
+        values: schedule.lateness_ns.iter().map(|&v| ms(v as f64)).collect(),
+    };
+    let queued = queue.iter().filter(|&&q| q * 1e3 >= 1.0).count();
+    println!(
+        "client_queue_time: {queued} of {} requests waited 1 ms or more",
+        queue.len()
+    );
+    println!("CELL\t{id}\tqueued\tcount\tvllm\t{queued}");
+    table(id, "queue", "client_queue_time", json, &[lateness]);
+    table(
+        id,
+        "E2E incl. queue",
+        "e2el_including_client_queue",
+        json,
+        &[intended(&schedule.e2e_ns)],
+    );
+
+    // Per request: vLLM's value (alone, and plus its client_queue_time) minus
+    // intended truth for the same request.
+    let per_request = |name: &str, list: &[f64], truth: &[i64]| {
+        for (label, with_queue) in [("alone", false), ("+ queue", true)] {
+            let diffs: Vec<f64> = lines
+                .iter()
+                .zip(truth)
+                .map(|(l, &t)| at(list, l) + if with_queue { at(&queue, l) } else { 0.0 } - ms(t as f64))
+                .collect();
+            let mut sorted = diffs.clone();
+            sorted.sort_by(f64::total_cmp);
+            let quantiles = [
+                ("min", sorted[0]),
+                ("p50", nearest_rank(&diffs, Some(0.5))),
+                ("p99", nearest_rank(&diffs, Some(0.99))),
+                ("max", nearest_rank(&diffs, None)),
+            ];
+            let text: Vec<String> = quantiles.iter().map(|(k, v)| format!("{k} {v:+.3}")).collect();
+            println!("per request, vLLM {name} {label} - intended (ms): {}", text.join(", "));
+            for (k, v) in quantiles {
+                println!("CELL\t{id}\t{name} {label} - intended\t{k}\tper-request\t{v:.3}");
+            }
+        }
+    };
+    per_request("TTFT", &ttfts, &schedule.ttft_ns);
+    per_request("E2EL", &latencies, &schedule.e2e_ns);
+}
+
 const V1: Scenario = Scenario {
     id: "V1",
     title: "rate 5, burstiness inf (constant spacing), no stall",
@@ -404,7 +514,7 @@ const V1: Scenario = Scenario {
     burstiness: Some("inf"),
     max_concurrency: None,
     stall: None,
-    constant: true,
+    schedule: Schedule::BySeq,
 };
 const V2: Scenario = Scenario {
     id: "V2",
@@ -413,7 +523,7 @@ const V2: Scenario = Scenario {
     burstiness: Some("inf"),
     max_concurrency: None,
     stall: Some(STALL),
-    constant: true,
+    schedule: Schedule::BySeq,
 };
 const V3: Scenario = Scenario {
     id: "V3",
@@ -422,7 +532,7 @@ const V3: Scenario = Scenario {
     burstiness: Some("1"),
     max_concurrency: None,
     stall: Some(STALL),
-    constant: false,
+    schedule: Schedule::None,
 };
 const V4: Scenario = Scenario {
     id: "V4",
@@ -431,7 +541,17 @@ const V4: Scenario = Scenario {
     burstiness: None,
     max_concurrency: Some(4),
     stall: Some(STALL),
-    constant: false,
+    schedule: Schedule::None,
+};
+
+const V5: Scenario = Scenario {
+    id: "V5",
+    title: "rate 5, burstiness inf (constant spacing), max concurrency 4, stall 10000:2000",
+    rate: "5",
+    burstiness: Some("inf"),
+    max_concurrency: Some(4),
+    stall: Some(STALL),
+    schedule: Schedule::ByClientId,
 };
 
 #[test]
@@ -456,6 +576,14 @@ fn v3_poisson_stall() {
 #[ignore = "runs the external vLLM binary for about 30 s"]
 fn v4_closed_loop_stall() {
     report("V4", &run_scenario(&V4));
+}
+
+#[test]
+#[ignore = "runs the external vLLM binary for about 30 s"]
+fn v5_constant_concurrency_stall() {
+    let run = run_scenario(&V5);
+    report("V5", &run);
+    report_queue("V5", &run);
 }
 
 // Checks of the helpers above, without vLLM.
@@ -534,4 +662,23 @@ fn untagged_lines_are_taken_out() {
     assert_eq!(s.origin_ns, 0);
     assert_eq!(s.lateness_ns, [0, 100]);
     assert_eq!(s.ttft_ns, [500, 600]);
+}
+
+/// Behind --max-concurrency, request 1 can reach phantom before request 0:
+/// intended truth follows client_id, not seq.
+#[test]
+fn schedule_by_client_id_follows_client_id() {
+    let log = [
+        r#"{"type":"manifest"}"#,
+        r#"{"type":"req","seq":0,"arrival_ns":200000000,"sent_ns":900000000,"client_id":1,"stream":true,"token_ns":[300000000,400000000]}"#,
+        r#"{"type":"req","seq":1,"arrival_ns":250000000,"sent_ns":950000000,"client_id":0,"stream":true,"token_ns":[350000000,450000000]}"#,
+    ]
+    .join("\n");
+    let log = stream_lines(&log);
+    let s = schedule_by_client_id(&log);
+    // Request 0 at 250 ms and request 1 at 200 ms: origin min(250, 200 - 200) = 0.
+    assert_eq!(s.origin_ns, 0);
+    assert_eq!(s.lateness_ns, [0, 250_000_000]);
+    assert_eq!(s.ttft_ns, [100_000_000, 350_000_000]);
+    assert_eq!(s.e2e_ns, [700_000_000, 950_000_000]);
 }

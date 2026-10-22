@@ -623,7 +623,7 @@ VLLM_BIN=~/audit-tools/vllm-venv/bin/vllm \
     cargo test --release -p phantom --test audit_vllm -- --ignored --nocapture --test-threads=1
 ```
 
-Without `VLLM_BIN`, or if it does not name a file, the scenarios fail with a message that says so. The test also has four tests that run without vLLM: the `VLLM_BIN` check, the removal of lines without a `client_id` on a hand-written log, reading Python's `Infinity` in vLLM's JSON, and the replica of numpy's percentile on values computed by numpy itself.
+Without `VLLM_BIN`, or if it does not name a file, the scenarios fail with a message that says so. The test also has five tests that run without vLLM: the `VLLM_BIN` check, the removal of lines without a `client_id` on a hand-written log, intended truth keyed by `client_id` on a hand-written log, reading Python's `Infinity` in vLLM's JSON, and the replica of numpy's percentile on values computed by numpy itself.
 
 phantom: `--service-ms 1 --ttft-ms 100 --itl-ms 20 --output-tokens 64 --token-text " the"`, seed 1, a fresh phantom for each scenario. Each scenario runs vLLM in a temporary directory:
 
@@ -641,12 +641,14 @@ vllm bench serve --backend openai --base-url http://127.0.0.1:<port> --endpoint 
 | V2 | `--request-rate 5 --burstiness inf` | `--stall 10000:2000` | yes |
 | V3 | `--request-rate 5 --burstiness 1` (Poisson) | `--stall 10000:2000` | no: server truth only |
 | V4 | `--request-rate inf --max-concurrency 4` (closed loop) | `--stall 10000:2000` | no: server truth only |
+| V5 | `--request-rate 5 --burstiness inf --max-concurrency 4` | `--stall 10000:2000` | yes, keyed by `client_id` |
 
 Notes on the command:
 
 - **Flags.** All are from `vllm bench serve --help` (0.32.0). The default `--backend openai` posts to `/v1/completions`, which has no role chunk. `--metric-percentiles` takes 100 as well; numpy's 100th percentile is the maximum, so `p100` is vLLM's maximum.
 - **`--request-id-prefix ''`.** vLLM sends request `i`'s id as the `x-request-id` header ([`endpoint_request_func.py` L139–L146](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/lib/endpoint_request_func.py#L139-L146)), and the random dataset builds it as prefix + `i` ([`datasets.py` L654–L661](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/datasets/datasets.py#L654-L661)). With an empty prefix the id is `i`, which phantom logs as `client_id`.
 - **The token text and the tokenizer.** gpt2 encodes `" the"` as 1 token (id 262), and 32 × `" the"` as 32 tokens. phantom's default `" tok"` is 2 tokens (ids 284 and 74), and 32 × `" tok"` is 64. vLLM re-tokenizes the text only when it reads no `usage` (see (d)). With phantom's current stream ending it reads phantom's `usage`, so the token text does not set the count; `" the"` is kept so that a re-tokenized count would also be 32. Two check runs with the default `" tok"` (2 requests each) show the difference. With phantom's earlier ending, vLLM reported 64 output tokens per request for 32 chunks, and TPOT p99 of 9.85 ms for a 20 ms ITL. With the current ending, it reported 32, and TPOT p99 of 20.00 ms.
+- **V5's percentile metrics** are `ttft,tpot,itl,e2el,client_queue_time,e2el_including_client_queue`. vLLM reports the last two only with `--max-concurrency` at a finite rate (see (f)).
 - **vLLM's result JSON** is written by Python's `json` module, which writes an infinite `--request-rate` or `--burstiness` as `Infinity`. JSON has no such literal, so the test reads it as a string before parsing.
 
 ### What vLLM bench serve measures
@@ -764,6 +766,21 @@ The delays are summed into send times and, with no ramp-up, rescaled so the last
 
 **(f) `--max-concurrency`** does not change when requests are issued, only when they run. Each issued request waits on a semaphore of that size before its request function, and so before `st` ([`serve.py` L975–L985](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L975-L985)). The time spent waiting is recorded separately as `client_queue_time` and is not in TTFT, ITL, TPOT or E2EL. The connection pool is limited to the same number ([L826–L828](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L826-L828)). With `--request-rate inf`, all 150 requests are issued at once and run 4 at a time: a closed loop.
 
+The wait starts when the request is issued, at its scheduled time: `request_arrival_time = time.perf_counter()` ([L1073](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L1073)). The detailed result lists every request's wait as `queue_times`, in request order ([L1296](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L1296)). With `--max-concurrency` at a finite rate, vLLM also computes a queue-inclusive E2EL, reported as `e2el_including_client_queue` when it is listed in `--percentile-metrics` ([L1318–L1326](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L1318-L1326), [L1398–L1411](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L1398-L1411)):
+
+```python
+    queue_times: list[float] | None = None
+    e2els_including_queue: list[float] | None = None
+    if max_concurrency is not None:
+        queue_times = [output.client_queue_time for output in outputs if output.success]
+        if not math.isinf(request_rate):
+            e2els_including_queue = [
+                output.latency + output.client_queue_time
+                for output in outputs
+                if output.success
+            ]
+```
+
 ```python
     async def limited_request_func(
         request_func_input, session, pbar, request_arrival_time
@@ -826,107 +843,153 @@ Truth comes from phantom's log through `tests/common/mod.rs` (`stream_lines`, `t
 - **Server TTFT** = `token_ns[0] − arrival_ns`. **Server end-to-end** = `sent_ns − arrival_ns`.
 - **Per-gap ITL truth**: every consecutive difference of `token_ns`, pooled over requests (31 per request). Compared with vLLM's ITL.
 - **Per-request mean ITL truth**: `(token_ns[last] − token_ns[0]) / (tokens − 1)`, one value per request: the gaps after the first token. Compared with vLLM's TPOT.
-- **Intended-schedule truth**, V1 and V2 only. Request `i` is phantom's `seq` `i`, and its intended send time is `origin + i × 200 ms`, with the same origin formula as the other audits (`schedule_origin`: the least-lagged request). Intended TTFT = `token_ns[0] − intended`, intended end-to-end = `sent_ns − intended`, and send lateness = `arrival_ns − intended`. vLLM reports no corrected or scheduled latency, so its TTFT and E2EL are shown against this truth as well.
+- **Intended-schedule truth**, V1, V2 and V5. Request `i`'s intended send time is `origin + i × 200 ms`, with the same origin formula as the other audits (`schedule_origin`: the least-lagged request). In V1 and V2, request `i` is phantom's `seq` `i`. In V5, request `i` is the line whose `client_id` is `i` (`schedule_by_client_id` in the test), because requests waiting for a `--max-concurrency` slot could reach phantom out of order. Intended TTFT = `token_ns[0] − intended`, intended end-to-end = `sent_ns − intended`, and send lateness = `arrival_ns − intended`. vLLM's TTFT and E2EL run from the actual send, and are shown against this truth as well.
+- **V5's queue.** vLLM's `client_queue_time` is compared with send lateness. Per request, vLLM's `ttfts[i]` and `latencies[i]`, alone and plus `queue_times[i]`, are compared with intended TTFT and end-to-end of the line whose `client_id` is `i`. vLLM's `e2el_including_client_queue` is compared with intended end-to-end.
 - **V3** sends at Poisson times drawn inside vLLM, which phantom does not know, and **V4** is a closed loop with no schedule, so both have server truth only.
 
 Each truth is shown at nearest rank (NR) and at numpy's method (np), the method vLLM uses.
 
 ### Results
 
-3 runs, release build, with phantom's current stream ending (the last token's chunk carries `finish_reason`, then a usage chunk with `"choices": []`). Intel(R) Core(TM) i7-14650HX, kernel 6.6.87.2-microsoft-standard-WSL2, rustc 1.94.1 (e408947bf 2026-03-25), tokio 1.53.3, release build (opt-level 3), on AC power, Windows Balanced power plan; Python 3.13.15, vLLM 0.32.0, aiohttp 3.14.5, numpy 2.4.6, transformers 5.19.0. Every cell is the min to max over the 3 runs, in ms. Deltas are vLLM − truth, at nearest rank (NR) and at numpy's method (np). The p100 row is the maximum.
+3 runs, release build, with phantom's current stream ending (the last token's chunk carries `finish_reason`, then a usage chunk with `"choices": []`), all 5 scenarios in each run. Intel(R) Core(TM) i7-14650HX, kernel 6.6.87.2-microsoft-standard-WSL2, rustc 1.94.1 (e408947bf 2026-03-25), tokio 1.53.3, release build (opt-level 3), on AC power, Windows Balanced power plan; Python 3.13.15, vLLM 0.32.0, aiohttp 3.14.5, numpy 2.4.6, transformers 5.19.0. Every cell is the min to max over the 3 runs, in ms. Deltas are vLLM − truth, at nearest rank (NR) and at numpy's method (np). The p100 row is the maximum.
 
 **TTFT** (ms)
 
 | scenario | pct | vLLM | server truth | − server (NR) | − server (np) | intended truth | − intended (NR) | − intended (np) |
 |:---|:---|---:|---:|---:|---:|---:|---:|---:|
-| V1 | p50 | 102.023–102.207 | 100.992–101.089 | +1.031 to +1.119 | +1.027 to +1.118 | 101.782–101.875 | +0.167 to +0.351 | +0.164 to +0.349 |
-|  | p90 | 102.787–102.879 | 101.651–101.769 | +1.019 to +1.227 | +1.018 to +1.226 | 102.914–103.152 | −0.364 to −0.035 | −0.365 to −0.035 |
-|  | p99 | 103.212–103.656 | 101.951–102.104 | +1.108 to +1.706 | +1.116 to +1.711 | 103.634–104.073 | −0.861 to −0.237 | −0.718 to −0.203 |
-|  | p100 | 103.453–103.907 | 102.129–102.209 | +1.294 to +1.698 | +1.294 to +1.698 | 103.690–105.209 | −1.302 to −0.236 | −1.302 to −0.236 |
-| V2 | p50 | 102.131–102.425 | 101.054–101.097 | +1.077 to +1.328 | +1.076 to +1.326 | 101.741–102.155 | +0.270 to +0.467 | +0.241 to +0.466 |
-|  | p90 | 102.932–103.229 | 101.671–101.920 | +1.196 to +1.420 | +1.194 to +1.419 | 103.321–103.689 | −0.460 to −0.205 | −0.469 to −0.211 |
-|  | p99 | 1703.195–1706.447 | 1799.842–1800.224 | −96.648 to −93.485 | +1.369 to +4.384 | 1801.041–1802.143 | −97.847 to −95.696 | +0.214 to +2.390 |
-|  | p100 | 2001.894–2005.159 | 2000.592–2001.553 | +1.302 to +3.606 | +1.302 to +3.606 | 2001.026–2002.106 | +0.868 to +3.053 | +0.868 to +3.053 |
-| V3 | p50 | 102.114–102.202 | 101.099–101.174 | +0.992 to +1.055 | +0.979 to +1.055 | — | — | — |
-|  | p90 | 102.731–103.101 | 101.679–101.800 | +1.020 to +1.301 | +1.019 to +1.301 | — | — | — |
-|  | p99 | 1010.957–1012.579 | 1249.391–1250.539 | −238.542 to −237.960 | +0.945 to +1.358 | — | — | — |
-|  | p100 | 1858.175–1859.346 | 1857.157–1858.314 | +1.017 to +1.052 | +1.017 to +1.052 | — | — | — |
-| V4 | p50 | 102.556–102.650 | 101.139–101.201 | +1.355 to +1.511 | +1.342 to +1.509 | — | — | — |
-|  | p90 | 103.540–103.839 | 101.677–101.719 | +1.863 to +2.128 | +1.861 to +2.127 | — | — | — |
-|  | p99 | 104.367–104.679 | 101.931–102.003 | +2.377 to +2.675 | +2.384 to +2.684 | — | — | — |
-|  | p100 | 104.694–105.290 | 101.942–102.081 | +2.616 to +3.349 | +2.616 to +3.349 | — | — | — |
+| V1 | p50 | 102.207–102.448 | 101.086–101.185 | +1.079 to +1.262 | +1.077 to +1.255 | 101.724–101.922 | +0.330 to +0.526 | +0.327 to +0.526 |
+|  | p90 | 102.851–102.895 | 101.588–101.761 | +1.089 to +1.277 | +1.088 to +1.272 | 102.945–103.129 | −0.278 to −0.050 | −0.279 to −0.062 |
+|  | p99 | 103.149–103.458 | 101.892–102.208 | +1.061 to +1.563 | +1.087 to +1.569 | 103.669–103.998 | −0.540 to −0.295 | −0.506 to −0.277 |
+|  | p100 | 103.201–103.709 | 101.980–102.274 | +1.092 to +1.636 | +1.092 to +1.636 | 103.764–104.067 | −0.586 to −0.149 | −0.586 to −0.149 |
+| V2 | p50 | 102.090–102.468 | 101.058–101.096 | +1.031 to +1.372 | +1.027 to +1.371 | 101.979–102.107 | +0.020 to +0.370 | +0.006 to +0.359 |
+|  | p90 | 103.027–103.450 | 101.909–101.952 | +1.075 to +1.520 | +1.071 to +1.515 | 103.363–103.574 | −0.532 to +0.087 | −0.549 to +0.075 |
+|  | p99 | 1702.713–1703.738 | 1798.114–1800.610 | −96.935 to −95.401 | +1.470 to +1.987 | 1800.628–1801.588 | −97.915 to −97.850 | +0.131 to +0.185 |
+|  | p100 | 1999.901–2002.120 | 1998.760–2001.100 | +1.020 to +1.141 | +1.020 to +1.141 | 2000.616–2001.584 | −0.715 to +0.565 | −0.715 to +0.565 |
+| V3 | p50 | 101.989–102.247 | 101.075–101.164 | +0.913 to +1.084 | +0.913 to +1.082 | — | — | — |
+|  | p90 | 102.584–102.929 | 101.649–101.728 | +0.935 to +1.234 | +0.934 to +1.233 | — | — | — |
+|  | p99 | 1011.243–1012.137 | 1249.379–1250.075 | −238.627 to −237.893 | +0.871 to +1.064 | — | — | — |
+|  | p100 | 1858.518–1859.130 | 1857.242–1858.070 | +1.061 to +1.276 | +1.061 to +1.276 | — | — | — |
+| V4 | p50 | 102.422–102.581 | 101.046–101.136 | +1.286 to +1.504 | +1.283 to +1.487 | — | — | — |
+|  | p90 | 103.538–103.781 | 101.630–101.731 | +1.908 to +2.050 | +1.907 to +2.050 | — | — | — |
+|  | p99 | 104.232–114.943 | 101.859–102.008 | +2.372 to +13.017 | +2.416 to +13.079 | — | — | — |
+|  | p100 | 104.339–115.900 | 101.942–102.106 | +2.339 to +13.957 | +2.339 to +13.957 | — | — | — |
+| V5 | p50 | 102.084–102.294 | 101.073–101.119 | +0.989 to +1.174 | +0.989 to +1.173 | 605.332–607.241 | −504.947 to −503.217 | −515.277 to −503.705 |
+|  | p90 | 102.777–102.952 | 101.649–101.745 | +1.031 to +1.303 | +1.030 to +1.302 | 1768.794–1770.813 | −1668.037 to −1665.842 | −1668.085 to −1666.604 |
+|  | p99 | 103.441–103.687 | 102.072–102.199 | +1.369 to +1.488 | +1.437 to +1.650 | 2023.641–2023.986 | −1920.545 to −1919.953 | −1920.179 to −1910.233 |
+|  | p100 | 2001.412–2002.335 | 2000.253–2001.293 | +1.041 to +1.159 | +1.041 to +1.159 | 2023.918–2024.442 | −23.030 to −21.686 | −23.030 to −21.686 |
 
 **TPOT** (ms), against the per-request mean gap
 
 | scenario | pct | vLLM | per-request mean truth | − (NR) | − (np) |
 |:---|:---|---:|---:|---:|---:|
-| V1 | p50 | 20.003–20.005 | 20.001–20.002 | +0.001 to +0.003 | +0.001 to +0.003 |
-|  | p90 | 20.020–20.023 | 20.019–20.021 | +0.001 to +0.003 | +0.001 to +0.002 |
-|  | p99 | 20.028–20.033 | 20.028–20.031 | −0.003 to +0.004 | −0.001 to +0.004 |
-|  | p100 | 20.033–20.036 | 20.030–20.035 | +0.001 to +0.003 | +0.001 to +0.003 |
-| V2 | p50 | 19.998–20.006 | 20.000–20.006 | −0.001 to +0.001 | −0.001 to +0.001 |
-|  | p90 | 20.020–20.033 | 20.020–20.029 | 0.000 to +0.004 | 0.000 to +0.004 |
-|  | p99 | 84.170–84.204 | 84.446–84.502 | −0.297 to −0.277 | +0.005 to +0.009 |
-|  | p100 | 84.517–84.523 | 84.510–84.520 | +0.001 to +0.013 | +0.001 to +0.013 |
-| V3 | p50 | 20.000–20.003 | 19.998–20.001 | +0.002 to +0.003 | +0.002 |
-|  | p90 | 20.016–20.022 | 20.014–20.019 | +0.002 to +0.004 | +0.002 to +0.003 |
-|  | p99 | 20.030–20.035 | 20.029–20.030 | +0.001 to +0.006 | +0.002 to +0.006 |
-|  | p100 | 83.904–84.487 | 83.899–84.486 | −0.002 to +0.005 | −0.002 to +0.005 |
-| V4 | p50 | 20.000–20.001 | 19.997–19.998 | +0.003 to +0.004 | +0.003 to +0.004 |
-|  | p90 | 20.020–20.024 | 20.016–20.019 | +0.003 to +0.007 | +0.003 to +0.006 |
-|  | p99 | 84.040–84.502 | 84.032–84.496 | −0.011 to +0.008 | +0.006 to +0.008 |
-|  | p100 | 84.109–84.505 | 84.102–84.500 | +0.003 to +0.007 | +0.003 to +0.007 |
+| V1 | p50 | 20.000–20.004 | 20.000–20.001 | +0.001 to +0.003 | +0.001 to +0.003 |
+|  | p90 | 20.021–20.024 | 20.019–20.021 | +0.001 to +0.003 | +0.001 to +0.003 |
+|  | p99 | 20.031–20.035 | 20.027–20.034 | −0.001 to +0.008 | +0.001 to +0.009 |
+|  | p100 | 20.033–20.038 | 20.030–20.035 | −0.001 to +0.009 | −0.001 to +0.009 |
+| V2 | p50 | 20.002–20.005 | 20.001–20.003 | −0.001 to +0.003 | −0.001 to +0.003 |
+|  | p90 | 20.021–20.028 | 20.019–20.022 | +0.002 to +0.006 | +0.002 to +0.006 |
+|  | p99 | 84.182–84.486 | 84.471–84.501 | −0.289 to −0.015 | +0.003 to +0.006 |
+|  | p100 | 84.479–84.535 | 84.474–84.526 | +0.003 to +0.009 | +0.003 to +0.009 |
+| V3 | p50 | 20.000–20.003 | 19.997–20.001 | +0.002 | +0.002 |
+|  | p90 | 20.020–20.022 | 20.017–20.020 | +0.001 to +0.003 | +0.001 to +0.003 |
+|  | p99 | 20.034–20.036 | 20.031–20.034 | +0.002 to +0.003 | +0.003 to +0.006 |
+|  | p100 | 84.489–84.499 | 84.491–84.499 | −0.002 to +0.003 | −0.002 to +0.003 |
+| V4 | p50 | 20.001–20.005 | 19.997–20.003 | +0.001 to +0.003 | +0.001 to +0.003 |
+|  | p90 | 20.021–20.027 | 20.017–20.020 | +0.001 to +0.007 | +0.001 to +0.007 |
+|  | p99 | 83.958–84.139 | 83.980–84.146 | −0.073 to −0.007 | +0.007 to +0.010 |
+|  | p100 | 84.229–84.255 | 84.218–84.248 | +0.001 to +0.011 | +0.001 to +0.011 |
+| V5 | p50 | 20.003–20.006 | 20.001–20.004 | +0.002 to +0.003 | +0.002 to +0.003 |
+|  | p90 | 20.024–20.026 | 20.020–20.024 | +0.002 to +0.004 | +0.002 to +0.004 |
+|  | p99 | 84.183–84.493 | 84.465–84.512 | −0.283 to −0.018 | +0.002 to +0.004 |
+|  | p100 | 84.516–84.541 | 84.515–84.539 | −0.001 to +0.002 | −0.001 to +0.002 |
 
 **ITL** (ms), against every gap
 
 | scenario | pct | vLLM | per-gap truth | − (NR) | − (np) |
 |:---|:---|---:|---:|---:|---:|
-| V1 | p50 | 20.254–20.264 | 20.268–20.282 | −0.018 to −0.013 | −0.018 to −0.013 |
-|  | p90 | 20.489–20.531 | 20.467–20.516 | +0.015 to +0.022 | +0.015 to +0.022 |
-|  | p99 | 20.709–20.799 | 20.665–20.755 | +0.036 to +0.045 | +0.037 to +0.045 |
-|  | p100 | 21.130–21.987 | 21.041–21.898 | +0.039 to +0.695 | +0.039 to +0.695 |
-| V2 | p50 | 20.238–20.277 | 20.262–20.309 | −0.032 to −0.024 | −0.032 to −0.025 |
-|  | p90 | 20.516–20.565 | 20.486–20.548 | +0.017 to +0.030 | +0.017 to +0.030 |
-|  | p99 | 20.749–20.840 | 20.736–20.776 | +0.014 to +0.064 | +0.014 to +0.064 |
-|  | p100 | 2019.109–2021.468 | 2019.034–2019.389 | +0.066 to +2.434 | +0.066 to +2.434 |
-| V3 | p50 | 19.894–19.970 | 19.892–19.965 | +0.003 to +0.005 | +0.002 to +0.005 |
-|  | p90 | 20.627–20.655 | 20.614–20.643 | +0.009 to +0.013 | +0.008 to +0.013 |
-|  | p99 | 20.918–20.967 | 20.896–20.937 | +0.022 to +0.034 | +0.022 to +0.035 |
-|  | p100 | 2000.740–2019.562 | 2000.867–2019.617 | −0.127 to −0.040 | −0.127 to −0.040 |
-| V4 | p50 | 20.206–20.285 | 20.231–20.299 | −0.025 to −0.015 | −0.025 to −0.015 |
-|  | p90 | 20.533–20.590 | 20.517–20.575 | +0.013 to +0.016 | +0.013 to +0.016 |
-|  | p99 | 20.749–20.879 | 20.697–20.830 | +0.049 to +0.067 | +0.050 to +0.067 |
-|  | p100 | 2007.454–2019.521 | 2007.430–2019.501 | −0.017 to +0.023 | −0.017 to +0.023 |
+| V1 | p50 | 20.248–20.266 | 20.254–20.273 | −0.016 to −0.007 | −0.016 to −0.007 |
+|  | p90 | 20.448–20.495 | 20.428–20.469 | +0.010 to +0.026 | +0.010 to +0.026 |
+|  | p99 | 20.660–20.732 | 20.636–20.697 | +0.024 to +0.046 | +0.025 to +0.047 |
+|  | p100 | 21.010–21.569 | 21.014–21.479 | −0.004 to +0.090 | −0.004 to +0.090 |
+| V2 | p50 | 20.248–20.270 | 20.259–20.281 | −0.016 to −0.011 | −0.016 to −0.011 |
+|  | p90 | 20.487–20.522 | 20.468–20.492 | +0.017 to +0.029 | +0.017 to +0.029 |
+|  | p99 | 20.727–20.825 | 20.654–20.716 | +0.056 to +0.108 | +0.057 to +0.109 |
+|  | p100 | 2018.976–2020.357 | 2018.845–2020.186 | −0.232 to +0.207 | −0.232 to +0.207 |
+| V3 | p50 | 19.894–19.962 | 19.890–19.966 | −0.004 to +0.004 | −0.004 to +0.004 |
+|  | p90 | 20.606–20.662 | 20.604–20.647 | +0.002 to +0.015 | +0.002 to +0.015 |
+|  | p99 | 20.919–20.943 | 20.893–20.910 | +0.026 to +0.033 | +0.027 to +0.034 |
+|  | p100 | 2018.975–2020.527 | 2018.917–2020.584 | −0.116 to +0.058 | −0.116 to +0.058 |
+| V4 | p50 | 20.247–20.285 | 20.260–20.297 | −0.027 to −0.008 | −0.027 to −0.009 |
+|  | p90 | 20.506–20.594 | 20.491–20.577 | +0.007 to +0.017 | +0.007 to +0.017 |
+|  | p99 | 20.738–20.837 | 20.704–20.762 | +0.024 to +0.090 | +0.025 to +0.091 |
+|  | p100 | 2010.841–2012.601 | 2010.719–2012.529 | +0.045 to +0.122 | +0.045 to +0.122 |
+| V5 | p50 | 20.210–20.254 | 20.236–20.271 | −0.026 to −0.012 | −0.027 to −0.012 |
+|  | p90 | 20.524–20.593 | 20.510–20.584 | +0.009 to +0.022 | +0.009 to +0.022 |
+|  | p99 | 20.735–20.841 | 20.720–20.814 | +0.014 to +0.052 | +0.014 to +0.061 |
+|  | p100 | 2020.636–2020.911 | 2020.633–2020.854 | −0.096 to +0.057 | −0.096 to +0.057 |
 
 **End-to-end** (ms; vLLM E2EL)
 
 | scenario | pct | vLLM | server truth | − server (NR) | − server (np) | intended truth | − intended (NR) | − intended (np) |
 |:---|:---|---:|---:|---:|---:|---:|---:|---:|
-| V1 | p50 | 722.213–722.266 | 721.078–721.186 | +1.081 to +1.145 | +1.076 to +1.145 | 721.809–722.012 | +0.201 to +0.414 | +0.200 to +0.413 |
-|  | p90 | 722.832–722.949 | 721.664–721.687 | +1.168 to +1.262 | +1.167 to +1.261 | 722.916–723.130 | −0.299 to +0.002 | −0.303 to −0.004 |
-|  | p99 | 723.248–723.781 | 721.957–722.055 | +1.193 to +1.824 | +1.261 to +1.840 | 723.972–724.742 | −1.108 to −0.551 | −1.060 to −0.318 |
-|  | p100 | 723.461–724.388 | 721.960–722.111 | +1.427 to +2.429 | +1.427 to +2.429 | 724.001–724.855 | −1.190 to −0.450 | −1.190 to −0.450 |
-| V2 | p50 | 722.312–722.411 | 721.128–721.220 | +1.113 to +1.283 | +1.112 to +1.281 | 721.886–722.184 | +0.227 to +0.465 | +0.226 to +0.454 |
-|  | p90 | 723.224–723.458 | 721.842–721.981 | +1.317 to +1.615 | +1.313 to +1.613 | 723.583–724.102 | −0.644 to −0.359 | −0.664 to −0.367 |
-|  | p99 | 2712.094–2712.410 | 2719.623–2720.383 | −8.235 to −7.530 | +1.171 to +1.396 | 2721.323–2722.166 | −10.073 to −8.993 | −0.271 to +0.591 |
-|  | p100 | 2721.816–2722.284 | 2720.294–2720.893 | +1.152 to +1.830 | +1.152 to +1.830 | 2721.546–2722.265 | −0.141 to +0.737 | −0.141 to +0.737 |
-| V3 | p50 | 722.075–722.323 | 721.081–721.204 | +0.993 to +1.171 | +0.991 to +1.170 | — | — | — |
-|  | p90 | 722.803–723.152 | 721.778–721.820 | +0.983 to +1.374 | +0.982 to +1.374 | — | — | — |
-|  | p99 | 2180.246–2181.243 | 2476.908–2477.891 | −296.662 to −296.448 | +1.145 to +1.313 | — | — | — |
-|  | p100 | 2702.503–2721.723 | 2701.201–2720.468 | +1.255 to +1.371 | +1.255 to +1.371 | — | — | — |
-| V4 | p50 | 722.568–722.739 | 721.081–721.165 | +1.467 to +1.574 | +1.461 to +1.574 | — | — | — |
-|  | p90 | 723.713–724.160 | 721.676–721.782 | +1.930 to +2.454 | +1.929 to +2.452 | — | — | — |
-|  | p99 | 2708.253–2722.396 | 2706.662–2720.073 | +0.638 to +2.324 | +0.922 to +2.333 | — | — | — |
-|  | p100 | 2709.751–2722.756 | 2708.422–2720.116 | +1.046 to +2.640 | +1.046 to +2.640 | — | — | — |
+| V1 | p50 | 722.374–722.419 | 721.163–721.231 | +1.187 to +1.211 | +1.183 to +1.203 | 721.950–722.010 | +0.388 to +0.469 | +0.386 to +0.459 |
+|  | p90 | 722.939–723.047 | 721.720–721.830 | +1.180 to +1.250 | +1.179 to +1.249 | 722.935–723.035 | −0.076 to +0.113 | −0.088 to +0.111 |
+|  | p99 | 723.268–723.323 | 721.911–722.115 | +1.193 to +1.357 | +1.228 to +1.367 | 723.890–724.024 | −0.726 to −0.567 | −0.719 to −0.496 |
+|  | p100 | 723.348–723.467 | 722.050–722.167 | +1.180 to +1.355 | +1.180 to +1.355 | 724.033–724.196 | −0.730 to −0.628 | −0.730 to −0.628 |
+| V2 | p50 | 722.159–722.590 | 721.134–721.243 | +1.025 to +1.347 | +1.025 to +1.346 | 721.984–722.206 | +0.175 to +0.384 | +0.173 to +0.374 |
+|  | p90 | 723.145–723.503 | 721.942–722.014 | +1.200 to +1.507 | +1.200 to +1.505 | 723.398–724.257 | −0.808 to +0.086 | −0.811 to +0.052 |
+|  | p99 | 2711.493–2721.696 | 2719.661–2720.689 | −8.168 to +1.413 | +1.067 to +1.520 | 2720.671–2722.548 | −9.179 to −0.522 | −0.619 to +0.386 |
+|  | p100 | 2720.870–2722.850 | 2719.798–2721.652 | +0.948 to +1.198 | +0.948 to +1.198 | 2720.752–2722.573 | +0.118 to +0.277 | +0.118 to +0.277 |
+| V3 | p50 | 722.111–722.268 | 721.053–721.146 | +0.971 to +1.122 | +0.969 to +1.120 | — | — | — |
+|  | p90 | 722.682–722.913 | 721.683–721.733 | +0.949 to +1.227 | +0.946 to +1.224 | — | — | — |
+|  | p99 | 2179.974–2181.034 | 2476.610–2477.790 | −296.798 to −296.636 | +1.031 to +1.209 | — | — | — |
+|  | p100 | 2721.520–2721.929 | 2720.561–2720.831 | +0.959 to +1.194 | +0.959 to +1.194 | — | — | — |
+| V4 | p50 | 722.457–722.619 | 721.058–721.087 | +1.370 to +1.557 | +1.365 to +1.555 | — | — | — |
+|  | p90 | 723.681–724.049 | 721.651–721.746 | +2.014 to +2.304 | +2.013 to +2.301 | — | — | — |
+|  | p99 | 2705.050–2710.078 | 2704.376–2709.452 | −0.971 to +0.728 | +1.097 to +1.332 | — | — | — |
+|  | p100 | 2712.837–2713.991 | 2711.511–2712.802 | +0.981 to +1.326 | +0.981 to +1.326 | — | — | — |
+| V5 | p50 | 722.212–722.487 | 721.084–721.217 | +1.067 to +1.318 | +1.065 to +1.312 | 1246.321–1250.253 | −527.767 to −524.037 | −555.106 to −552.462 |
+|  | p90 | 722.894–723.121 | 721.713–721.789 | +1.155 to +1.407 | +1.150 to +1.403 | 2410.913–2412.840 | −1689.831 to −1687.972 | −1695.273 to −1693.471 |
+|  | p99 | 2712.139–2721.887 | 2719.956–2721.452 | −8.474 to +0.951 | +0.994 to +1.311 | 2721.484–2722.098 | −9.613 to +0.403 | +0.240 to +0.656 |
+|  | p100 | 2722.287–2722.683 | 2721.121–2721.645 | +0.975 to +1.166 | +0.975 to +1.166 | 2721.541–2722.268 | +0.206 to +0.747 | +0.206 to +0.747 |
 
 **Requests, ITL samples and send lateness**
 
 | scenario | vLLM completed / failed | phantom completed / `completed: false` / no client_id | vLLM ITL samples | phantom gaps | lateness p50 ms | lateness p99 ms | lateness max ms |
 |:---|---:|---:|---:|---:|---:|---:|---:|
-| V1 | 150/0 | 150/0/0 | 4650 | 4650 | 0.731–0.752 | 2.425–2.914 | 2.611–3.350 |
-| V2 | 150/0 | 150/0/0 | 4650 | 4650 | 0.669–1.053 | 2.300–3.273 | 2.350–4.983 |
+| V1 | 150/0 | 150/0/0 | 4650 | 4650 | 0.658–0.795 | 2.340–2.710 | 2.383–2.807 |
+| V2 | 150/0 | 150/0/0 | 4650 | 4650 | 0.665–0.901 | 2.482–2.828 | 2.584–10.743 |
 | V3 | 150/0 | 150/0/0 | 4650 | 4650 | — | — | — |
 | V4 | 150/0 | 150/0/0 | 4650 | 4650 | — | — | — |
+| V5 | 150/0 | 150/0/0 | 4650 | 4650 | 447.652–451.836 | 1922.552–1923.151 | 1922.625–1923.219 |
+
+**V5: vLLM's client_queue_time** (ms), against phantom's send lateness (arrival − intended)
+
+| pct | vLLM client_queue_time | lateness truth | − (NR) | − (np) |
+|:---|---:|---:|---:|---:|
+| p50 | 475.051–478.368 | 447.652–451.836 | +26.532 to +27.715 | −0.925 to −0.726 |
+| p90 | 1616.715–1619.045 | 1612.222–1613.728 | +4.493 to +5.317 | −1.229 to −0.139 |
+| p99 | 1912.452–1921.948 | 1922.552–1923.151 | −10.281 to −0.604 | −0.581 to −0.432 |
+| p100 | 1922.147–1922.655 | 1922.625–1923.219 | −0.979 to −0.136 | −0.979 to −0.136 |
+
+
+**V5: vLLM's queue-inclusive E2EL** (`e2el_including_client_queue`, ms), against intended truth
+
+| pct | vLLM | intended truth | − (NR) | − (np) |
+|:---|---:|---:|---:|---:|
+| p50 | 1275.307–1278.336 | 1246.321–1250.253 | +28.082 to +29.077 | +0.562 to +0.910 |
+| p90 | 2416.833–2418.203 | 2410.913–2412.840 | +5.363 to +6.498 | −0.079 to +0.999 |
+| p99 | 2712.207–2721.946 | 2721.484–2722.098 | −9.545 to +0.463 | +0.309 to +0.708 |
+| p100 | 2722.339–2722.734 | 2721.541–2722.268 | +0.260 to +0.799 | +0.260 to +0.799 |
+
+**V5, per request: vLLM − intended truth for the same request** (ms)
+
+| quantity | min | p50 | p99 | max |
+|:---|---:|---:|---:|---:|
+| vLLM TTFT alone | −1922.428 to −1921.748 | −505.121 to −503.167 | +0.814 to +1.265 | +0.822 to +1.352 |
+| vLLM TTFT + queue | −1.348 to −0.905 | +0.251 to +0.557 | +0.935 to +1.321 | +0.971 to +1.417 |
+| vLLM E2EL alone | −1922.267 to −1921.627 | −504.962 to −502.870 | +0.826 to +1.130 | +0.869 to +1.141 |
+| vLLM E2EL + queue | −1.316 to −0.933 | +0.352 to +0.647 | +0.958 to +1.265 | +1.027 to +1.311 |
 
 These ranges are the observed min–max over the 3 runs, not bounds: with only 3 runs a new run falls outside the range about half the time by chance, and this audit sets no pass criteria at all — it asserts only that vLLM exited 0, its result JSON parsed, and phantom logged at least 20 requests.
 
@@ -934,41 +997,49 @@ In every run, vLLM completed all 150 requests with none failed, and phantom logg
 
 What the tables show:
 
-- **TTFT against server truth.** At numpy's method, vLLM − server TTFT was +0.98 to +1.71 ms in V1 and V3, +1.08 to +4.38 ms in V2, and +1.34 to +3.35 ms in V4. The V2 values above +1.5 ms are all at p99 and p100, in runs 1 and 3 (+2.49 to +4.38 ms). At nearest rank the deltas were in the same ranges, except at p99 in V2 (−93.5 to −96.6 ms) and V3 (−238.0 to −238.5 ms).
-- **Percentile method in the stall tail.** At p99, numpy's virtual index `(n − 1) × 0.99` = 147.51 lies between the 148th and 149th smallest of 150 values, and nearest rank takes the 149th. In V2 and V3 both are requests the stall delayed, by different amounts. numpy returns the point 51% of the way from the first to the second, a value no request had. vLLM's TTFT p99 was 1703.2–1706.4 ms in V2 (nearest-rank truth 1799.8–1800.2 ms). Its TTFT and E2EL p99 in V3 were 1011.0–1012.6 and 2180.2–2181.2 ms (nearest-rank truth 1249.4–1250.5 and 2476.9–2477.9 ms). The same effect, smaller, shows in V2's E2EL p99 at nearest rank (−7.5 to −8.2 ms against server truth) and V2's TPOT p99 (−0.28 to −0.30 ms). Against truth taken at numpy's method, all of these cells are within the ranges of the other cells.
-- **TTFT against intended truth (V1, V2).** vLLM − intended TTFT was −1.30 to +0.47 ms at both methods, except V2 p99 and p100 (+0.21 to +3.05 ms at numpy's method) and V2 p99 at nearest rank (−95.7 to −97.8 ms, the tail effect). Send lateness was 0.67–1.05 ms at p50, 2.30–3.27 ms at p99 and at most 4.98 ms.
-- **TPOT.** vLLM's TPOT matched the per-request mean truth within −0.001 to +0.013 ms at numpy's method in every cell. A stalled request's TPOT was about 84 ms: a per-request mean spreads its 2 s gap over 31 gaps.
-- **ITL.** vLLM's ITL matched per-gap truth within −0.127 to +0.067 ms at every percentile from p50 to p99, and at the maximum in V3 and V4. The exceptions are three maxima, one gap each: V1 +0.695 ms (run 3), and V2 +1.314 and +2.434 ms (runs 1 and 3). In V2, V3 and V4, the maximum ITL was the stall itself, 2.00–2.02 s. At p50, vLLM's ITL was 0.013–0.032 ms below truth in V1, V2 and V4, and 0.002–0.005 ms above it in V3.
-- **End-to-end against server truth.** vLLM − server was +0.92 to +2.64 ms in every cell at numpy's method. At nearest rank, V3 p99 was −296.4 to −296.7 ms and V2 p99 −7.5 to −8.2 ms, by the tail effect; the other nearest-rank cells were +0.64 to +2.64 ms.
-- **End-to-end against intended truth (V1, V2).** vLLM − intended was −1.19 to +0.74 ms at numpy's method. At nearest rank it was in the same range, except V2 p99 (−9.0 to −10.1 ms, the tail effect).
-- **Percentile method elsewhere.** Outside the cells named above (V2 TTFT, E2EL and TPOT p99; V3 TTFT and E2EL p99), nearest rank and numpy's method gave truths at most 0.46 ms apart (V1 intended end-to-end p99). At p100 both are the maximum.
+- **TTFT against server truth.** At numpy's method, vLLM − server TTFT was +1.08 to +1.64 ms in V1, +1.02 to +1.99 ms in V2, +0.87 to +1.28 ms in V3 and +0.99 to +1.65 ms in V5: +0.87 to +1.99 ms over those four. In V4 it was +1.28 to +2.60 ms, except p99 and max in run 2: +13.08 and +13.96 ms. At nearest rank the deltas were in the same ranges, except at p99 in V2 (−95.4 to −96.9 ms) and V3 (−237.9 to −238.6 ms).
+- **Percentile method in the stall tail.** At p99, numpy's virtual index `(n − 1) × 0.99` = 147.51 lies between the 148th and 149th smallest of 150 values, and nearest rank takes the 149th. In V2 and V3 both are requests the stall delayed, by different amounts. numpy returns the point 51% of the way from the first to the second, a value no request had. vLLM's TTFT p99 was 1702.7–1703.7 ms in V2 (nearest-rank truth 1798.1–1800.6 ms). Its TTFT and E2EL p99 in V3 were 1011.2–1012.1 and 2180.0–2181.0 ms (nearest-rank truth 1249.4–1250.1 and 2476.6–2477.8 ms). The same effect, smaller, shows at nearest rank in E2EL p99 against server truth in V2 (−8.2 to +1.4 ms) and V5 (−8.5 to +0.95 ms), and in TPOT p99 in V2 (−0.02 to −0.29 ms) and V5 (−0.02 to −0.28 ms). Against truth taken at numpy's method, all of these cells are within the ranges of the other cells.
+- **TTFT against intended truth (V1, V2).** vLLM − intended TTFT was −0.72 to +0.57 ms at both methods, except V2 p99 at nearest rank (−97.85 to −97.92 ms, the tail effect). Send lateness was 0.66–0.90 ms at p50 and 2.34–2.83 ms at p99. Its maximum was 2.38–3.63 ms, except 10.74 ms in one V2 run.
+- **TPOT.** vLLM's TPOT matched the per-request mean truth within −0.002 to +0.011 ms at numpy's method in every cell. A stalled request's TPOT was about 84 ms: a per-request mean spreads its 2 s gap over 31 gaps.
+- **ITL.** vLLM's ITL matched per-gap truth within −0.027 to +0.109 ms at every percentile from p50 to p99, and within −0.232 to +0.207 ms at the maximum. In V2 to V5, the maximum ITL was the stall itself, 2.01–2.02 s. At p50, vLLM's ITL was 0.007–0.027 ms below truth in V1, V2, V4 and V5, and −0.004 to +0.004 ms from it in V3.
+- **End-to-end against server truth.** vLLM − server was +0.95 to +2.30 ms in every cell at numpy's method. At nearest rank, the p99 cells of V2, V3 and V5 show the tail effect (above), and V4 p99 was −0.97 to +0.73 ms; the other nearest-rank cells were +0.95 to +2.30 ms.
+- **End-to-end against intended truth (V1, V2).** vLLM − intended was −0.81 to +0.46 ms at numpy's method, and −0.81 to +0.47 ms at nearest rank except V2 p99 (−0.52 to −9.18 ms, the tail effect).
+- **Percentile method elsewhere.** In V1 to V4, outside the cells named above (V2 TTFT, E2EL and TPOT p99; V3 TTFT and E2EL p99), nearest rank and numpy's method gave truths at most 2.16 ms apart (V4 end-to-end p99, one run). At p100 both are the maximum.
 
-Against the earlier ending. An earlier set of 3 runs used phantom's earlier stream ending: after the last token, one more chunk with `choices` (`text` `""`, `finish_reason` `"length"`) and `usage`. In those runs:
+**V5: a schedule behind `--max-concurrency`.** V5 sends on V2's schedule but runs at most 4 requests at once. In every run, `client_id` equalled `seq` on all 150 lines, so keying by `client_id` gave the same truth as keying by `seq` would have.
 
-- vLLM's ITL list had 32 entries per request (4800 against 4650 gaps). The extra entry, the gap from the last token to that chunk, was 0.005–0.006 ms at p50 and at most 0.201 ms.
-- vLLM re-tokenized the text instead of reading `usage`. With `" the"` the count was the same, 32.
-- vLLM's ITL p50 was further below truth: −0.020 to −0.041 ms in V1 and V2 (now −0.013 to −0.032), and −0.006 to −0.020 ms in V3 (now +0.002 to +0.005).
-- The other cells had about the same ranges as now. TTFT and end-to-end against server truth were +0.92 to +3.29 ms at numpy's method, and TPOT was within −0.001 to +0.022 ms. The large V2 tail values of runs 1 and 3 above did not occur.
+- **Against server truth,** V5 read like V1 and V2: TTFT +0.99 to +1.65 ms and end-to-end +0.98 to +1.40 ms at numpy's method, TPOT within −0.001 to +0.004 ms, and ITL within −0.096 to +0.061 ms.
+- **Requests waited for a slot.** 99 of 150 requests waited 1 ms or more in every run (`queue_times` in vLLM's detailed result), and 89–90 of 150 reached phantom more than one period after their intended send time. Send lateness was 447.7–451.8 ms at p50 and 1922.6–1923.2 ms at p99 and max.
+- **vLLM's TTFT and E2EL against intended truth.** vLLM's TTFT p50 was 102.1–102.3 ms; intended TTFT p50 was 605.3–607.2 ms at nearest rank. vLLM − intended TTFT was −503.2 to −504.9 ms at p50 and −1919.95 to −1920.55 ms at p99 (nearest rank). vLLM's E2EL p50 was 722.2–722.5 ms; intended end-to-end p50 was 1246.3–1250.3 ms. Per request, vLLM's TTFT alone was down to 1921.7–1922.4 ms below intended TTFT.
+- **client_queue_time against send lateness.** vLLM's client_queue_time was 475.1–478.4 ms at p50, 1912.5–1921.9 ms at p99 and 1922.1–1922.7 ms at max. Against phantom's send lateness at numpy's method it was −0.14 to −1.23 ms at every percentile.
+- **TTFT + client_queue_time against intended TTFT, per request.** For every request in every run, vLLM's TTFT plus its client_queue_time was within −1.35 to +1.42 ms of the same request's intended TTFT (p50 +0.25 to +0.56 ms). E2EL plus client_queue_time was within −1.32 to +1.31 ms of intended end-to-end.
+- **vLLM's queue-inclusive E2EL** (`e2el_including_client_queue`, which vLLM reports with `--max-concurrency` at a finite rate) was −0.08 to +1.00 ms from intended end-to-end at numpy's method.
+- **Percentile method.** V5's queue times and lateness are spread out: neighbouring values around p50 differ by tens of ms. Nearest rank and numpy's method therefore differ by up to 29 ms in the client_queue_time, queue-inclusive E2EL and intended-truth cells (for example, client_queue_time − lateness at p50: +26.5 to +27.7 ms at nearest rank, −0.73 to −0.93 ms at numpy's method). The comparisons above use numpy's method, vLLM's own.
 
-The two sets of runs were made a day apart, 3 runs each. The ITL count and the token source changed as the source read in (a) and (d) predicts. Of the 160 delta cells in the tables, 126 have min–max ranges that overlap between the two sets, and 31 more are apart by at most 0.11 ms. The other 3 are nearest-rank cells at V2 p99 (E2EL against server and intended truth, and TPOT), by 0.27–8.3 ms. There the two values around numpy's index were further apart in the current runs, so nearest rank and numpy's method differ more (the tail effect above).
+**Earlier sets of runs.** Two earlier sets of 3 runs are not tabulated.
+
+- **phantom's earlier stream ending.** After the last token it sent one more chunk with `choices` (`text` `""`, `finish_reason` `"length"`) and `usage`. vLLM's ITL list then had 32 entries per request (4800 against 4650 gaps). The extra entry, the gap from the last token to that chunk, was 0.005–0.006 ms at p50 and at most 0.201 ms. vLLM re-tokenized the text instead of reading `usage`; with `" the"` the count was the same, 32. vLLM's ITL p50 was further below truth: −0.020 to −0.041 ms in V1 and V2 (tabulated: −0.007 to −0.016), and −0.006 to −0.020 ms in V3 (tabulated: −0.004 to +0.004). Of the 160 delta cells of V1 to V4, 134 have min–max ranges that overlap with the tabulated runs, and the other 26 are apart by at most 0.112 ms. The ITL count and the token source changed as the source read in (a) and (d) predicts.
+- **The current ending, a day before the tabulated runs.** In runs 1 and 3 of that set, V2's TTFT p99 and max were +2.49 to +4.38 ms against server truth, and V2 had two single ITL maxima of +1.31 and +2.43 ms; V1 had one of +0.695 ms. In the tabulated runs these cells were at most +1.99 ms (TTFT) and +0.21 ms (ITL). V4's TTFT p99 and max in run 2 of the tabulated runs (+13.08 and +13.96 ms) had no counterpart in either earlier set, where they were at most +3.35 ms.
 
 Candidate explanations, none of them verified:
 
 - **What each side's clock covers.** vLLM's TTFT and E2EL start just before aiohttp posts the request and end when its client has parsed the message. phantom's truth starts at handler entry and ends at the chunk hand-off. vLLM's side also includes aiohttp writing the request, the loopback trip both ways, hyper's write, and reading and parsing each SSE message in Python. That would put a positive delta on TTFT and end-to-end, as seen (about +1 ms; GuideLLM's was about +0.5 ms). V4 has 4 requests in flight on one event loop, which would add more.
-- **TTFT and E2EL against intended truth.** vLLM's values run from its actual send, intended truth from the intended send. Intended truth therefore includes the send lateness (0.67–1.05 ms at p50, at most 4.98 ms), and vLLM's values include the client-side time in the first candidate (about 1 ms). The two partly cancel, which would put the deltas near 0, as seen.
+- **TTFT and E2EL against intended truth.** vLLM's values run from its actual send, intended truth from the intended send. Intended truth therefore includes the send lateness (0.66–0.90 ms at p50 in V1 and V2), and vLLM's values include the client-side time in the first candidate (about 1 ms). The two partly cancel, which would put the deltas near 0, as seen.
 - **ITL p50 slightly below truth.** vLLM's gap is between the times its client parsed two messages, and phantom's between two hand-offs. A message read late lengthens one gap and shortens the next. That widens vLLM's gap distribution, which raises the upper percentiles (as seen at p90 and p99) and can lower the middle. The earlier ending's near-zero extra gaps (3% of the samples) lowered p50 further. This was not examined.
-- **V2's stall tail in runs 1 and 3.** When the stall window ends, phantom releases at once the held token of every stream in the window, so vLLM's one event loop reads many streams' messages in a burst. Messages read later in the burst get later timestamps. That would raise TTFT and the stall ITL for some stalled requests, which sit at p99 and p100. The earlier runs had the same burst without deltas this large, and it was not examined.
-- **One large ITL maximum (V1, +0.695 ms).** A single gap vLLM recorded longer than any gap phantom handed off. A pause in vLLM's event loop, or in reading the socket, between two messages is a candidate.
+- **V5's backlog.** Each request takes about 720 ms (TTFT 100 ms + 31 × 20 ms), so at 5 requests/s about 3.6 are in flight, under the limit of 4, until the stall. The stall holds all 4 slots for up to 2 s while sends continue, and afterwards 4 slots complete about 5.6 requests/s against 5 sent per second. The backlog would then shrink by only about 0.6 requests/s, and so last to the end of the run. That would match the about 100 requests (from about request 50, at 10 s) that waited. It was not checked request by request.
+- **TTFT + client_queue_time near intended TTFT.** vLLM's client_queue_time starts when the request is issued (`request_arrival_time = time.perf_counter()`, [`serve.py` L1073](https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/benchmarks/serve.py#L1073)), at its scheduled time plus the event loop's own delay, and TTFT ends when vLLM's client has parsed the first token. The sum therefore runs from about the intended send to the client's read, and the remaining ±1.4 ms would be the issue delay and the client-side time in the first candidate. This was not examined further.
+- **Single large values.** V4's TTFT p99 and max in one run (about +13 ms), and in the earlier set V2's stall tail (up to +4.4 ms) and a few single ITL maxima (up to +2.4 ms). For V2's stall tail: when the stall window ends, phantom releases at once the held token of every stream in the window, so vLLM's one event loop reads many streams' messages in a burst, and messages read later get later timestamps. For the others, a pause in vLLM's event loop or in reading the socket is a candidate. None of these was examined.
 
 Limits:
 
 - **Loopback only.** vLLM and phantom share one machine and one kernel. Nothing here measures a real network.
 - **One chunk = one token.** phantom sends one `" the"` per chunk and reports one completion token per chunk in `usage`, which vLLM reads. A real server may put several tokens in one chunk; vLLM's ITL would then be per chunk, not per token. The token text is one gpt2 token, so a re-tokenized count would match too.
 - **Completions endpoint only.** On the chat backend, vLLM would also take phantom's role chunk as the first token and add one more ITL entry for it (a). Chat was not run.
-- **Truth is server-side plus intended-schedule.** Server truth stops at phantom's chunk hand-off: it cannot see the response being written, carried or read. Intended truth depends on the origin formula and on seq order.
+- **Truth is server-side plus intended-schedule.** Server truth stops at phantom's chunk hand-off: it cannot see the response being written, carried or read. Intended truth depends on the origin formula and on the request order.
 - **Intended truth for constant spacing only.** V3's Poisson send times are drawn inside vLLM from its seed, and phantom does not know them. V4 has no schedule. Both have server truth only.
-- **Request order.** In V1 and V2, intended truth is keyed by seq, and every line's `client_id` (vLLM's request index) equalled its `seq` in every run, so seq order was vLLM's send order. In V4, with 4 requests in flight, it was 97–106 of 150 lines.
-- **The earlier ending is summarized, not tabulated.** Its 3 runs are compared above in a few figures only.
+- **Request order.** In V1 and V2, intended truth is keyed by seq, and every line's `client_id` (vLLM's request index) equalled its `seq` in every run, so seq order was vLLM's send order. V5's is keyed by `client_id`, and also matched seq. In V4, with 4 requests in flight and no schedule, `client_id` equalled `seq` on 99–102 of 150 lines.
+- **client_queue_time is compared per request through `client_id`.** vLLM's detailed result lists `ttfts`, `latencies` and `queue_times` in request order, so entry i is request i, whose `x-request-id` is i (see the notes on the command).
+- **Earlier sets are summarized, not tabulated.** Their 3 runs each are compared above in a few figures only.
 - **Release build, one machine, 3 runs.**
 
 ### oha, GuideLLM and vLLM compared
@@ -982,6 +1053,6 @@ Only what the three source reads above established. "Not read" means this repo's
 | TPOT | not read | not read | per request: `(latency − TTFT) / (output tokens − 1)`, unweighted |
 | Output tokens | not applicable | asks for usage (`include_usage` and `continuous_usage_stats`); the last `usage.completion_tokens` seen, else the number of token-bearing lines | asks for usage (`include_usage`); the server's `usage.completion_tokens` from a message without `choices`, else the generated text re-tokenized with `--tokenizer` |
 | End of a request | not read | the end of the stream | the last message with non-empty `choices`, not `[DONE]` |
-| Corrected or scheduled latency | `--latency-correction`: "Correct latency to avoid coordinated omission problem. It's ignored if -q is not set." (`oha --help`) | `request_scheduled_latency`, constant profile only: request end − targeted start, `start + index / rate` | none: TTFT, TPOT, ITL and E2EL run from the actual send; the wait for `--max-concurrency` is recorded separately as `client_queue_time` |
+| Corrected or scheduled latency | `--latency-correction`: "Correct latency to avoid coordinated omission problem. It's ignored if -q is not set." (`oha --help`) | `request_scheduled_latency`, constant profile only: request end − targeted start, `start + index / rate` | TTFT, TPOT, ITL and E2EL run from the actual send. The wait for `--max-concurrency` is recorded separately as `client_queue_time`, from the request's issue at its scheduled time; with `--max-concurrency` at a finite rate, `e2el_including_client_queue` = E2EL + `client_queue_time` |
 | Percentile | sorted values at the truncated index `(p / 100 × n) as usize`, no interpolation | first value whose weighted running sum (numpy `cumsum`) is ≥ q (`searchsorted`, `side="left"`) | `np.percentile`, linear interpolation between the two samples around `(n − 1) × p / 100` |
 | Clock | not read | `time.time()`, a wall clock | `time.perf_counter()` for request timings; `time.time()` for the send schedule |

@@ -7,6 +7,35 @@ status: pre-release
 
 A latency harness that audits its own numbers.
 
+## Findings
+
+Method: phantom, a scripted fake OpenAI server, logs per-request and per-token ground truth, and each tool is measured against it on one machine, over loopback, in release builds. Every number below is from [phantom/README.md](phantom/README.md), and each finding links to its evidence.
+
+| tool | version | tool − phantom's truth | definitional finding |
+|:---|:---|:---|:---|
+| tailbench, open loop | this repo | +0.65 to +3.51 ms, p50 to max ([evidence](phantom/README.md#audit-results)) | latency runs from the intended send time |
+| oha | 1.16.0 | within 0.81 ms at oha's own index, except O4 p99 (`-c 1`, uncorrected) ([evidence](phantom/README.md#audit-oha)) | percentile at a truncated index; `--latency-correction` measures from the intended send |
+| GuideLLM | 0.8.1 | TTFT +0.29 to +0.93 ms; end-to-end +0.41 to +1.52 ms, one maximum +9.21 ms ([evidence](phantom/README.md#results)) | ITL is a per-request mean |
+| vLLM bench serve | 0.32.0 | TTFT +0.87 to +1.99 ms (V1, V2, V3, V5); end-to-end +0.95 to +2.30 ms; TPOT −0.002 to +0.011 ms; ITL −0.232 to +0.207 ms ([evidence](phantom/README.md#results-1)) | ITL is per gap; TTFT and E2EL start after any `--max-concurrency` wait |
+
+GuideLLM and vLLM are compared with server truth (phantom's own timestamps); tailbench and oha with intended-schedule truth. One V4 run read TTFT up to +13.96 ms; see the evidence.
+
+- **(a) Open loop against closed loop under a 500 ms stall.** tailbench's closed-loop runner read p99 at 1.07–1.15% of the truth p99 of the matching open-loop run ([evidence](phantom/README.md#audit-results)). oha at `-c 1` without `--latency-correction` read p99 4.2–4.5 ms against that run's truth of 431–439 ms ([evidence](phantom/README.md#audit-oha)). Both measure from the actual send.
+- **(b) oha's `--latency-correction`.** At 50, 10 and 1 connections (O2, O3, O5), oha's p50, p99, p99.9 and max at its own index were within 0.81 ms of truth ([evidence](phantom/README.md#audit-oha)).
+- **(c) "ITL" means different things.** vLLM's ITL is every gap between token messages, so a 2 s freeze shows as a maximum ITL of 2.01–2.02 s ([evidence](phantom/README.md#results-1)). GuideLLM's is a per-request mean, so the same freeze reads about 84 ms ([evidence](phantom/README.md#results)).
+- **(d) Percentile conventions differ.** oha takes the value at the truncated index `(p / 100 × n) as usize`, GuideLLM a weighted CDF with numpy's `searchsorted`, and vLLM `np.percentile` with linear interpolation ([evidence](phantom/README.md#oha-guidellm-and-vllm-compared)). In V3, vLLM's TTFT p99 was 1011.2–1012.1 ms against a nearest-rank truth of 1249.4–1250.1 ms, because numpy interpolated between two stalled requests ([evidence](phantom/README.md#results-1)).
+- **(e) GuideLLM's send lateness.** At 5 requests/s, in the 3 runs with the workarounds, GuideLLM's sends reached phantom 22.3–29.3 ms late at p99 (16.3 ms at most in the later re-runs). Its TTFT runs from the actual send, so it leaves that lateness out: it read 21.4–25.9 ms below intended TTFT at p99 and max in G1 and G4. Its `request_scheduled_latency` runs from the targeted start, so it includes the lateness: it was +1.36 to +2.48 ms from intended truth in G1, G2 and G4 ([evidence](phantom/README.md#results), [definitions](phantom/README.md#oha-guidellm-and-vllm-compared)).
+- **(f) vLLM behind `--max-concurrency` (V5).** At 5 requests/s with 4 slots and a 2 s stall, 99 of 150 requests waited for a slot. vLLM's TTFT p50 was 102.1–102.3 ms against an intended TTFT p50 of 605.3–607.2 ms. Adding each request's own `client_queue_time` gave its intended TTFT within −1.35 to +1.42 ms, for every request ([evidence](phantom/README.md#results-1)).
+
+Limits:
+
+- **Loopback only.** Client and phantom share one kernel; no real network was measured.
+- **One machine.** Intel Core i7-14650HX under WSL2, on AC power; other machines were not measured.
+- **Truth is a lower bound.** phantom's timestamps stop at the hand-off to the response stream, so they cannot see the response being written, carried or read by the client.
+- **Synthetic workload.** Timings are scripted, and one chunk is one token with fixed text.
+
+Related work: this builds on the open-loop methodology of MIT's TailBench (Kasture and Sanchez, "TailBench: A Benchmark Suite and Evaluation Methodology for Latency-Critical Applications", IISWC 2016, <https://tailbench.csail.mit.edu/>); this repository is unrelated to it. See also [wrk2](https://github.com/giltene/wrk2) (below).
+
 ## The problem
 
 A simple benchmark loop is closed loop: it sends the next request only after the previous one returns. When the server freezes, the generator waits with it, so the requests that would have been sent during the freeze are never timed. This is coordinated omission, and it makes a freeze nearly invisible in the percentiles.
