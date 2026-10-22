@@ -16,8 +16,8 @@
 //! A request whose client goes away before its response is finished still
 //! gets a line, marked `"completed": false`.
 //!
-//! Times in the log are nanoseconds since t0, the arrival of the first
-//! non-healthz request, on the server's own monotonic clock.
+//! Times in the log are nanoseconds since t0, the arrival of the first chat
+//! or completions request, on the server's own monotonic clock.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -51,11 +51,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_OUTPUT_TOKENS: u64 = 32;
 /// ITL when `--itl-ms` and `--itl-lognormal` are both unset.
 pub const DEFAULT_ITL: ServiceSpec = ServiceSpec::Fixed { ms: 10 };
+/// The text of every streamed token unless `--token-text` says otherwise:
+/// one chunk is one token.
+pub const DEFAULT_TOKEN_TEXT: &str = " tok";
 
 const NS_PER_MS: u64 = 1_000_000;
-/// The text of every streamed token: one chunk is one token.
-const TOKEN_TEXT: &str = " tok";
 const PROMPT_TOKENS: u64 = 8;
+
 /// Keys for the TTFT and ITL draws, so they never reuse the service-time
 /// draw or each other's ("ttft" and "itl" in ASCII).
 const TTFT_DOMAIN: u64 = 0x7474_6674;
@@ -207,6 +209,17 @@ pub fn parse_stall(s: &str) -> Result<Stall, SpecError> {
     Ok(stall)
 }
 
+/// Parses `--token-text`: any text but the empty string, which a client
+/// would not count as a token.
+pub fn parse_token_text(s: &str) -> Result<String, SpecError> {
+    if s.is_empty() {
+        return Err(SpecError(
+            "invalid token text \"\": expected at least one character".to_owned(),
+        ));
+    }
+    Ok(s.to_owned())
+}
+
 /// Splits `a:b` into exactly two parts.
 fn split_pair(s: &str) -> Option<[&str; 2]> {
     let mut parts = s.split(':');
@@ -246,7 +259,8 @@ pub struct StreamSpec {
     pub ttft: Option<ServiceSpec>,
     /// Gap before each token after the first.
     pub itl: ServiceSpec,
-    /// Tokens per response, unless the request's `max_tokens` is smaller.
+    /// Tokens per response, unless the request's token limit
+    /// (`max_completion_tokens`, else `max_tokens`) is smaller.
     pub output_tokens: u64,
 }
 
@@ -271,6 +285,7 @@ pub struct Script {
     windows_ns: Vec<(u64, u64)>,
     stream: StreamSpec,
     role_chunk: RoleChunk,
+    token_text: String,
 }
 
 impl Script {
@@ -305,6 +320,7 @@ impl Script {
             windows_ns,
             stream: StreamSpec::default(),
             role_chunk: RoleChunk::default(),
+            token_text: DEFAULT_TOKEN_TEXT.to_owned(),
         })
     }
 
@@ -334,6 +350,13 @@ impl Script {
         self
     }
 
+    /// Sets the text every streamed token carries (default:
+    /// `DEFAULT_TOKEN_TEXT`), refusing the empty string like the parser.
+    pub fn with_token_text(mut self, text: &str) -> Result<Self, SpecError> {
+        self.token_text = parse_token_text(text)?;
+        Ok(self)
+    }
+
     pub fn seed(&self) -> u64 {
         self.seed
     }
@@ -352,6 +375,10 @@ impl Script {
 
     pub fn role_chunk(&self) -> RoleChunk {
         self.role_chunk
+    }
+
+    pub fn token_text(&self) -> &str {
+        &self.token_text
     }
 
     /// The TTFT spec in effect: `--ttft-*` if given, else the service spec.
@@ -457,6 +484,8 @@ struct Manifest<'a> {
     output_tokens: u64,
     /// When a chat stream's role chunk is sent.
     role_chunk: RoleChunk,
+    /// The text of every streamed token.
+    token_text: &'a str,
     listen: String,
     /// Wall-clock start, for matching runs up; never used for intervals.
     start_unix_ns: u64,
@@ -571,7 +600,8 @@ impl Drop for LogLine {
 struct Shared {
     script: Script,
     next_seq: AtomicU64,
-    /// Arrival of the first chat request; health checks do not set it.
+    /// Arrival of the first chat or completions request; health checks do
+    /// not set it.
     t0: OnceLock<Instant>,
     log: mpsc::Sender<Record>,
 }
@@ -599,9 +629,10 @@ pub async fn start(listener: TcpListener, script: Script, log_path: &Path) -> io
         itl: script.stream.itl,
         output_tokens: script.stream.output_tokens,
         role_chunk: script.role_chunk,
+        token_text: &script.token_text,
         listen: addr.to_string(),
         start_unix_ns: SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, nanos),
-        times: "ns since t0, the arrival of the first non-healthz request, on the server's monotonic clock",
+        times: "ns since t0, the arrival of the first chat or completions request, on the server's monotonic clock",
     };
     serde_json::to_writer(&mut out, &manifest)?;
     out.write_all(b"\n")?;
@@ -624,6 +655,7 @@ pub async fn start(listener: TcpListener, script: Script, log_path: &Path) -> io
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/healthz", get(healthz))
+        .route("/health", get(healthz))
         .with_state(shared);
     let (stop, stopped) = oneshot::channel::<()>();
     let server = tokio::spawn(async move {
@@ -742,46 +774,49 @@ impl Endpoint {
         }
     }
 
-    /// One streamed chunk: `delta` is the chat delta (or None for the final
-    /// chunk), `text` the completions text, `usage` only on the final chunk.
-    fn chunk(self, seq: u64, delta: Value, text: &str, finish_reason: Option<&str>, usage: Option<Value>) -> Value {
-        let (object, choice) = match self {
-            Self::Chat => (
-                "chat.completion.chunk",
-                json!({"index": 0, "delta": delta, "finish_reason": finish_reason}),
-            ),
-            Self::Completions => (
-                "text_completion",
-                json!({"index": 0, "text": text, "logprobs": null, "finish_reason": finish_reason}),
-            ),
+    /// One streamed chunk with one choice: `delta` is the chat delta, `text`
+    /// the completions text.
+    fn chunk(self, seq: u64, delta: Value, text: &str, finish_reason: Option<&str>) -> Value {
+        let choice = match self {
+            Self::Chat => json!({"index": 0, "delta": delta, "finish_reason": finish_reason}),
+            Self::Completions => json!({"index": 0, "text": text, "logprobs": null, "finish_reason": finish_reason}),
         };
-        let mut chunk = json!({
+        self.stream_chunk(seq, json!([choice]))
+    }
+
+    fn stream_chunk(self, seq: u64, choices: Value) -> Value {
+        let object = match self {
+            Self::Chat => "chat.completion.chunk",
+            Self::Completions => "text_completion",
+        };
+        json!({
             "id": self.id(seq),
             "object": object,
             "created": 0,
             "model": "phantom",
-            "choices": [choice]
-        });
-        if let Some(usage) = usage {
-            chunk["usage"] = usage;
-        }
-        chunk
+            "choices": choices
+        })
     }
 
     /// The chunk that opens a chat stream; completions have none.
     fn role_chunk(self, seq: u64) -> Option<Value> {
         match self {
-            Self::Chat => Some(self.chunk(seq, json!({"role": "assistant", "content": ""}), "", None, None)),
+            Self::Chat => Some(self.chunk(seq, json!({"role": "assistant", "content": ""}), "", None)),
             Self::Completions => None,
         }
     }
 
-    fn token_chunk(self, seq: u64) -> Value {
-        self.chunk(seq, json!({"content": TOKEN_TEXT}), TOKEN_TEXT, None, None)
+    /// The last token's chunk carries `finish_reason`, as vLLM's does.
+    fn token_chunk(self, seq: u64, text: &str, last: bool) -> Value {
+        self.chunk(seq, json!({"content": text}), text, last.then_some("length"))
     }
 
-    fn finish_chunk(self, seq: u64, tokens: u64) -> Value {
-        self.chunk(seq, json!({}), "", Some("length"), Some(usage(tokens)))
+    /// vLLM's final usage chunk: no choices, sent after the last token only
+    /// when the request asked for it.
+    fn usage_chunk(self, seq: u64, tokens: u64) -> Value {
+        let mut chunk = self.stream_chunk(seq, json!([]));
+        chunk["usage"] = usage(tokens);
+        chunk
     }
 }
 
@@ -797,8 +832,12 @@ fn usage(completion_tokens: u64) -> Value {
 struct RequestOptions {
     /// `"stream": true`, exactly; anything else is a non-streaming request.
     stream: bool,
-    /// `max_tokens`, if it is a whole number.
+    /// `max_completion_tokens` if it is a whole number, else `max_tokens` if
+    /// that is.
     max_tokens: Option<u64>,
+    /// `"stream_options": {"include_usage": true}`, exactly: the stream ends
+    /// with a usage chunk.
+    include_usage: bool,
 }
 
 impl RequestOptions {
@@ -807,7 +846,11 @@ impl RequestOptions {
         let value = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
         Self {
             stream: value.get("stream") == Some(&Value::Bool(true)),
-            max_tokens: value.get("max_tokens").and_then(Value::as_u64),
+            max_tokens: value
+                .get("max_completion_tokens")
+                .and_then(Value::as_u64)
+                .or_else(|| value.get("max_tokens").and_then(Value::as_u64)),
+            include_usage: value.pointer("/stream_options/include_usage") == Some(&Value::Bool(true)),
         }
     }
 }
@@ -846,13 +889,14 @@ async fn handle(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Bod
             stream: None,
         }),
     };
-    // Read so the connection can be reused; only stream and max_tokens matter.
+    // Read so the connection can be reused; only stream, the token limit and
+    // include_usage matter.
     let options = RequestOptions::parse(&axum::body::to_bytes(body, MAX_BODY_BYTES).await.unwrap_or_default());
 
     let script = &shared.script;
     if options.stream {
         let n = script.stream.output_tokens;
-        // min(max_tokens, N), but at least one token.
+        // min(token limit, N), but at least one token.
         let tokens = options.max_tokens.map_or(n, |max| max.min(n)).max(1);
         let scripted_ttft_ns = script.scripted_ttft_ns(seq);
         let record = line.record();
@@ -875,6 +919,7 @@ async fn handle(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Bod
             t0,
             arrival_ns,
             tokens,
+            include_usage: options.include_usage,
         };
         return stream_response(line, request);
     }
@@ -901,6 +946,7 @@ struct StreamRequest {
     t0: Instant,
     arrival_ns: u64,
     tokens: u64,
+    include_usage: bool,
 }
 
 /// Answers with an event stream fed by `emit_tokens`, which runs as its own
@@ -936,6 +982,7 @@ async fn emit_tokens(mut line: LogLine, request: StreamRequest, tx: tokio_mpsc::
         t0,
         arrival_ns,
         tokens,
+        include_usage,
     } = request;
     let shared = Arc::clone(&line.shared);
     let script = &shared.script;
@@ -969,7 +1016,7 @@ async fn emit_tokens(mut line: LogLine, request: StreamRequest, tx: tokio_mpsc::
         if k == 0 && script.role_chunk == RoleChunk::WithFirstToken && !send_role(&mut line) {
             return;
         }
-        let chunk = event(endpoint.token_chunk(seq));
+        let chunk = event(endpoint.token_chunk(seq, &script.token_text, k + 1 == tokens));
         let handed_off = nanos(t0.elapsed());
         if tx.send(chunk).is_err() {
             return;
@@ -983,7 +1030,7 @@ async fn emit_tokens(mut line: LogLine, request: StreamRequest, tx: tokio_mpsc::
         stream.scheduled_token_ns.push(scheduled);
         stream.token_stall_wait_ns.push(wait);
     }
-    if tx.send(event(endpoint.finish_chunk(seq, tokens))).is_err() {
+    if include_usage && tx.send(event(endpoint.usage_chunk(seq, tokens))).is_err() {
         return;
     }
     let done = Event::default().data("[DONE]");
@@ -1000,4 +1047,39 @@ async fn healthz() -> &'static str {
 
 fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn max_tokens(body: Value) -> Option<u64> {
+        RequestOptions::parse(body.to_string().as_bytes()).max_tokens
+    }
+
+    #[test]
+    fn max_tokens_and_max_completion_tokens_are_read() {
+        assert_eq!(max_tokens(json!({})), None);
+        assert_eq!(max_tokens(json!({"max_tokens": 3})), Some(3));
+        assert_eq!(max_tokens(json!({"max_completion_tokens": 3})), Some(3));
+        // Both present: max_completion_tokens wins, whether smaller or larger.
+        assert_eq!(
+            max_tokens(json!({"max_tokens": 4, "max_completion_tokens": 2})),
+            Some(2)
+        );
+        assert_eq!(
+            max_tokens(json!({"max_tokens": 2, "max_completion_tokens": 4})),
+            Some(4)
+        );
+        // Anything but a whole number is not a limit, so the other one applies.
+        assert_eq!(
+            max_tokens(json!({"max_tokens": 2, "max_completion_tokens": "4"})),
+            Some(2)
+        );
+        assert_eq!(
+            max_tokens(json!({"max_tokens": 2.5, "max_completion_tokens": 4})),
+            Some(4)
+        );
+        assert_eq!(max_tokens(json!({"max_completion_tokens": -1})), None);
+    }
 }
