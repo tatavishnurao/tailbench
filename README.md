@@ -5,7 +5,7 @@
 
 status: pre-release
 
-A latency harness that audits its own numbers.
+A latency harness that audits its own numbers, and other tools' numbers against a server that logs the truth.
 
 ## Findings
 
