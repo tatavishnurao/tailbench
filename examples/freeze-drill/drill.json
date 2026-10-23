@@ -1,0 +1,723 @@
+{
+  "meta": {
+    "python": "3.12.3",
+    "openai": "3.37.0",
+    "httpx2": "2.16.0",
+    "httpx": "not installed",
+    "phantom": "0.2.0",
+    "phantom_scripts": {
+      "streaming": [
+        "--service-ms",
+        "1",
+        "--ttft-ms",
+        "200",
+        "--itl-ms",
+        "30",
+        "--output-tokens",
+        "40"
+      ],
+      "non-streaming": [
+        "--service-ms",
+        "1",
+        "--output-tokens",
+        "40"
+      ]
+    },
+    "sdk_defaults": {
+      "DEFAULT_TIMEOUT": "Timeout(connect=5.0, read=600, write=600, pool=600)",
+      "DEFAULT_MAX_RETRIES": 2
+    },
+    "cap_s": {
+      "streaming": 40.0,
+      "non-streaming": 120.0
+    },
+    "total_s": 95.92240154999308
+  },
+  "cells": [
+    {
+      "freeze": "before first token",
+      "stall": "100:15000",
+      "stream": true,
+      "cap_s": 40.0,
+      "config": "SDK defaults",
+      "config_code": "OpenAI(base_url=..., api_key=...)",
+      "client_effective": {
+        "timeout": "Timeout(connect=5.0, read=600, write=600, pool=600)",
+        "max_retries": 2
+      },
+      "phantom_cmd": [
+        "phantom",
+        "--listen",
+        "127.0.0.1:36359",
+        "--service-ms",
+        "1",
+        "--ttft-ms",
+        "200",
+        "--itl-ms",
+        "30",
+        "--output-tokens",
+        "40",
+        "--stall",
+        "100:15000",
+        "--log",
+        "/home/vishnurao/wsl-projects/tailbench/examples/freeze-drill/out/cell0-A.jsonl"
+      ],
+      "requests_total": 1,
+      "phantom_exit": "exited after SIGINT",
+      "client": {
+        "create_returned_s": 0.019285636954009533,
+        "answer_tokens": null,
+        "time_to_first_token_s": 15.124765436979942,
+        "token_times_s": [
+          15.124765436979942,
+          15.149174668011256,
+          15.17979328695219,
+          15.210502331960015,
+          15.2395022950368,
+          15.27037475304678,
+          15.299499082029797,
+          15.32976798596792,
+          15.360130202956498,
+          15.38954103004653,
+          15.419895455008373,
+          15.44983671605587,
+          15.480202201986685,
+          15.510330392979085,
+          15.540982860024087,
+          15.569876229041256,
+          15.599846918950789,
+          15.630461069988087,
+          15.66011564002838,
+          15.690949540003203,
+          15.720523006981239,
+          15.750076523050666,
+          15.780638798023574,
+          15.809940321021713,
+          15.83983456203714,
+          15.870454443036579,
+          15.900405736989342,
+          15.931301007047296,
+          15.959958633990027,
+          15.990219213999808,
+          16.0198984160088,
+          16.05070969404187,
+          16.07998859102372,
+          16.109917095978744,
+          16.140463719028048,
+          16.17013434600085,
+          16.200508570997044,
+          16.229928739950992,
+          16.26025686901994,
+          16.295297977980226
+        ],
+        "tokens_received": 40,
+        "outcome": "finished",
+        "error_class": null,
+        "error_message": null,
+        "outcome_at_s": 16.29546112997923,
+        "wall_s": 16.29559260199312
+      },
+      "phantom_log": {
+        "requests": [
+          {
+            "seq": 0,
+            "arrival_s": 4.9e-08,
+            "completed": true,
+            "abandoned_s": null,
+            "sent_s": 16.275625101,
+            "tokens_sent": 40,
+            "stream": true
+          }
+        ],
+        "stalls": [
+          {
+            "start_ms": 100,
+            "len_ms": 15000
+          }
+        ]
+      }
+    },
+    {
+      "freeze": "before first token",
+      "stall": "100:15000",
+      "stream": true,
+      "cap_s": 40.0,
+      "config": "timeout=10",
+      "config_code": "OpenAI(timeout=10)",
+      "client_effective": {
+        "timeout": "10",
+        "max_retries": 2
+      },
+      "phantom_cmd": [
+        "phantom",
+        "--listen",
+        "127.0.0.1:49241",
+        "--service-ms",
+        "1",
+        "--ttft-ms",
+        "200",
+        "--itl-ms",
+        "30",
+        "--output-tokens",
+        "40",
+        "--stall",
+        "100:15000",
+        "--log",
+        "/home/vishnurao/wsl-projects/tailbench/examples/freeze-drill/out/cell1-B.jsonl"
+      ],
+      "requests_total": 1,
+      "phantom_exit": "exited after SIGINT",
+      "client": {
+        "create_returned_s": 0.0015614759176969528,
+        "answer_tokens": null,
+        "time_to_first_token_s": null,
+        "token_times_s": [],
+        "tokens_received": 0,
+        "outcome": "exception",
+        "error_class": "openai.APITimeoutError",
+        "error_message": "Request timed out.",
+        "outcome_at_s": 10.012431480921805,
+        "wall_s": 10.012632820988074
+      },
+      "phantom_log": {
+        "requests": [
+          {
+            "seq": 0,
+            "arrival_s": 4.6e-08,
+            "completed": false,
+            "abandoned_s": 10.011192203,
+            "sent_s": null,
+            "tokens_sent": 0,
+            "stream": true
+          }
+        ],
+        "stalls": [
+          {
+            "start_ms": 100,
+            "len_ms": 15000
+          }
+        ]
+      }
+    },
+    {
+      "freeze": "before first token",
+      "stall": "100:15000",
+      "stream": true,
+      "cap_s": 40.0,
+      "config": "read=2",
+      "config_code": "OpenAI(timeout=Timeout(10, read=2))",
+      "client_effective": {
+        "timeout": "Timeout(connect=10, read=2, write=10, pool=10)",
+        "max_retries": 2
+      },
+      "phantom_cmd": [
+        "phantom",
+        "--listen",
+        "127.0.0.1:53977",
+        "--service-ms",
+        "1",
+        "--ttft-ms",
+        "200",
+        "--itl-ms",
+        "30",
+        "--output-tokens",
+        "40",
+        "--stall",
+        "100:15000",
+        "--log",
+        "/home/vishnurao/wsl-projects/tailbench/examples/freeze-drill/out/cell2-C.jsonl"
+      ],
+      "requests_total": 1,
+      "phantom_exit": "exited after SIGINT",
+      "client": {
+        "create_returned_s": 0.0013953690649941564,
+        "answer_tokens": null,
+        "time_to_first_token_s": null,
+        "token_times_s": [],
+        "tokens_received": 0,
+        "outcome": "exception",
+        "error_class": "openai.APITimeoutError",
+        "error_message": "Request timed out.",
+        "outcome_at_s": 2.0039770980365574,
+        "wall_s": 2.0041669269558042
+      },
+      "phantom_log": {
+        "requests": [
+          {
+            "seq": 0,
+            "arrival_s": 5.2e-08,
+            "completed": false,
+            "abandoned_s": 2.002834575,
+            "sent_s": null,
+            "tokens_sent": 0,
+            "stream": true
+          }
+        ],
+        "stalls": [
+          {
+            "start_ms": 100,
+            "len_ms": 15000
+          }
+        ]
+      }
+    },
+    {
+      "freeze": "mid-answer",
+      "stall": "600:15000",
+      "stream": true,
+      "cap_s": 40.0,
+      "config": "SDK defaults",
+      "config_code": "OpenAI(base_url=..., api_key=...)",
+      "client_effective": {
+        "timeout": "Timeout(connect=5.0, read=600, write=600, pool=600)",
+        "max_retries": 2
+      },
+      "phantom_cmd": [
+        "phantom",
+        "--listen",
+        "127.0.0.1:46701",
+        "--service-ms",
+        "1",
+        "--ttft-ms",
+        "200",
+        "--itl-ms",
+        "30",
+        "--output-tokens",
+        "40",
+        "--stall",
+        "600:15000",
+        "--log",
+        "/home/vishnurao/wsl-projects/tailbench/examples/freeze-drill/out/cell3-A.jsonl"
+      ],
+      "requests_total": 1,
+      "phantom_exit": "exited after SIGINT",
+      "client": {
+        "create_returned_s": 0.0014924380229786038,
+        "answer_tokens": null,
+        "time_to_first_token_s": 0.20356180996168405,
+        "token_times_s": [
+          0.20356180996168405,
+          0.23311764502432197,
+          0.26254157698713243,
+          0.29296104703098536,
+          0.3226360429544002,
+          0.3525699150050059,
+          0.38330681703519076,
+          0.4128834280418232,
+          0.44322191295214,
+          0.47322902805171907,
+          0.5036638990277424,
+          0.5334395379759371,
+          0.562680538976565,
+          0.5935238560196012,
+          15.603072114055976,
+          15.632714129053056,
+          15.663497474044561,
+          15.6928806490032,
+          15.72293892595917,
+          15.752615428064018,
+          15.783699964988045,
+          15.813689784961753,
+          15.842958854045719,
+          15.873703264980577,
+          15.9030985069694,
+          15.932765605044551,
+          15.962954082060605,
+          15.993400176987052,
+          16.023203728022054,
+          16.05349495005794,
+          16.082672076066956,
+          16.113541211001575,
+          16.143440230982378,
+          16.17284584301524,
+          16.203379680984654,
+          16.233055426040664,
+          16.262626493000425,
+          16.293169865035452,
+          16.32316746201832,
+          16.353383781039156
+        ],
+        "tokens_received": 40,
+        "outcome": "finished",
+        "error_class": null,
+        "error_message": null,
+        "outcome_at_s": 16.353611957048997,
+        "wall_s": 16.353750588954426
+      },
+      "phantom_log": {
+        "requests": [
+          {
+            "seq": 0,
+            "arrival_s": 4.8e-08,
+            "completed": true,
+            "abandoned_s": null,
+            "sent_s": 16.351486724,
+            "tokens_sent": 40,
+            "stream": true
+          }
+        ],
+        "stalls": [
+          {
+            "start_ms": 600,
+            "len_ms": 15000
+          }
+        ]
+      }
+    },
+    {
+      "freeze": "mid-answer",
+      "stall": "600:15000",
+      "stream": true,
+      "cap_s": 40.0,
+      "config": "timeout=10",
+      "config_code": "OpenAI(timeout=10)",
+      "client_effective": {
+        "timeout": "10",
+        "max_retries": 2
+      },
+      "phantom_cmd": [
+        "phantom",
+        "--listen",
+        "127.0.0.1:57731",
+        "--service-ms",
+        "1",
+        "--ttft-ms",
+        "200",
+        "--itl-ms",
+        "30",
+        "--output-tokens",
+        "40",
+        "--stall",
+        "600:15000",
+        "--log",
+        "/home/vishnurao/wsl-projects/tailbench/examples/freeze-drill/out/cell4-B.jsonl"
+      ],
+      "requests_total": 1,
+      "phantom_exit": "exited after SIGINT",
+      "client": {
+        "create_returned_s": 0.0012624410446733236,
+        "answer_tokens": null,
+        "time_to_first_token_s": 0.2028714120388031,
+        "token_times_s": [
+          0.2028714120388031,
+          0.23292448604479432,
+          0.2625509890494868,
+          0.2927594049833715,
+          0.32191885996144265,
+          0.3528973499778658,
+          0.38266013201791793,
+          0.4131019030464813,
+          0.44225073396228254,
+          0.47229188797064126,
+          0.502146729035303,
+          0.5325355679960921,
+          0.562391918967478,
+          0.5923003100324422
+        ],
+        "tokens_received": 14,
+        "outcome": "exception",
+        "error_class": "openai.APITimeoutError",
+        "error_message": "Request timed out.",
+        "outcome_at_s": 10.603221633005887,
+        "wall_s": 10.60338140197564
+      },
+      "phantom_log": {
+        "requests": [
+          {
+            "seq": 0,
+            "arrival_s": 5.6e-08,
+            "completed": false,
+            "abandoned_s": 10.602159822,
+            "sent_s": null,
+            "tokens_sent": 14,
+            "stream": true
+          }
+        ],
+        "stalls": [
+          {
+            "start_ms": 600,
+            "len_ms": 15000
+          }
+        ]
+      }
+    },
+    {
+      "freeze": "mid-answer",
+      "stall": "600:15000",
+      "stream": true,
+      "cap_s": 40.0,
+      "config": "read=2",
+      "config_code": "OpenAI(timeout=Timeout(10, read=2))",
+      "client_effective": {
+        "timeout": "Timeout(connect=10, read=2, write=10, pool=10)",
+        "max_retries": 2
+      },
+      "phantom_cmd": [
+        "phantom",
+        "--listen",
+        "127.0.0.1:50741",
+        "--service-ms",
+        "1",
+        "--ttft-ms",
+        "200",
+        "--itl-ms",
+        "30",
+        "--output-tokens",
+        "40",
+        "--stall",
+        "600:15000",
+        "--log",
+        "/home/vishnurao/wsl-projects/tailbench/examples/freeze-drill/out/cell5-C.jsonl"
+      ],
+      "requests_total": 1,
+      "phantom_exit": "exited after SIGINT",
+      "client": {
+        "create_returned_s": 0.0013661939883604646,
+        "answer_tokens": null,
+        "time_to_first_token_s": 0.20488850201945752,
+        "token_times_s": [
+          0.20488850201945752,
+          0.2330410910071805,
+          0.2627277260180563,
+          0.29325158800929785,
+          0.3228159409482032,
+          0.3534553929930553,
+          0.3828325269278139,
+          0.41317082196474075,
+          0.4429717470193282,
+          0.4724611089332029,
+          0.5035389519762248,
+          0.5336370109580457,
+          0.5625113099813461,
+          0.5928367730230093
+        ],
+        "tokens_received": 14,
+        "outcome": "exception",
+        "error_class": "openai.APITimeoutError",
+        "error_message": "Request timed out.",
+        "outcome_at_s": 2.5955252279527485,
+        "wall_s": 2.5957364009227604
+      },
+      "phantom_log": {
+        "requests": [
+          {
+            "seq": 0,
+            "arrival_s": 4.4e-08,
+            "completed": false,
+            "abandoned_s": 2.594394411,
+            "sent_s": null,
+            "tokens_sent": 14,
+            "stream": true
+          }
+        ],
+        "stalls": [
+          {
+            "start_ms": 600,
+            "len_ms": 15000
+          }
+        ]
+      }
+    },
+    {
+      "freeze": "non-streaming",
+      "stall": "0:15000",
+      "stream": false,
+      "cap_s": 120.0,
+      "config": "SDK defaults",
+      "config_code": "OpenAI(base_url=..., api_key=...)",
+      "client_effective": {
+        "timeout": "Timeout(connect=5.0, read=600, write=600, pool=600)",
+        "max_retries": 2
+      },
+      "phantom_cmd": [
+        "phantom",
+        "--listen",
+        "127.0.0.1:56203",
+        "--service-ms",
+        "1",
+        "--output-tokens",
+        "40",
+        "--stall",
+        "0:15000",
+        "--log",
+        "/home/vishnurao/wsl-projects/tailbench/examples/freeze-drill/out/cell6-A.jsonl"
+      ],
+      "requests_total": 1,
+      "phantom_exit": "exited after SIGINT",
+      "client": {
+        "create_returned_s": null,
+        "answer_tokens": 6,
+        "time_to_first_token_s": null,
+        "token_times_s": [],
+        "tokens_received": 0,
+        "outcome": "finished",
+        "error_class": null,
+        "error_message": null,
+        "outcome_at_s": 15.013412125059403,
+        "wall_s": 15.013517654966563
+      },
+      "phantom_log": {
+        "requests": [
+          {
+            "seq": 0,
+            "arrival_s": 4.9e-08,
+            "completed": true,
+            "abandoned_s": null,
+            "sent_s": 15.004036134,
+            "tokens_sent": 0,
+            "stream": false
+          }
+        ],
+        "stalls": [
+          {
+            "start_ms": 0,
+            "len_ms": 15000
+          }
+        ]
+      }
+    },
+    {
+      "freeze": "non-streaming",
+      "stall": "0:15000",
+      "stream": false,
+      "cap_s": 120.0,
+      "config": "timeout=10",
+      "config_code": "OpenAI(timeout=10)",
+      "client_effective": {
+        "timeout": "10",
+        "max_retries": 2
+      },
+      "phantom_cmd": [
+        "phantom",
+        "--listen",
+        "127.0.0.1:55381",
+        "--service-ms",
+        "1",
+        "--output-tokens",
+        "40",
+        "--stall",
+        "0:15000",
+        "--log",
+        "/home/vishnurao/wsl-projects/tailbench/examples/freeze-drill/out/cell7-B.jsonl"
+      ],
+      "requests_total": 2,
+      "phantom_exit": "exited after SIGINT",
+      "client": {
+        "create_returned_s": null,
+        "answer_tokens": 6,
+        "time_to_first_token_s": null,
+        "token_times_s": [],
+        "tokens_received": 0,
+        "outcome": "finished",
+        "error_class": null,
+        "error_message": null,
+        "outcome_at_s": 15.006488682935014,
+        "wall_s": 15.006584028946236
+      },
+      "phantom_log": {
+        "requests": [
+          {
+            "seq": 0,
+            "arrival_s": 5.2e-08,
+            "completed": false,
+            "abandoned_s": 10.010869045,
+            "sent_s": null,
+            "tokens_sent": 0,
+            "stream": false
+          },
+          {
+            "seq": 1,
+            "arrival_s": 10.456286937,
+            "completed": true,
+            "abandoned_s": null,
+            "sent_s": 15.003779601,
+            "tokens_sent": 0,
+            "stream": false
+          }
+        ],
+        "stalls": [
+          {
+            "start_ms": 0,
+            "len_ms": 15000
+          }
+        ]
+      }
+    },
+    {
+      "freeze": "non-streaming",
+      "stall": "0:15000",
+      "stream": false,
+      "cap_s": 120.0,
+      "config": "read=2",
+      "config_code": "OpenAI(timeout=Timeout(10, read=2))",
+      "client_effective": {
+        "timeout": "Timeout(connect=10, read=2, write=10, pool=10)",
+        "max_retries": 2
+      },
+      "phantom_cmd": [
+        "phantom",
+        "--listen",
+        "127.0.0.1:41253",
+        "--service-ms",
+        "1",
+        "--output-tokens",
+        "40",
+        "--stall",
+        "0:15000",
+        "--log",
+        "/home/vishnurao/wsl-projects/tailbench/examples/freeze-drill/out/cell8-C.jsonl"
+      ],
+      "requests_total": 3,
+      "phantom_exit": "exited after SIGINT",
+      "client": {
+        "create_returned_s": null,
+        "answer_tokens": null,
+        "time_to_first_token_s": null,
+        "token_times_s": [],
+        "tokens_received": 0,
+        "outcome": "exception",
+        "error_class": "openai.APITimeoutError",
+        "error_message": "Request timed out.",
+        "outcome_at_s": 7.381934392964467,
+        "wall_s": 7.382195423939265
+      },
+      "phantom_log": {
+        "requests": [
+          {
+            "seq": 0,
+            "arrival_s": 4.8e-08,
+            "completed": false,
+            "abandoned_s": 2.002411042,
+            "sent_s": null,
+            "tokens_sent": 0,
+            "stream": false
+          },
+          {
+            "seq": 1,
+            "arrival_s": 2.453025328,
+            "completed": false,
+            "abandoned_s": 4.455253901,
+            "sent_s": null,
+            "tokens_sent": 0,
+            "stream": false
+          },
+          {
+            "seq": 2,
+            "arrival_s": 5.376546378,
+            "completed": false,
+            "abandoned_s": 7.381201078,
+            "sent_s": null,
+            "tokens_sent": 0,
+            "stream": false
+          }
+        ],
+        "stalls": [
+          {
+            "start_ms": 0,
+            "len_ms": 15000
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+# openai 3.37.0 depends on httpx2 (not httpx); `pip install openai` on 2026-10-23 resolved to these.
+openai==3.37.0
+httpx2==2.16.0
