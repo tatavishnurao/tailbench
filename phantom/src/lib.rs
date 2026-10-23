@@ -16,6 +16,12 @@
 //! A request whose client goes away before its response is finished still
 //! gets a line, marked `"completed": false`.
 //!
+//! The binary can also draw what it sees as it serves (`--live`, see
+//! [`live`]), and `phantom report` reads a log back into a chart and
+//! percentiles of open-loop truth and server time (see [`report`]).
+//! `phantom demo` runs a naive client and tailbench's open loop against it
+//! in-process and sets each one's p99 against the truth.
+//!
 //! Times in the log are nanoseconds since t0, the arrival of the first chat
 //! or completions request, on the server's own monotonic clock.
 //!
@@ -32,7 +38,7 @@
 //! per request:
 //!
 //! ```json
-//! {"type":"manifest","phantom_version":"0.1.0","seed":1,"service":{"kind":"fixed","ms":20},"stalls":[{"start_ms":2000,"len_ms":500}],"ttft":{"kind":"fixed","ms":20},"itl":{"kind":"fixed","ms":10},"output_tokens":32,"role_chunk":"with-first-token","token_text":" tok","listen":"127.0.0.1:8080","start_unix_ns":1792675346756144385,"times":"ns since t0, the arrival of the first chat or completions request, on the server's monotonic clock"}
+//! {"type":"manifest","phantom_version":"0.2.0","seed":1,"service":{"kind":"fixed","ms":20},"stalls":[{"start_ms":2000,"len_ms":500}],"ttft":{"kind":"fixed","ms":20},"itl":{"kind":"fixed","ms":10},"output_tokens":32,"role_chunk":"with-first-token","token_text":" tok","listen":"127.0.0.1:8080","start_unix_ns":1792675346756144385,"times":"ns since t0, the arrival of the first chat or completions request, on the server's monotonic clock"}
 //! {"type":"req","seq":0,"arrival_ns":148,"scripted_service_ns":20000000,"stall_wait_ns":0,"sent_ns":22616234}
 //! {"type":"req","seq":1,"arrival_ns":29606223,"scripted_service_ns":20000000,"stall_wait_ns":0,"sent_ns":52109987}
 //! ```
@@ -60,6 +66,9 @@
 //! ```
 
 #![warn(missing_docs)]
+
+pub mod live;
+pub mod report;
 
 use std::convert::Infallible;
 use std::fmt;
@@ -643,6 +652,13 @@ impl LogLine {
     /// Only fails if the writer has stopped on an I/O error, which `shutdown`
     /// reports.
     fn write(&self, record: Record) {
+        self.shared
+            .monitor
+            .finish(record.sent_ns.map(|sent_ns| report::Completed {
+                seq: record.seq,
+                arrival_ns: record.arrival_ns,
+                sent_ns,
+            }));
         let _ = self.shared.log.send(record);
     }
 }
@@ -664,6 +680,7 @@ struct Shared {
     /// not set it.
     t0: OnceLock<Instant>,
     log: mpsc::Sender<Record>,
+    monitor: live::Monitor,
 }
 
 /// A running server. Dropping it without `shutdown` leaves the log unflushed.
@@ -672,6 +689,7 @@ pub struct Phantom {
     stop: oneshot::Sender<()>,
     server: JoinHandle<io::Result<()>>,
     writer: thread::JoinHandle<io::Result<()>>,
+    monitor: live::Monitor,
 }
 
 /// Writes the manifest, then serves on `listener` and logs to `log_path`
@@ -705,11 +723,13 @@ pub async fn start(listener: TcpListener, script: Script, log_path: &Path) -> io
         .name("phantom-log".to_owned())
         .spawn(move || write_records(out, rx))?;
 
+    let monitor = live::Monitor::new(&script.windows_ns);
     let shared = Arc::new(Shared {
         script,
         next_seq: AtomicU64::new(0),
         t0: OnceLock::new(),
         log: tx,
+        monitor: monitor.clone(),
     });
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -731,6 +751,7 @@ pub async fn start(listener: TcpListener, script: Script, log_path: &Path) -> io
         stop,
         server,
         writer,
+        monitor,
     })
 }
 
@@ -738,6 +759,12 @@ impl Phantom {
     /// The address the server is listening on.
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// The live counters behind `--live`; the handle stays usable after
+    /// `shutdown`.
+    pub fn monitor(&self) -> live::Monitor {
+        self.monitor.clone()
     }
 
     /// Stops accepting connections, waits for in-flight requests to be
@@ -934,6 +961,8 @@ async fn handle(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Bod
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     let arrival_ns = nanos(arrival - t0);
+    // Paired with the finish in LogLine::write.
+    shared.monitor.arrive(t0, arrival_ns);
     // From here on, the request gets a line however it ends.
     let mut line = LogLine {
         shared: Arc::clone(&shared),

@@ -20,6 +20,24 @@ and both crates adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## tailbench-phantom
 
+### [0.2.0] - 2026-10-22
+
+#### Added
+
+- `phantom demo`: coordinated omission in one command, in about 12 s and in-process. A naive client (tailbench's closed-loop runner: one request at a time, timed from its actual send) and then tailbench's open-loop runner, each against a fresh phantom on an ephemeral loopback port with 1 ms service and a 2000:500 freeze, both asked for 100 requests/s. Each run's final panel and the summary show the same two numbers, the tool's own p99 and the open-loop truth from that run's log, and the same ratio (✓ within 10%); both logs are kept for `phantom report`.
+- `--live`: on a terminal, redraws a panel on stderr about 10 times a second: requests arriving over the whole run with the frozen windows underneath, then a "p99 latency" block of two bars on one linear scale (eighth-block ends): "your tool ≈ reports", phantom's estimate from server time, which is what a tool timing from its actual sends sees, and "users waited" (open-loop truth at the rate measured outside the freeze), red when more than 3× the other, else both green; values to 3 significant figures. Once the first freeze has ended, a verdict says whether the load tool kept sending through it. At most 80 columns wide on any terminal; colour unless `NO_COLOR` is set; plain numbers instead of bars below 50 columns; text wraps, never truncated. At shutdown the final panel stays, with a one-line summary. Off a terminal it prints nothing extra.
+- `phantom report --rate R LOG.jsonl [--html OUT.html]`: open-loop truth (from the intended send time, keyed by seq) and server time for every request, as a block chart against intended send time and nearest-rank p50, p99, p99.9 and max; for streams, TTFT truth and each request's largest token gap against its mean ITL. `--html` writes one self-contained page: the two p99s and the verdict up top, an inline SVG timeline, the percentile table and the manifest's script, in light and dark.
+- Library: `phantom::live` (the panel's counters, its pure renderer and the freeze verdict), `phantom::report` (`schedule_origin`, `open_loop_truth`, `nearest_rank` and the report), and `Phantom::monitor`.
+- Docs: the measured overhead of server time over the scripted time (about 2.6 ms at p50, from tokio's millisecond timer) in the truth log reference.
+
+#### Changed
+
+- tailbench-phantom now depends on tailbench 0.1.0, for `phantom demo`'s runners.
+
+#### Unchanged
+
+- The JSONL log format and every server flag; the server runs as before when `report` or `demo` is not the first argument.
+
 ### [0.1.0] - 2026-10-22
 
 #### Added

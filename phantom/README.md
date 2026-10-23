@@ -4,6 +4,111 @@ A deterministic fake OpenAI-compatible server that logs ground truth for every r
 
 phantom follows a script fixed at startup and writes what it did for each request to a JSONL log, so a harness's measurements can be compared request by request with the truth.
 
+## See it
+
+```sh
+phantom demo
+```
+
+In about 12 s, in-process: a naive client (one request at a time, timed from its actual send) and then tailbench's open loop, each against a fresh phantom that freezes for 500 ms, both asked for 100 requests/s. Each panel sets the tool's own p99 against what its users waited, on one scale; the summary repeats the same numbers. Its final output:
+
+```text
+phantom · 1/2 naive client                                             t = 6.0 s
+
+requests arriving  ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▂▁▁▁▁███▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+server frozen      ····················█████···································
+
+p99 latency
+  your tool reports  ▌                                                   4.58 ms
+  users waited       ███████████████████████████████████████████████████  459 ms
+
+✗ Your load tool stopped sending while the server was frozen. It will
+  under-report p99 by 100×.
+your tool's own p99; users waited: truth from phantom's log at 100 req/s
+phantom: stopped at t = 6.0 s: 600 answered, 0 abandoned
+
+phantom · 2/2 tailbench open loop                                      t = 6.0 s
+
+requests arriving  ███████████████████████████████████████████████████████████▇
+server frozen      ····················█████···································
+
+p99 latency
+  your tool reports  ████████████████████████████████████████████████████ 438 ms
+  users waited       ███████████████████████████████████████████████████▉ 437 ms
+
+✓ Your load tool kept sending. Its numbers include the freeze.
+your tool's own p99; users waited: truth from phantom's log at 100 req/s
+phantom: stopped at t = 6.0 s: 600 answered, 0 abandoned
+
+100 req/s for 6 s against 1 ms service, server frozen 2.0–2.5 s:
+
+  p99                      your tool reports  users waited
+  1/2 naive client                   4.58 ms        459 ms  ✗ under by 100×
+  2/2 tailbench open loop             438 ms        437 ms  ✓ matches the truth
+
+logs: /tmp/phantom-demo-73177/naive.jsonl
+      /tmp/phantom-demo-73177/tailbench.jsonl
+next: phantom report --rate 100 /tmp/phantom-demo-73177/naive.jsonl --html out.html
+```
+
+To watch another load generator, serve with `--live` and point it at phantom (a fresh phantom for each run):
+
+```sh
+phantom --live --listen 127.0.0.1:8090 --service-ms 1 --stall 2000:500 --log /tmp/gt-c1.jsonl
+oha -q 100 -z 10s -c 1 -m POST -H 'content-type: application/json' -d '{}' http://127.0.0.1:8090/v1/chat/completions
+```
+
+Here phantom cannot see the tool's own numbers, so "your tool ≈ reports" is its estimate: the p99 of server time, which is what a tool timing from its actual sends measures. The panel is at most 80 columns wide, on any terminal. The final panels after Ctrl-C:
+
+`-c 1`
+
+```text
+phantom 0.2.0 listening on 127.0.0.1:8090, logging to /tmp/gt-c1.jsonl
+
+phantom · watching 127.0.0.1:8090                                     t = 10.5 s
+
+requests arriving  ▄▄▄▄▄▄▄▄▄▄▂▁▅█▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▁▁▁
+server frozen      ··········███········································
+
+p99 latency
+  your tool ≈ reports  ▍                                                 3.73 ms
+  users waited         █████████████████████████████████████████████████  434 ms
+
+✗ Your load tool stopped sending while the server was frozen. It will
+  under-report p99 by 116×.
+assumes 100 req/s intended, the rate measured outside the freeze
+phantom: stopped at t = 10.5 s: 1000 answered, 0 abandoned
+```
+
+`-c 50` (logging to `/tmp/gt-c50.jsonl`)
+
+```text
+phantom 0.2.0 listening on 127.0.0.1:8090, logging to /tmp/gt-c50.jsonl
+
+phantom · watching 127.0.0.1:8090                                     t = 10.5 s
+
+requests arriving  ███▇██████████████████████████████████████████████▁▁▁
+server frozen      ··········███········································
+
+p99 latency
+  your tool ≈ reports  █████████████████████████████████████████████████▉ 394 ms
+  users waited         ██████████████████████████████████████████████████ 395 ms
+
+✓ Your load tool kept sending. Its numbers include the freeze.
+assumes 100 req/s intended, the rate measured outside the freeze
+phantom: stopped at t = 10.5 s: 1000 answered, 0 abandoned
+```
+
+With one connection oha waits for each reply, so it sends nothing while phantom is frozen and its own p99 leaves the wait out; with fifty it keeps its schedule, and the freeze is in its numbers.
+
+Read a log back, against the rate the client was asked for, as a chart and percentiles, or a self-contained HTML page:
+
+```sh
+phantom report --rate 100 /tmp/gt-c1.jsonl --html /tmp/gt-c1.html
+```
+
+To see what an app built on the openai Python SDK shows its user when a provider freezes, run the [provider freeze drill](https://github.com/tatavishnurao/tailbench/blob/main/examples/freeze-drill/README.md).
+
 ## Install
 
 ```sh
@@ -34,7 +139,7 @@ curl -s -H 'content-type: application/json' -d '{}' http://127.0.0.1:8080/v1/cha
 `/tmp/gt.jsonl` then holds the manifest and one line per request:
 
 ```json
-{"type":"manifest","phantom_version":"0.1.0","seed":1,"service":{"kind":"fixed","ms":20},"stalls":[{"start_ms":2000,"len_ms":500}],"ttft":{"kind":"fixed","ms":20},"itl":{"kind":"fixed","ms":10},"output_tokens":32,"role_chunk":"with-first-token","token_text":" tok","listen":"127.0.0.1:8080","start_unix_ns":1792675346756144385,"times":"ns since t0, the arrival of the first chat or completions request, on the server's monotonic clock"}
+{"type":"manifest","phantom_version":"0.2.0","seed":1,"service":{"kind":"fixed","ms":20},"stalls":[{"start_ms":2000,"len_ms":500}],"ttft":{"kind":"fixed","ms":20},"itl":{"kind":"fixed","ms":10},"output_tokens":32,"role_chunk":"with-first-token","token_text":" tok","listen":"127.0.0.1:8080","start_unix_ns":1792675346756144385,"times":"ns since t0, the arrival of the first chat or completions request, on the server's monotonic clock"}
 {"type":"req","seq":0,"arrival_ns":148,"scripted_service_ns":20000000,"stall_wait_ns":0,"sent_ns":22616234}
 {"type":"req","seq":1,"arrival_ns":29606223,"scripted_service_ns":20000000,"stall_wait_ns":0,"sent_ns":52109987}
 ```

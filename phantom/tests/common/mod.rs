@@ -305,33 +305,17 @@ pub fn truth_from_log(text: &str, key: Key) -> Truth {
     }
 }
 
-/// The schedule start on phantom's clock: the minimum over requests of
-/// `arrival_ns_i - i * period_ns`, for (i, arrival_ns_i) pairs.
-///
-/// Why the least-lagged request: arrival_ns_i - i * period is the schedule
-/// start on phantom's clock PLUS request i's own delay (scheduler lag, client
-/// send, loopback, header parsing), and that delay is never negative. Any
-/// single request, request 0 included, carries its own delay into every truth
-/// value; the minimum over all requests carries only the smallest one. Stalls
-/// do not bias it: phantom applies them after arrival, and late sends only
-/// raise arrivals.
+/// The schedule start on phantom's clock: `phantom::report::schedule_origin`,
+/// the minimum over requests of `arrival_ns_i - i * period_ns` (see there
+/// for why the least-lagged request).
 pub fn schedule_origin(arrivals: impl IntoIterator<Item = (i64, u64)>, period_ns: i64) -> i64 {
-    arrivals
-        .into_iter()
-        .map(|(i, arrival)| arrival as i64 - i * period_ns)
-        .min()
-        .expect("at least one request")
+    phantom::report::schedule_origin(arrivals, period_ns).expect("at least one request")
 }
 
 /// Nearest rank, the definition tailbench's histogram uses (without its
-/// rounding up to the bucket, which is under 0.1%).
+/// rounding up to the bucket, which is under 0.1%), and `phantom report`'s.
 pub fn truth_at(sorted: &[i64], p: Pct) -> f64 {
-    let n = sorted.len();
-    let rank = match p.q {
-        Some(q) => ((q * n as f64).ceil() as usize).max(1),
-        None => n,
-    };
-    sorted[rank - 1] as f64
+    phantom::report::nearest_rank(sorted, p.q) as f64
 }
 
 pub fn sorted(truth_ns: &[i64]) -> Vec<i64> {

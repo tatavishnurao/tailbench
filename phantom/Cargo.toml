@@ -1,6 +1,6 @@
 [package]
 name = "tailbench-phantom"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # The lowest toolchain that checks the workspace (--all-targets) with Cargo.lock.
 rust-version = "1.88"
@@ -35,10 +35,11 @@ serde_json = "1.0.154"
 # dependency tree. signal: SIGINT/SIGTERM trigger the graceful shutdown that
 # flushes the log.
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "time", "sync", "net", "signal"] }
+# phantom demo drives phantom with tailbench's closed-loop and open-loop
+# runners. The path is for this workspace; published, it is tailbench 0.1.0.
+tailbench = { path = "..", version = "0.1.0" }
 
 [dev-dependencies]
 # Loopback HTTP only: default features (TLS, HTTP/2, proxy discovery) are not needed.
 reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
 tempfile = "3.27.0"
-# The harness under audit in tests/audit.rs.
-tailbench = { path = ".." }
