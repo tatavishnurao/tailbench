@@ -19,7 +19,9 @@ use std::fmt::{self, Write as _};
 
 use serde_json::Value;
 
-use crate::live::{RED_RATIO, StallCounts, Verdict, fmt_p99, verdict_sentence};
+use crate::live::{
+    MIN_ARRIVALS_BEFORE, RED_RATIO, STALL_UNOBSERVED, StallCounts, Verdict, fmt_p99, verdict_sentence, wrap,
+};
 
 const NS_PER_MS: f64 = 1e6;
 const NS_PER_S: f64 = 1e9;
@@ -31,6 +33,9 @@ pub const QUANTILES: [(&str, Option<f64>); 4] = [
     ("p99.9", Some(0.999)),
     ("max", None),
 ];
+
+/// The terminal chart is never wider than this many columns.
+pub const MAX_CHART_WIDTH: usize = 100;
 
 /// Above this many requests the HTML timeline plots the maximum per column
 /// instead of every request.
@@ -108,6 +113,111 @@ pub fn open_loop_truth(requests: &[Completed], period_ns: i64) -> Option<(i64, V
         .map(|r| r.sent_ns as i64 - (origin + r.seq as i64 * period_ns))
         .collect();
     Some((origin, truth))
+}
+
+/// Arrivals further apart than this start a new run, whatever the rate.
+pub const MIN_RUN_GAP_NS: u64 = 1_000_000_000;
+
+/// Arrivals further apart than this many median inter-arrival times start a
+/// new run.
+pub const RUN_GAP_FACTOR: u64 = 20;
+
+/// One run: arrivals with no gap between them long enough to be idle time
+/// (see [`find_runs`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Run {
+    /// The first arrival, in ns since t0.
+    pub start_ns: u64,
+    /// The last arrival, in ns since t0.
+    pub end_ns: u64,
+    /// Arrivals in the run.
+    pub arrivals: usize,
+}
+
+/// The gap that separates runs: `max(1 s, 20 x median inter-arrival)`.
+pub fn run_gap_threshold_ns(median_gap_ns: u64) -> u64 {
+    MIN_RUN_GAP_NS.max(RUN_GAP_FACTOR.saturating_mul(median_gap_ns))
+}
+
+/// Whether the gap from arrival `prev_ns` to arrival `next_ns` ends a run:
+/// it is longer than `threshold_ns`, and a stall window does not explain it.
+///
+/// A closed-loop client sends nothing while the server is frozen, so its
+/// gap across a long stall is a wait, not idle time: the last arrival came
+/// within `threshold_ns` of the window's start (or inside it) and the next
+/// one at the window's end or within `threshold_ns` after it.
+pub fn gap_starts_run(prev_ns: u64, next_ns: u64, threshold_ns: u64, stalls_ns: &[(u64, u64)]) -> bool {
+    if next_ns.saturating_sub(prev_ns) <= threshold_ns {
+        return false;
+    }
+    !stalls_ns.iter().any(|&(start, end)| {
+        prev_ns < end
+            && next_ns >= end
+            && prev_ns.saturating_add(threshold_ns) >= start
+            && next_ns <= end.saturating_add(threshold_ns)
+    })
+}
+
+/// The median of the gaps between consecutive values of `sorted`; 0 for
+/// fewer than two. For an even number of gaps, the upper of the middle two.
+pub fn median_gap_ns(sorted: &[u64]) -> u64 {
+    let mut gaps: Vec<u64> = sorted.windows(2).map(|w| w[1] - w[0]).collect();
+    gaps.sort_unstable();
+    gaps.get(gaps.len() / 2).copied().unwrap_or(0)
+}
+
+/// Splits arrivals (ns since t0, any order) into runs at gaps longer than
+/// `max(1 s, 20 x the median inter-arrival)`, except gaps a stall window in
+/// `stalls_ns` explains ([`gap_starts_run`]). One run for no arrivals or one;
+/// none for an empty list.
+pub fn find_runs(arrivals_ns: &[u64], stalls_ns: &[(u64, u64)]) -> Vec<Run> {
+    let mut sorted = arrivals_ns.to_vec();
+    sorted.sort_unstable();
+    let threshold = run_gap_threshold_ns(median_gap_ns(&sorted));
+    let mut runs: Vec<Run> = Vec::new();
+    for &t in &sorted {
+        match runs.last_mut() {
+            Some(run) if !gap_starts_run(run.end_ns, t, threshold, stalls_ns) => {
+                run.end_ns = t;
+                run.arrivals += 1;
+            }
+            _ => runs.push(Run {
+                start_ns: t,
+                end_ns: t,
+                arrivals: 1,
+            }),
+        }
+    }
+    runs
+}
+
+/// Open-loop truth for requests spread over several runs: each run gets its
+/// own schedule origin ([`schedule_origin`] over that run's requests), so
+/// idle time between runs is not lateness. Returns `(origin, truth)` for each
+/// request, in the order given; `None` for no requests. A request belongs to
+/// the last run that started at or before its arrival. For one run this is
+/// [`open_loop_truth`], request for request.
+pub fn open_loop_truth_by_run(requests: &[Completed], runs: &[Run], period_ns: i64) -> Option<Vec<(i64, i64)>> {
+    if requests.is_empty() {
+        return None;
+    }
+    let run_of = |r: &Completed| {
+        runs.partition_point(|run| run.start_ns <= r.arrival_ns)
+            .saturating_sub(1)
+    };
+    let mut origins: Vec<Option<i64>> = vec![None; runs.len().max(1)];
+    for r in requests {
+        let o = r.arrival_ns as i64 - r.seq as i64 * period_ns;
+        let slot = &mut origins[run_of(r)];
+        *slot = Some(slot.map_or(o, |m| m.min(o)));
+    }
+    requests
+        .iter()
+        .map(|r| {
+            let origin = origins[run_of(r)]?;
+            Some((origin, r.sent_ns as i64 - (origin + r.seq as i64 * period_ns)))
+        })
+        .collect()
 }
 
 /// Nearest rank: the `ceil(q * n)`-th smallest of `sorted` (at least the
@@ -189,23 +299,38 @@ pub struct Report {
     pub stalls_ns: Vec<(u64, u64)>,
     /// The arrival of every request line, completed or not, in ns since t0.
     pub arrivals_ns: Vec<u64>,
+    /// The runs in the arrival sequence ([`find_runs`]), in time order.
+    pub runs: Vec<Run>,
+    /// The arrival rate measured from the log, per second: the median
+    /// inter-arrival in the longest run; `None` if no run has two arrivals.
+    pub measured_rate_per_s: Option<f64>,
+    /// Whether the log's last line was cut off mid-JSON and left out.
+    pub ignored_incomplete_line: bool,
 }
 
 impl Report {
     /// Reads a truth log (the manifest line, then one line per request) and
     /// computes truth for a schedule of one request every `period_ns`.
     pub fn from_log(text: &str, period_ns: i64) -> Result<Self, ReportError> {
-        let mut lines = text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty());
+        let mut lines: Vec<(usize, &str)> = text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()).collect();
         let parse = |(n, line): (usize, &str)| {
             serde_json::from_str::<Value>(line).map_err(|e| ReportError(format!("line {}: not JSON: {e}", n + 1)))
         };
+        // A log still being written (or cut short) ends mid-line: no final
+        // newline and not JSON. Leave that line out; the manifest is never it.
+        let ignored_incomplete_line =
+            lines.len() > 1 && !text.ends_with('\n') && lines.last().is_some_and(|&l| parse(l).is_err());
+        if ignored_incomplete_line {
+            lines.pop();
+        }
+        let mut lines = lines.into_iter();
         let manifest = lines
             .next()
             .map(parse)
             .transpose()?
             .filter(|m| m["type"] == "manifest")
             .ok_or_else(|| ReportError("line 1 is not a phantom manifest".to_owned()))?;
-        let stalls_ns = manifest["stalls"]
+        let stalls_ns: Vec<(u64, u64)> = manifest["stalls"]
             .as_array()
             .map(|stalls| {
                 stalls
@@ -252,14 +377,30 @@ impl Report {
                 sent_ns,
             })
             .collect();
-        let (origin_ns, truth) = open_loop_truth(&times, period_ns)
+        let runs = find_runs(&arrivals_ns, &stalls_ns);
+        let truth = open_loop_truth_by_run(&times, &runs, period_ns)
             .ok_or_else(|| ReportError("the log has no completed request".to_owned()))?;
+        // The timeline starts at the first run's schedule origin.
+        let origin_ns = truth[0].0;
+        let measured_rate_per_s = runs
+            .iter()
+            .max_by_key(|run| (run.end_ns - run.start_ns, run.arrivals))
+            .and_then(|longest| {
+                let mut in_run: Vec<u64> = arrivals_ns
+                    .iter()
+                    .copied()
+                    .filter(|t| (longest.start_ns..=longest.end_ns).contains(t))
+                    .collect();
+                in_run.sort_unstable();
+                let gap = median_gap_ns(&in_run);
+                (gap > 0).then(|| NS_PER_S / gap as f64)
+            });
 
         let requests = completed
             .into_iter()
             .zip(truth)
-            .map(|((seq, arrival, sent, tokens), truth_ns)| {
-                let intended = origin_ns + seq as i64 * period_ns;
+            .map(|((seq, arrival, sent, tokens), (origin, truth_ns))| {
+                let intended = origin + seq as i64 * period_ns;
                 let stream = tokens.filter(|t| !t.is_empty()).map(|t| {
                     let n = t.len();
                     StreamTimes {
@@ -286,6 +427,9 @@ impl Report {
             abandoned,
             stalls_ns,
             arrivals_ns,
+            runs,
+            measured_rate_per_s,
+            ignored_incomplete_line,
         })
     }
 
@@ -293,8 +437,20 @@ impl Report {
     /// window (the `--live` panel's check, on the logged arrivals); `None`
     /// without a stall.
     pub fn verdict(&self) -> Option<Verdict> {
+        Some(self.first_stall_counts()?.verdict())
+    }
+
+    fn first_stall_counts(&self) -> Option<StallCounts> {
         let &(start, end) = self.stalls_ns.first()?;
-        Some(StallCounts::from_arrivals(start, end, self.arrivals_ns.iter().copied()).verdict())
+        Some(StallCounts::from_arrivals(start, end, self.arrivals_ns.iter().copied()))
+    }
+
+    /// Whether the log has a stall window that no traffic preceded (fewer
+    /// than [`MIN_ARRIVALS_BEFORE`] arrivals in the interval before it), so
+    /// that a verdict on it would rest on nothing (`--live` shows none).
+    pub fn stall_passed_unobserved(&self) -> bool {
+        self.first_stall_counts()
+            .is_some_and(|c| c.before < MIN_ARRIVALS_BEFORE)
     }
 
     /// Truth p99 over server-time p99, if server time's is above zero.
@@ -457,6 +613,7 @@ impl Report {
 
     /// The terminal report: a header, the chart, and the percentile table.
     pub fn text(&self, log_name: &str, width: usize) -> String {
+        let width = width.min(MAX_CHART_WIDTH);
         let mut out = String::new();
         let rate = NS_PER_S / self.period_ns as f64;
         let _ = writeln!(
@@ -467,7 +624,7 @@ impl Report {
         );
         let _ = writeln!(
             out,
-            "answered {}   abandoned {}   stalls {}",
+            "answered {}   abandoned {}   stalls {}   runs {}",
             self.requests.len(),
             self.abandoned,
             if self.stalls_ns.is_empty() {
@@ -478,8 +635,48 @@ impl Report {
                     .map(|&(s, e)| format!("{}–{}", fmt_s(s as f64), fmt_s(e as f64)))
                     .collect::<Vec<_>>()
                     .join(", ")
-            }
+            },
+            self.runs.len()
         );
+        let mut notes = Vec::new();
+        if self.ignored_incomplete_line {
+            notes.push("ignored 1 incomplete final line".to_owned());
+        }
+        if self.runs.len() > 1 {
+            let gaps: Vec<String> = self
+                .runs
+                .windows(2)
+                .map(|w| fmt_s((w[1].start_ns - w[0].end_ns) as f64))
+                .collect();
+            notes.push(format!(
+                "{} separate runs found (gaps of {}); truth is computed per run. For a clean result use a fresh phantom per run.",
+                self.runs.len(),
+                gaps.join(", ")
+            ));
+        }
+        if let Some(measured) = self.measured_rate_per_s {
+            let rate = NS_PER_S / self.period_ns as f64;
+            notes.push(format!(
+                "arrival rate in the log: {} /s (median inter-arrival, longest run)",
+                trim_float(measured)
+            ));
+            if (measured - rate).abs() > 0.2 * rate {
+                notes.push(format!(
+                    "warning: the log's arrival rate is {} /s but --rate is {} /s; truth assumes --rate",
+                    trim_float(measured),
+                    trim_float(rate)
+                ));
+            }
+        }
+        if self.stall_passed_unobserved() {
+            notes.push(STALL_UNOBSERVED.to_owned());
+        }
+        for note in notes {
+            for line in wrap(&note, width) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
         out.push('\n');
         out.push_str(&self.chart(width, 8));
         out.push('\n');
@@ -983,5 +1180,219 @@ mod tests {
         assert!(Report::from_log("", 1).is_err());
         assert!(Report::from_log(r#"{"type":"req"}"#, 1).is_err());
         assert!(Report::from_log(r#"{"type":"manifest"}"#, 1).is_err());
+    }
+
+    /// Runs of open-loop traffic at 100 req/s (a request every 10 ms inside
+    /// each `[from, to)` in ms, seq continuing across runs), with the
+    /// jitter and service times of the golden single-run values: arrival
+    /// `+ (seq % 7) * 100 µs`, service `2 ms + (seq % 5) * 1 ms`.
+    fn runs_log(runs: &[(u64, u64)], stalls: &str) -> String {
+        let mut lines = vec![format!(r#"{{"type":"manifest","stalls":{stalls}}}"#)];
+        let mut seq = 0u64;
+        for &(from, to) in runs {
+            for t in (from..to).step_by(10) {
+                let arrival = t * MS + (seq % 7) * 100_000;
+                let sent = arrival + 2 * MS + (seq % 5) * MS;
+                lines.push(format!(
+                    r#"{{"type":"req","seq":{seq},"arrival_ns":{arrival},"sent_ns":{sent}}}"#
+                ));
+                seq += 1;
+            }
+        }
+        lines.join("\n") + "\n"
+    }
+
+    const PERIOD: i64 = 10 * MS as i64;
+
+    #[test]
+    fn one_run_is_what_it_was_golden() {
+        let report = Report::from_log(&runs_log(&[(0, 3_000)], "[]"), PERIOD).unwrap();
+        assert_eq!(report.runs.len(), 1);
+        assert_eq!(report.origin_ns, 0);
+        // Hand-computed: truth = 2 ms + (i % 7) * 0.1 ms + (i % 5) * 1 ms.
+        assert_eq!(report.truth().0, [4_300_000, 6_600_000, 6_600_000, 6_600_000]);
+        assert_eq!(report.server().0, [4_000_000, 6_000_000, 6_000_000, 6_000_000]);
+        // And exactly the single-origin formula, request for request.
+        let times: Vec<Completed> = report
+            .requests
+            .iter()
+            .map(|r| Completed {
+                seq: r.seq,
+                arrival_ns: (r.seq * 10 * MS + (r.seq % 7) * 100_000),
+                sent_ns: (r.seq * 10 * MS + (r.seq % 7) * 100_000) + 2 * MS + (r.seq % 5) * MS,
+            })
+            .collect();
+        let (origin, truth) = open_loop_truth(&times, PERIOD).unwrap();
+        assert_eq!(origin, report.origin_ns);
+        assert_eq!(truth, report.requests.iter().map(|r| r.truth_ns).collect::<Vec<_>>());
+        let text = report.text("one.jsonl", 100);
+        assert!(
+            text.contains("answered 300   abandoned 0   stalls none   runs 1"),
+            "{text}"
+        );
+        assert!(!text.contains("separate runs"), "{text}");
+    }
+
+    #[test]
+    fn two_runs_with_a_gap_are_scored_per_run() {
+        // Two 3 s runs at 100 req/s on one phantom, 6 s apart. Over one
+        // schedule the second run is ~6 s late.
+        let text = runs_log(&[(0, 3_000), (9_000, 12_000)], "[]");
+        let report = Report::from_log(&text, PERIOD).unwrap();
+        assert_eq!(report.runs.len(), 2, "{:?}", report.runs);
+        assert_eq!((report.runs[0].arrivals, report.runs[1].arrivals), (300, 300));
+        // Pooled over both runs, the same numbers as one run alone.
+        assert_eq!(report.truth().0, [4_300_000, 6_600_000, 6_600_000, 6_600_000]);
+        assert_eq!(report.server().p99(), 6_000_000);
+        let one_origin = open_loop_truth(
+            &report
+                .arrivals_ns
+                .iter()
+                .zip(&report.requests)
+                .map(|(&a, r)| Completed {
+                    seq: r.seq,
+                    arrival_ns: a,
+                    sent_ns: a + 2 * MS + (r.seq % 5) * MS,
+                })
+                .collect::<Vec<_>>(),
+            PERIOD,
+        )
+        .unwrap()
+        .1;
+        assert!(
+            one_origin.iter().max().unwrap() > &(5_900 * MS as i64),
+            "the failure this fixes"
+        );
+        let out = report.text("two.jsonl", 100);
+        assert!(out.contains("runs 2"), "{out}");
+        assert!(
+            out.replace("\n  ", " ").contains(
+                "2 separate runs found (gaps of 6.0 s); truth is computed per run. \
+For a clean result use a fresh phantom per run."
+            ),
+            "{out}"
+        );
+        // The timeline starts at the first run's origin and covers the gap.
+        let last = report.requests.last().unwrap();
+        assert!(
+            (11_000 * MS as i64..=12_000 * MS as i64).contains(&last.intended_ns),
+            "{}",
+            last.intended_ns
+        );
+    }
+
+    #[test]
+    fn three_runs() {
+        let text = runs_log(&[(0, 2_000), (5_000, 7_000), (30_000, 32_000)], "[]");
+        let report = Report::from_log(&text, PERIOD).unwrap();
+        assert_eq!(report.runs.len(), 3, "{:?}", report.runs);
+        assert_eq!(
+            report.runs.iter().map(|r| r.arrivals).collect::<Vec<_>>(),
+            [200, 200, 200]
+        );
+        assert_eq!(report.truth().p99(), 6_600_000);
+        let out = report.text("three.jsonl", 100).replace("\n  ", " ");
+        assert!(out.contains("3 separate runs found (gaps of 3.0 s, 23.0 s)"), "{out}");
+    }
+
+    #[test]
+    fn what_ends_a_run() {
+        let at = |ms: &[u64]| ms.iter().map(|m| m * MS).collect::<Vec<_>>();
+        // 100 req/s: a gap over 1 s ends a run, 1 s itself does not.
+        let runs = |extra: u64| find_runs(&at(&[0, 10, 20, 30, 30 + extra, 40 + extra]), &[]);
+        assert_eq!(runs(1_000).len(), 1);
+        assert_eq!(runs(1_001).len(), 2);
+        // 10 req/s: the threshold is 20 x 100 ms = 2 s.
+        let slow = |gap: u64| find_runs(&at(&[0, 100, 200, 300, 300 + gap, 400 + gap]), &[]);
+        assert_eq!(slow(1_500).len(), 1);
+        assert_eq!(slow(2_001).len(), 2);
+        assert_eq!(run_gap_threshold_ns(100 * MS), 2_000 * MS);
+        assert_eq!(run_gap_threshold_ns(MS), MIN_RUN_GAP_NS);
+        assert!(find_runs(&[], &[]).is_empty());
+        assert_eq!(find_runs(&[5], &[]).len(), 1);
+        // A closed-loop client that sent nothing through a 3 s freeze is
+        // waiting, not idle; the same gap with no stall is two runs.
+        let gap = at(&[0, 10, 20, 990, 4_001, 4_011]);
+        assert_eq!(find_runs(&gap, &[(1_000 * MS, 4_000 * MS)]).len(), 1);
+        assert_eq!(find_runs(&gap, &[]).len(), 2);
+        // A stall far from the gap does not excuse it.
+        assert_eq!(find_runs(&gap, &[(20_000 * MS, 21_000 * MS)]).len(), 2);
+        let far = at(&[0, 10, 20, 30, 7_000, 7_010]);
+        assert_eq!(find_runs(&far, &[(5_000 * MS, 5_500 * MS)]).len(), 2);
+    }
+
+    #[test]
+    fn a_log_cut_off_mid_json_loses_only_its_last_line() {
+        let whole = runs_log(&[(0, 1_000)], "[]");
+        let cut = format!("{whole}{}", r#"{"type":"req","seq":100,"arrival_ns":1000000"#);
+        let report = Report::from_log(&cut, PERIOD).unwrap();
+        assert!(report.ignored_incomplete_line);
+        assert_eq!(report.requests.len(), 100);
+        let text = report.text("cut.jsonl", 100);
+        assert!(text.contains("ignored 1 incomplete final line"), "{text}");
+        assert!(!Report::from_log(&whole, PERIOD).unwrap().ignored_incomplete_line);
+        // A bad line that ends in a newline is damage, not a log in progress;
+        // so is a bad line in the middle, and a cut manifest.
+        assert!(Report::from_log(&format!("{whole}{{oops\n"), PERIOD).is_err());
+        assert!(Report::from_log(&whole.replacen("\"seq\":3,", "{", 1), PERIOD).is_err());
+        assert!(Report::from_log(r#"{"type":"manifest","stal"#, PERIOD).is_err());
+    }
+
+    #[test]
+    fn the_logs_rate_is_measured_and_checked_against_rate() {
+        let text = runs_log(&[(0, 3_000)], "[]");
+        let report = Report::from_log(&text, PERIOD).unwrap();
+        let rate = report.measured_rate_per_s.unwrap();
+        assert!((95.0..=105.0).contains(&rate), "{rate}");
+        let out = report.text("one.jsonl", 100);
+        assert!(out.contains("arrival rate in the log: 99.0 /s"), "{out}");
+        assert!(!out.contains("warning"), "{out}");
+        // Within 20% of --rate: no warning (110 against a measured ~99).
+        let near = Report::from_log(&text, (NS_PER_S / 110.0) as i64).unwrap();
+        assert!(!near.text("l", 100).contains("warning"));
+        // Further than that: a warning with both numbers.
+        let off = Report::from_log(&text, (NS_PER_S / 200.0) as i64)
+            .unwrap()
+            .text("l", 100);
+        assert!(
+            off.contains("warning: the log's arrival rate is 99.0 /s but --rate is 200 /s"),
+            "{off}"
+        );
+        // The longest run decides, not the idle time between runs.
+        let two = Report::from_log(&runs_log(&[(0, 1_000), (9_000, 12_000)], "[]"), PERIOD).unwrap();
+        assert!((95.0..=105.0).contains(&two.measured_rate_per_s.unwrap()));
+        // One arrival has no rate.
+        let single = Report::from_log(&runs_log(&[(0, 10)], "[]"), PERIOD).unwrap();
+        assert_eq!(single.measured_rate_per_s, None);
+    }
+
+    #[test]
+    fn the_terminal_chart_is_at_most_100_columns() {
+        let report = Report::from_log(&runs_log(&[(0, 3_000)], "[]"), PERIOD).unwrap();
+        for width in [120, 300] {
+            let text = report.text("one.jsonl", width);
+            let widest = text.lines().map(|l| l.chars().count()).max().unwrap();
+            assert!(widest <= 100, "{width}: {widest}\n{text}");
+        }
+        let text = report.text("one.jsonl", 100);
+        assert!(text.lines().any(|l| l.chars().count() == 100), "{text}");
+        // Narrower terminals still get what fit before.
+        let text = report.text("one.jsonl", 80);
+        assert!(text.lines().map(|l| l.chars().count()).max().unwrap() <= 100);
+    }
+
+    #[test]
+    fn a_stall_with_no_traffic_before_it_is_flagged() {
+        let stall = r#"[{"start_ms":5000,"len_ms":500}]"#;
+        let report = Report::from_log(&runs_log(&[(0, 3_000), (9_000, 11_000)], stall), PERIOD).unwrap();
+        assert!(report.stall_passed_unobserved());
+        let out = report.text("l", 100).replace("\n  ", " ");
+        assert!(
+            out.contains("stall window passed before any traffic arrived; start a fresh phantom for each run"),
+            "{out}"
+        );
+        let busy = Report::from_log(&runs_log(&[(0, 3_000)], r#"[{"start_ms":1000,"len_ms":500}]"#), PERIOD).unwrap();
+        assert!(!busy.stall_passed_unobserved());
+        assert!(!busy.text("l", 100).contains("stall window passed"));
     }
 }
