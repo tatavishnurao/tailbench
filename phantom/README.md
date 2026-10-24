@@ -48,7 +48,7 @@ phantom: stopped at t = 6.0 s: 600 answered, 0 abandoned
 
 logs: /tmp/phantom-demo-73177/naive.jsonl
       /tmp/phantom-demo-73177/tailbench.jsonl
-next: phantom report --rate 100 /tmp/phantom-demo-73177/naive.jsonl --html out.html
+next: phantom report --rate 100 /tmp/phantom-demo-73177/naive.jsonl --html /tmp/phantom-report.html
 ```
 
 To watch another load generator, serve with `--live` and point it at phantom (use a fresh phantom for each run: its clock starts at the first request, and a stall window is placed on that clock):

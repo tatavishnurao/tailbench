@@ -149,7 +149,7 @@ fn run_demo() -> io::Result<ExitCode> {
     println!("logs: {}", logs[0].display());
     println!("      {}", logs[1].display());
     println!(
-        "next: phantom report --rate {RATE} {} --html out.html",
+        "next: phantom report --rate {RATE} {} --html /tmp/phantom-report.html",
         logs[0].display()
     );
     if failed > 0 {
