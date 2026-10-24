@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::time::Instant;
 
-use crate::report::{Completed, Percentiles, open_loop_truth};
+use crate::report::{Completed, Percentiles, Run, gap_starts_run, open_loop_truth, run_gap_threshold_ns};
 
 /// One bucket of the timeline: 100 ms.
 pub const BUCKET_NS: u64 = 100_000_000;
@@ -29,6 +29,14 @@ const BUCKETS_PER_S: u64 = 1_000_000_000 / BUCKET_NS;
 /// The freeze check needs at least this many arrivals in the interval before
 /// a stall.
 pub const MIN_ARRIVALS_BEFORE: u64 = 20;
+
+/// With no arrival for this long (and no stall window running), the panel
+/// is idle: it shows the last run greyed instead of a verdict.
+pub const IDLE_AFTER_NS: u64 = 2_000_000_000;
+
+/// Shown in place of the verdict when the stall window passed with fewer
+/// than [`MIN_ARRIVALS_BEFORE`] arrivals before it.
+pub const STALL_UNOBSERVED: &str = "stall window passed before any traffic arrived; start a fresh phantom for each run";
 
 /// The "users waited" bar turns red above this multiple of the tool's p99.
 pub const RED_RATIO: f64 = 3.0;
@@ -174,15 +182,70 @@ impl Numbers {
 }
 
 impl Snapshot {
-    /// The intended rate, per second: the median of arrivals per complete
-    /// 100 ms bucket, leaving out buckets that touch a stall window, the
-    /// still-filling last bucket, and the idle ones after the last arrival.
+    /// The runs in the arrivals, at the resolution of the 100 ms buckets:
+    /// split at gaps longer than `max(1 s, 20 x the median inter-arrival)`
+    /// (the same rule as `phantom report`, [`gap_starts_run`]; the median
+    /// inter-arrival is estimated as 100 ms over the median nonzero bucket).
+    /// A run starts at its first bucket's start and ends at its last
+    /// bucket's end.
+    pub fn runs(&self) -> Vec<Run> {
+        let active: Vec<(usize, u64)> = self
+            .arrivals
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, a)| a > 0)
+            .collect();
+        let mut per_arrival: Vec<u64> = active.iter().map(|&(_, a)| BUCKET_NS / a).collect();
+        per_arrival.sort_unstable();
+        let threshold = run_gap_threshold_ns(per_arrival.get(per_arrival.len() / 2).copied().unwrap_or(0));
+        let stalls: Vec<(u64, u64)> = self.stalls.iter().map(|s| (s.start_ns, s.end_ns)).collect();
+        let mut runs: Vec<Run> = Vec::new();
+        for &(k, count) in &active {
+            let (lo, hi) = (k as u64 * BUCKET_NS, (k as u64 + 1) * BUCKET_NS);
+            match runs.last_mut() {
+                Some(run) if !gap_starts_run(run.end_ns - BUCKET_NS, lo, threshold, &stalls) => {
+                    run.end_ns = hi;
+                    run.arrivals += count as usize;
+                }
+                _ => runs.push(Run {
+                    start_ns: lo,
+                    end_ns: hi,
+                    arrivals: count as usize,
+                }),
+            }
+        }
+        runs
+    }
+
+    /// The run the last arrival belongs to.
+    pub fn current_run(&self) -> Option<Run> {
+        self.runs().pop()
+    }
+
+    /// Whether `now` is past [`IDLE_AFTER_NS`] without an arrival, outside
+    /// the stall windows (a closed-loop client sends nothing while the
+    /// server is frozen, and that is not idleness).
+    pub fn is_idle(&self) -> bool {
+        let (Some(now), Some(run)) = (self.now_ns, self.current_run()) else {
+            return false;
+        };
+        let frozen = self.stalls.iter().any(|s| (s.start_ns..s.end_ns).contains(&now));
+        now.saturating_sub(run.end_ns) > IDLE_AFTER_NS && !frozen
+    }
+
+    /// The intended rate of the current run, per second: the median of
+    /// arrivals per complete 100 ms bucket, leaving out buckets that touch a
+    /// stall window, the still-filling last bucket, and the idle ones after
+    /// the last arrival.
     pub fn intended_rate_per_s(&self) -> Option<f64> {
+        let first = self.current_run().map_or(0, |r| (r.start_ns / BUCKET_NS) as usize);
         let complete = self.arrivals.len().saturating_sub(1);
         let last_active = self.arrivals[..complete].iter().rposition(|&a| a > 0)?;
         let mut counts: Vec<u64> = self.arrivals[..=last_active]
             .iter()
             .enumerate()
+            .skip(first)
             .filter(|&(k, _)| {
                 let (lo, hi) = (k as u64 * BUCKET_NS, (k as u64 + 1) * BUCKET_NS);
                 !self.stalls.iter().any(|s| s.start_ns < hi && s.end_ns > lo)
@@ -199,13 +262,21 @@ impl Snapshot {
         (median > 0.0).then_some(median * BUCKETS_PER_S as f64)
     }
 
-    /// The two p99s so far, the tool's estimated from server time.
+    /// The two p99s of the current run, the tool's estimated from server
+    /// time.
     pub fn numbers(&self) -> Numbers {
-        let server = Percentiles::of(self.completed.iter().map(|r| r.sent_ns as i64 - r.arrival_ns as i64));
+        let from = self.current_run().map_or(0, |r| r.start_ns);
+        let completed: Vec<Completed> = self
+            .completed
+            .iter()
+            .copied()
+            .filter(|r| r.arrival_ns >= from)
+            .collect();
+        let server = Percentiles::of(completed.iter().map(|r| r.sent_ns as i64 - r.arrival_ns as i64));
         let rate = self.intended_rate_per_s();
         let truth = rate.and_then(|rate| {
             let period_ns = (1e9 / rate).round() as i64;
-            let (_, truth) = open_loop_truth(&self.completed, period_ns)?;
+            let (_, truth) = open_loop_truth(&completed, period_ns)?;
             Percentiles::of(truth)
         });
         Numbers {
@@ -285,18 +356,34 @@ pub fn render_panel(header: &PanelHeader, snap: &Snapshot, numbers: &Numbers, wi
         Some(title) => format!("phantom · {title}"),
         None => format!("phantom · watching {}", header.listen),
     };
-    let right = snap
-        .now_ns
-        .map_or_else(|| "t = –".to_owned(), |ns| format!("t = {:.1} s", ns as f64 / 1e9));
-    if left.chars().count() + 2 + right.chars().count() <= w {
-        let gap = w - left.chars().count() - right.chars().count();
-        out.push(Out::Laid(vec![
-            (left, Style::Bold),
-            (" ".repeat(gap), Style::Plain),
-            (right, Style::Dim),
-        ]));
+    let run = snap.current_run();
+    let run_start = run.map_or(0, |r| r.start_ns);
+    // Elapsed since the current run began; once a run has begun after the
+    // first, the total (since the first request) follows, dim.
+    let (right, uptime) = match snap.now_ns {
+        None => ("t = –".to_owned(), None),
+        Some(ns) => (
+            format!("t = {:.1} s", ns.saturating_sub(run_start) as f64 / 1e9),
+            (run_start > 0).then(|| format!("  up {:.1} s", ns as f64 / 1e9)),
+        ),
+    };
+    let right_w = right.chars().count() + uptime.as_ref().map_or(0, |u| u.chars().count());
+    if left.chars().count() + 2 + right_w <= w {
+        let gap = w - left.chars().count() - right_w;
+        let mut parts = vec![(left, Style::Bold), (" ".repeat(gap), Style::Plain)];
+        match uptime {
+            Some(up) => {
+                parts.push((right, Style::Plain));
+                parts.push((up, Style::Dim));
+            }
+            None => parts.push((right, Style::Dim)),
+        }
+        out.push(Out::Laid(parts));
     } else {
-        out.push(Out::Text(format!("{left}  {right}"), Style::Bold));
+        out.push(Out::Text(
+            format!("{left}  {right}{}", uptime.unwrap_or_default()),
+            Style::Bold,
+        ));
     }
     out.push(Out::Text(String::new(), Style::Plain));
 
@@ -308,30 +395,43 @@ pub fn render_panel(header: &PanelHeader, snap: &Snapshot, numbers: &Numbers, wi
         return finish(out, w, color);
     };
 
-    // The whole run, several buckets per column if it does not fit.
+    // The current run, from its first bucket to now (to its last arrival
+    // when idle), several buckets per column if it does not fit.
+    let idle = snap.is_idle();
+    let first = (run_start / BUCKET_NS) as usize;
+    let last = match run {
+        Some(r) if idle => ((r.end_ns / BUCKET_NS) as usize).min(snap.arrivals.len()),
+        _ => snap.arrivals.len(),
+    };
+    let buckets = &snap.arrivals[first.min(last)..last];
     let spark_w = w.saturating_sub(LABEL_W).max(8);
-    let per_column = snap.arrivals.len().div_ceil(spark_w);
-    let columns: Vec<(u64, u64, u64)> = snap
-        .arrivals
+    let per_column = buckets.len().div_ceil(spark_w).max(1);
+    let median = median_of(buckets);
+    // The bucket still filling is not a gap.
+    let filling = (!idle && !buckets.is_empty()).then(|| buckets.len() - 1);
+    let is_low = |k: usize, a: u64| a * 10 < median && Some(k) != filling;
+    let columns: Vec<(u64, bool, u64, u64)> = buckets
         .chunks(per_column)
         .enumerate()
         .map(|(c, chunk)| {
-            let lo = (c * per_column) as u64;
+            let lo = (first + c * per_column) as u64;
             (
-                chunk.iter().sum(),
+                chunk.iter().copied().max().unwrap_or(0),
+                chunk.iter().enumerate().any(|(i, &a)| is_low(c * per_column + i, a)),
                 lo * BUCKET_NS,
                 (lo + chunk.len() as u64) * BUCKET_NS,
             )
         })
         .collect();
-    let arrivals: Vec<u64> = columns.iter().map(|c| c.0).collect();
+    let arrivals: Vec<(u64, bool)> = columns.iter().map(|c| (c.0, c.1)).collect();
     out.push(Out::Laid(vec![
         (format!("{:LABEL_W$}", "requests arriving"), Style::Plain),
-        (sparkline(&arrivals), Style::Plain),
+        (sparkline_marked(&arrivals), Style::Plain),
     ]));
+    let stall = snap.stalls.first();
     if !snap.stalls.is_empty() {
         let mut parts = vec![(format!("{:LABEL_W$}", "server frozen"), Style::Plain)];
-        for &(_, lo, hi) in &columns {
+        for &(_, _, lo, hi) in &columns {
             let frozen = snap.stalls.iter().any(|s| s.start_ns < hi && s.end_ns > lo);
             parts.push(if frozen {
                 ("█".to_owned(), Style::Red)
@@ -343,11 +443,16 @@ pub fn render_panel(header: &PanelHeader, snap: &Snapshot, numbers: &Numbers, wi
     }
     out.push(Out::Text(String::new(), Style::Plain));
 
-    out.push(Out::Text("p99 latency".to_owned(), Style::Bold));
-    out.extend(p99_rows(numbers, w, width >= BARS_MIN_WIDTH));
+    out.push(Out::Text(
+        if idle { "p99 latency (last run)" } else { "p99 latency" }.to_owned(),
+        if idle { Style::Dim } else { Style::Bold },
+    ));
+    out.extend(p99_rows(numbers, w, width >= BARS_MIN_WIDTH, idle));
     out.push(Out::Text(String::new(), Style::Plain));
 
-    if let Some(first) = snap.stalls.first() {
+    if idle {
+        out.push(Out::Text("idle: waiting for traffic".to_owned(), Style::Dim));
+    } else if let Some(first) = stall {
         if now < first.start_ns {
             out.push(Out::Text(freeze_scheduled(first), Style::Dim));
         } else if now < first.end_ns {
@@ -355,6 +460,10 @@ pub fn render_panel(header: &PanelHeader, snap: &Snapshot, numbers: &Numbers, wi
                 format!("server frozen until {:.1} s", first.end_ns as f64 / 1e9),
                 Style::Dim,
             ));
+        } else if first.before < MIN_ARRIVALS_BEFORE {
+            out.push(Out::Text(STALL_UNOBSERVED.to_owned(), Style::Dim));
+        } else if first.end_ns <= run_start {
+            // Judged in an earlier run; this run has no window of its own.
         } else {
             let verdict = first.verdict();
             let style = match verdict {
@@ -367,7 +476,7 @@ pub fn render_panel(header: &PanelHeader, snap: &Snapshot, numbers: &Numbers, wi
     if let Some(rate) = numbers.rate_per_s {
         let footnote = if numbers.measured {
             format!("your tool's own p99; users waited: truth from phantom's log at {rate:.0} req/s")
-        } else if snap.stalls.is_empty() {
+        } else if stall.is_none_or(|s| s.end_ns <= run_start) {
             format!("assumes {rate:.0} req/s intended, the median rate measured")
         } else {
             format!("assumes {rate:.0} req/s intended, the rate measured outside the freeze")
@@ -382,7 +491,7 @@ pub fn render_panel(header: &PanelHeader, snap: &Snapshot, numbers: &Numbers, wi
 /// value right-aligned after it; without, just the labels and values.
 /// "users waited" is red when it is more than [`RED_RATIO`] times the tool's
 /// p99, and otherwise both bars are green.
-fn p99_rows(numbers: &Numbers, w: usize, bars: bool) -> Vec<Out> {
+fn p99_rows(numbers: &Numbers, w: usize, bars: bool, grey: bool) -> Vec<Out> {
     let tool_label = if numbers.measured {
         "your tool reports"
     } else {
@@ -393,7 +502,9 @@ fn p99_rows(numbers: &Numbers, w: usize, bars: bool) -> Vec<Out> {
         ("users waited", numbers.truth_p99_ns),
     ];
     let red = numbers.ratio().is_some_and(|r| r > RED_RATIO);
-    let styles = if red {
+    let styles = if grey {
+        [Style::Dim, Style::Dim]
+    } else if red {
         [Style::Plain, Style::Red]
     } else {
         [Style::Green, Style::Green]
@@ -414,7 +525,7 @@ fn p99_rows(numbers: &Numbers, w: usize, bars: bool) -> Vec<Out> {
             }
             let pad = value_w - value.chars().count();
             parts.push((" ".repeat(pad), Style::Plain));
-            parts.push((value, Style::Bold));
+            parts.push((value, if grey { Style::Dim } else { Style::Bold }));
             Out::Laid(parts)
         })
         .collect()
@@ -494,6 +605,25 @@ pub fn sparkline(values: &[u64]) -> String {
         .collect()
 }
 
+/// [`sparkline`] for `(value, low)` pairs: the scale is the largest value,
+/// but a `low` column is always the lowest level, so that a merged column
+/// holding a near-empty bucket still shows it.
+fn sparkline_marked(values: &[(u64, bool)]) -> String {
+    let plain: Vec<u64> = values.iter().map(|v| v.0).collect();
+    sparkline(&plain)
+        .chars()
+        .zip(values)
+        .map(|(c, &(_, low))| if low { LEVELS[0] } else { c })
+        .collect()
+}
+
+/// The median of `values` (the upper middle for an even count); 0 for none.
+fn median_of(values: &[u64]) -> u64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted.get(sorted.len() / 2).copied().unwrap_or(0)
+}
+
 /// Lays out `lines` at most `width` visible characters wide: text is
 /// word-wrapped with a two-space hanging indent (a word longer than a line
 /// is split across lines, never cut) and then styled line by line, so a
@@ -520,7 +650,7 @@ fn finish(lines: Vec<Out>, width: usize, color: bool) -> String {
 
 /// `text` word-wrapped to `width`, continuations with a two-space hanging
 /// indent; nothing is cut.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     if text.chars().count() <= width {
         return vec![text.to_owned()];
     }
@@ -938,5 +1068,226 @@ mod tests {
         assert_eq!(lines.concat().chars().filter(|&c| c == 'x').count(), 130);
         assert!(lines.iter().all(|l| l.chars().count() <= 59));
         assert!(lines[1..].iter().all(|l| l.starts_with(HANGING_INDENT)));
+    }
+
+    /// Open-loop traffic at 100 req/s in each of `runs` ([start, end) in
+    /// ms), 1 ms service, seq continuing across runs; seen at `now_ms`.
+    fn runs_snapshot(runs: &[(u64, u64)], stall: Option<(u64, u64)>, now_ms: u64) -> Snapshot {
+        let windows: Vec<(u64, u64)> = stall.into_iter().map(|(s, e)| (s * MS, e * MS)).collect();
+        let m = Monitor::new(&windows);
+        let t0 = Instant::now();
+        let mut seq = 0;
+        for &(from, to) in runs {
+            for arrival_ms in (from..to).step_by(10) {
+                let arrival = arrival_ms * MS;
+                if arrival >= now_ms * MS {
+                    break;
+                }
+                m.arrive(t0, arrival);
+                let held = windows
+                    .iter()
+                    .find(|&&(s, e)| (s..e).contains(&arrival))
+                    .map_or(arrival, |&(_, e)| e);
+                let sent = held + 4 * MS;
+                if sent < now_ms * MS {
+                    m.finish(Some(Completed {
+                        seq,
+                        arrival_ns: arrival,
+                        sent_ns: sent,
+                    }));
+                }
+                seq += 1;
+            }
+        }
+        m.snapshot_at(Some(now_ms * MS))
+    }
+
+    #[test]
+    fn numbers_cover_the_current_run_only() {
+        // Two 3 s runs, a 6 s gap: the second run's numbers are its own, not
+        // 6 s of idle time as lateness.
+        let snap = runs_snapshot(&[(0, 3_000), (9_000, 12_000)], None, 12_000);
+        let runs = snap.runs();
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[1].start_ns, 9_000 * MS);
+        let numbers = snap.numbers();
+        assert_eq!(numbers.rate_per_s, Some(100.0));
+        assert_eq!(numbers.tool_p99_ns, Some(4 * MS as i64));
+        let truth = numbers.truth_p99_ns.unwrap();
+        assert!(truth <= 5 * MS as i64, "truth {truth} ns");
+        let panel = panel(&snap, 100, false);
+        assert!(
+            panel.contains("✓ Your load tool kept sending") || !panel.contains('✗'),
+            "{panel}"
+        );
+        // One run: the same thing, request for request.
+        let one = runs_snapshot(&[(0, 3_000)], None, 3_000);
+        assert_eq!(one.runs().len(), 1);
+        assert_eq!(one.numbers().truth_p99_ns, Some(4 * MS as i64));
+    }
+
+    #[test]
+    fn a_gap_a_stall_explains_does_not_split_the_run() {
+        // Closed loop through a 3 s freeze: a 3 s gap in arrivals, one run.
+        let m = Monitor::new(&[(1_000 * MS, 4_000 * MS)]);
+        let t0 = Instant::now();
+        for ms in (0..1_000).step_by(10).chain((4_001..6_000).step_by(10)) {
+            m.arrive(t0, ms * MS);
+        }
+        let snap = m.snapshot_at(Some(6_000 * MS));
+        assert_eq!(snap.runs().len(), 1, "{:?}", snap.runs());
+        // The same gap with no stall is idle time: two runs.
+        let m = Monitor::new(&[]);
+        for ms in (0..1_000).step_by(10).chain((4_001..6_000).step_by(10)) {
+            m.arrive(t0, ms * MS);
+        }
+        assert_eq!(m.snapshot_at(Some(6_000 * MS)).runs().len(), 2);
+    }
+
+    #[test]
+    fn idle_shows_the_last_run_greyed_and_no_verdict() {
+        let stall = Some((2_000, 2_500));
+        let busy = runs_snapshot(&[(0, 5_000)], stall, 5_000);
+        let p = visible(&panel(&busy, 100, true));
+        assert!(!p.contains("idle") && !p.contains("(last run)"), "{p}");
+        assert!(p.contains('✓'), "{p}");
+        // 2.0 s after the last arrival is not yet idle; 2.5 s is.
+        let almost = runs_snapshot(&[(0, 5_000)], stall, 6_990);
+        assert!(!almost.is_idle());
+        let snap = runs_snapshot(&[(0, 5_000)], stall, 7_500);
+        assert!(snap.is_idle());
+        let colored = panel(&snap, 100, true);
+        let p = visible(&colored);
+        assert!(p.contains("idle: waiting for traffic"), "{p}");
+        assert!(p.contains("p99 latency (last run)"), "{p}");
+        assert!(!p.contains('✓') && !p.contains('✗'), "{p}");
+        // The last result is still there, in the dim style.
+        assert!(colored.contains("\x1b[2mp99 latency (last run)"), "{colored}");
+        let tool = fmt_p99(snap.numbers().tool_p99_ns);
+        assert!(colored.contains(&format!("\x1b[2m{tool}\x1b[0m")), "{colored}");
+        assert!(!colored.contains("\x1b[1;32m█"), "{colored}");
+        // A frozen server is not idle, whatever the client does.
+        let m = Monitor::new(&[(1_000 * MS, 6_000 * MS)]);
+        let t0 = Instant::now();
+        for ms in (0..1_000).step_by(10) {
+            m.arrive(t0, ms * MS);
+        }
+        assert!(!m.snapshot_at(Some(5_000 * MS)).is_idle());
+    }
+
+    #[test]
+    fn a_stall_before_any_traffic_gets_no_verdict() {
+        // One probe at t0, then the load tool starts at 2.6 s: the 2.0–2.5 s
+        // window had no traffic before it.
+        let m = Monitor::new(&[(2_000 * MS, 2_500 * MS)]);
+        let t0 = Instant::now();
+        m.arrive(t0, 0);
+        for ms in (2_600..5_000).step_by(10) {
+            m.arrive(t0, ms * MS);
+        }
+        let snap = m.snapshot_at(Some(5_000 * MS));
+        let p = panel(&snap, 100, false);
+        assert!(
+            p.replace("\n  ", " ")
+                .contains("stall window passed before any traffic arrived; start a fresh phantom for each run"),
+            "{p}"
+        );
+        assert!(!p.contains('✓') && !p.contains('✗'), "{p}");
+        // With traffic before the window, the verdict is back.
+        let p = panel(&runs_snapshot(&[(0, 5_000)], Some((2_000, 2_500)), 5_000), 100, false);
+        assert!(p.contains('✓') && !p.contains("stall window passed"), "{p}");
+        // 19 arrivals before it is not enough; 20 is.
+        let before = |n: u64| {
+            let m = Monitor::new(&[(1_000 * MS, 1_500 * MS)]);
+            let t0 = Instant::now();
+            for i in 0..n {
+                m.arrive(t0, 500 * MS + i * 20 * MS);
+            }
+            // The client keeps sending through and after the window.
+            for ms in (1_000..3_000).step_by(20) {
+                m.arrive(t0, ms * MS);
+            }
+            panel(&m.snapshot_at(Some(3_000 * MS)), 100, false)
+        };
+        assert!(before(19).contains("stall window passed"), "{}", before(19));
+        let twenty = before(20);
+        assert!(!twenty.contains("stall window passed"), "{twenty}");
+        assert!(twenty.contains('✓'), "{twenty}");
+    }
+
+    #[test]
+    fn the_header_shows_time_in_the_current_run_and_total_uptime() {
+        let one = visible(&panel(&runs_snapshot(&[(0, 3_000)], None, 3_000), 100, true));
+        assert!(one.lines().next().unwrap().ends_with("t = 3.0 s"), "{one}");
+        assert!(!one.contains(" up "), "{one}");
+        let two = runs_snapshot(&[(0, 3_000), (9_000, 12_000)], None, 11_000);
+        let colored = panel(&two, 100, true);
+        let first = visible(&colored).lines().next().unwrap().to_owned();
+        assert!(first.ends_with("t = 2.0 s  up 11.0 s"), "{first:?}");
+        assert_eq!(first.chars().count(), MAX_WIDTH, "{first:?}");
+        // The total is dim.
+        assert!(colored.contains("\x1b[2m  up 11.0 s\x1b[0m"), "{colored}");
+    }
+
+    /// The characters of the arrivals row and the frozen row after the label.
+    fn rows(panel: &str) -> (Vec<char>, Vec<char>) {
+        let row = |label: &str| -> Option<Vec<char>> {
+            Some(
+                panel
+                    .lines()
+                    .find(|l| l.starts_with(label))?
+                    .chars()
+                    .skip(LABEL_W)
+                    .collect(),
+            )
+        };
+        (
+            row("requests arriving").unwrap_or_else(|| panic!("no arrivals row in\n{panel}")),
+            row("server frozen").unwrap_or_default(),
+        )
+    }
+
+    #[test]
+    fn the_timeline_is_scaled_to_the_current_run_and_shows_a_short_freeze() {
+        // A 10 s run at 100 req/s with nothing arriving from 2.0 to 2.5 s.
+        let m = Monitor::new(&[(2_000 * MS, 2_500 * MS)]);
+        let t0 = Instant::now();
+        for ms in (0..9_950).step_by(10).filter(|ms| !(2_000..2_500).contains(ms)) {
+            m.arrive(t0, ms * MS);
+        }
+        let snap = m.snapshot_at(Some(9_950 * MS));
+        for width in [60, 100] {
+            let p = visible(&panel(&snap, width, false));
+            let (arriving, frozen) = rows(&p);
+            assert_eq!(arriving.len(), frozen.len(), "{width}:\n{p}");
+            let under: Vec<usize> = (0..frozen.len()).filter(|&i| frozen[i] == '█').collect();
+            assert!(!under.is_empty(), "{width}:\n{p}");
+            // Lower exactly under the stall marker, and nowhere else.
+            let low: Vec<usize> = (0..arriving.len()).filter(|&i| arriving[i] == '▁').collect();
+            assert_eq!(low, under, "{width}:\n{p}");
+            // About 5% of the row: 0.5 s of 10 s, to within a column or two.
+            let share = under.len() as f64 / arriving.len() as f64;
+            assert!((0.03..=0.09).contains(&share), "{width}: {share}\n{p}");
+            // Everything else is up at the top of the scale (the last
+            // column is the bucket still filling).
+            let settled = &arriving[..arriving.len() - 1];
+            assert!(
+                settled.iter().filter(|&&c| c != '▁').all(|&c| c >= '▇'),
+                "{width}:\n{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_timeline_starts_at_the_current_run_and_never_splits_100_ms() {
+        // Run 2 is 3 s long, 9 s in: its row is 30 columns of 100 ms, and
+        // the first run is not in it.
+        let snap = runs_snapshot(&[(0, 3_000), (9_000, 12_000)], None, 11_990);
+        let (arriving, _) = rows(&visible(&panel(&snap, 100, false)));
+        assert_eq!(arriving.len(), 30, "{arriving:?}");
+        assert!(arriving.iter().all(|&c| c >= '▇'), "{arriving:?}");
+        // Idle: the row stops at the run's last arrival.
+        let idle = runs_snapshot(&[(0, 3_000)], None, 8_000);
+        assert_eq!(rows(&visible(&panel(&idle, 100, false))).0.len(), 30);
     }
 }
