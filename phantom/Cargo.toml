@@ -1,6 +1,6 @@
 [package]
 name = "tailbench-phantom"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 # The lowest toolchain that checks the workspace (--all-targets) with Cargo.lock.
 rust-version = "1.88"
