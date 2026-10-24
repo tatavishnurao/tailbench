@@ -51,7 +51,7 @@ logs: /tmp/phantom-demo-73177/naive.jsonl
 next: phantom report --rate 100 /tmp/phantom-demo-73177/naive.jsonl --html out.html
 ```
 
-To watch another load generator, serve with `--live` and point it at phantom (a fresh phantom for each run):
+To watch another load generator, serve with `--live` and point it at phantom (use a fresh phantom for each run: its clock starts at the first request, and a stall window is placed on that clock):
 
 ```sh
 phantom --live --listen 127.0.0.1:8090 --service-ms 1 --stall 2000:500 --log /tmp/gt-c1.jsonl
@@ -63,41 +63,43 @@ Here phantom cannot see the tool's own numbers, so "your tool ≈ reports" is it
 `-c 1`
 
 ```text
-phantom 0.2.0 listening on 127.0.0.1:8090, logging to /tmp/gt-c1.jsonl
+phantom 0.2.1 listening on 127.0.0.1:8090, logging to /tmp/gt-c1.jsonl
 
 phantom · watching 127.0.0.1:8090                                     t = 10.5 s
 
-requests arriving  ▄▄▄▄▄▄▄▄▄▄▂▁▅█▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▁▁▁
+requests arriving  ▄▄▄▄▄▄▄▄▄▄▁▁▁█▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▁▁▁
 server frozen      ··········███········································
 
 p99 latency
-  your tool ≈ reports  ▍                                                 3.73 ms
-  users waited         █████████████████████████████████████████████████  434 ms
+  your tool ≈ reports  ▍                                                 3.79 ms
+  users waited         █████████████████████████████████████████████████  441 ms
 
 ✗ Your load tool stopped sending while the server was frozen. It will
   under-report p99 by 116×.
 assumes 100 req/s intended, the rate measured outside the freeze
-phantom: stopped at t = 10.5 s: 1000 answered, 0 abandoned
+phantom: stopped at t = 10.5 s: 1000 answered, 1 abandoned
 ```
 
 `-c 50` (logging to `/tmp/gt-c50.jsonl`)
 
 ```text
-phantom 0.2.0 listening on 127.0.0.1:8090, logging to /tmp/gt-c50.jsonl
+phantom 0.2.1 listening on 127.0.0.1:8090, logging to /tmp/gt-c50.jsonl
 
 phantom · watching 127.0.0.1:8090                                     t = 10.5 s
 
-requests arriving  ███▇██████████████████████████████████████████████▁▁▁
+requests arriving  █▇▇▇██▇▇▇██▇██▇█▇▇█▇█▇▇▇█▇▇▇██▇██▇█▇▇█▇█▇▇██▇▇████▁▁▁
 server frozen      ··········███········································
 
 p99 latency
-  your tool ≈ reports  █████████████████████████████████████████████████▉ 394 ms
-  users waited         ██████████████████████████████████████████████████ 395 ms
+  your tool ≈ reports  ██████████████████████████████████████████████████ 404 ms
+  users waited         ██████████████████████████████████████████████████ 405 ms
 
 ✓ Your load tool kept sending. Its numbers include the freeze.
 assumes 100 req/s intended, the rate measured outside the freeze
-phantom: stopped at t = 10.5 s: 1000 answered, 0 abandoned
+phantom: stopped at t = 10.5 s: 1000 answered, 1 abandoned
 ```
+
+A phantom that is reused, or sits idle, is handled as far as it can be: arrivals more than `max(1 s, 20 × the median inter-arrival)` apart are separate runs, and the panel and `phantom report` score each run on its own schedule. `--live` shows the current run only, greys the last result with "idle: waiting for traffic" once nothing has arrived for 2 s, and gives a verdict only for a stall window that had traffic before it. The reports are still cleanest from one run on a fresh phantom.
 
 With one connection oha waits for each reply, so it sends nothing while phantom is frozen and its own p99 leaves the wait out; with fifty it keeps its schedule, and the freeze is in its numbers.
 
