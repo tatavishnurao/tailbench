@@ -20,6 +20,23 @@ and both crates adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## tailbench-phantom
 
+### [0.2.1] - 2026-10-23
+
+#### Fixed
+
+- Open-loop truth counted the idle time between runs as lateness when a phantom served more than one run, or sat idle: two 3 s `oha` runs at 100 req/s with a 6 s gap on one phantom gave a truth p99 of about 6 s against a server p99 of about 4 ms, in `phantom report` and in `--live`. Arrivals are now split into runs at gaps longer than `max(1 s, 20 × the median inter-arrival)`, except a gap a stall window explains (a closed-loop client sends nothing while the server is frozen), and each run is scored against its own schedule origin. The same two runs now give a truth p99 of about 5 ms. For a single run the numbers are unchanged.
+- `--live` gave a ✓ or ✗ for a stall window that no traffic preceded. It now prints "stall window passed before any traffic arrived; start a fresh phantom for each run" unless there were at least 20 arrivals in the interval just before the window.
+
+#### Changed
+
+- `phantom report` prints the number of runs and, when there is more than one, a plain-words line with the gaps ("N separate runs found (gaps of X s); truth is computed per run. For a clean result use a fresh phantom per run."). It also prints the arrival rate measured from the log (the median inter-arrival in the longest run) and warns, with both numbers, when it differs from `--rate` by more than 20%. A log that ends mid-JSON, as one still being written does, is read up to its last whole line, with a note. The terminal chart is at most 100 columns wide.
+- `--live` shows the current run only: the two p99s, the header (`t` is the time since the run began, with the total time dim on the right once a second run has begun) and the two timeline rows, which are scaled from the run's start to now rather than to the whole uptime, so a 0.5 s freeze in a 10 s run is about 5% of the row. A column is never narrower than 100 ms; when the run is longer than the width allows, buckets are merged by their maximum, and a column holding a bucket with under 10% of the run's median arrivals shows `▁` rather than being hidden. With no arrival for 2 s (and no stall window running) it shows the last result dim, titled "(last run)", and "idle: waiting for traffic" in place of a verdict.
+- Library: `phantom::report` gains `find_runs`, `gap_starts_run`, `run_gap_threshold_ns`, `median_gap_ns`, `open_loop_truth_by_run`, `Run` and the `Report` fields `runs`, `measured_rate_per_s` and `ignored_incomplete_line`; `phantom::live` gains `Snapshot::runs`, `current_run` and `is_idle`. `Snapshot::numbers` and `intended_rate_per_s` cover the current run.
+
+#### Unchanged
+
+- The JSONL log format, every server flag, and the truth formula for a single contiguous run. No new dependencies.
+
 ### [0.2.0] - 2026-10-22
 
 #### Added
