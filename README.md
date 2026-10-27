@@ -157,7 +157,9 @@ At factor 5 the leak reaches 0.41 (R = 10, phi 0.5, body x1.20), so keep the def
 
 ## Quick start
 
-tailbench is a library for now: there is no CLI and nothing is published to crates.io. Clone the repository and run the tests that produce the numbers above:
+tailbench 0.1.0 (the library) is on crates.io at <https://crates.io/crates/tailbench>, and tailbench-phantom 0.2.1 (the `phantom` CLI) is at <https://crates.io/crates/tailbench-phantom>; install the CLI with `cargo install --locked tailbench-phantom`. The tailbench crate itself has no CLI. Clone the repository and run the tests that produce the numbers above:
+
+New to the repository? Start with the [project guide](docs/project-guide.md) for the problem it solves, the source tree, the main workflows, and a file-by-file code walkthrough.
 
 ```sh
 cargo test                                                   # everything except the slow, ignored tests
@@ -188,7 +190,7 @@ tailbench's focus is auditing results (provenance, calibrated verdicts that can 
 - **T is a multiple of the median.** A slow mode of a bimodal body above T is counted as episodes, not body. If you have a stall or SLO definition, set an absolute threshold equal to it.
 - **Body bias under stalls.** The split body p99 reads +0.2% to +1.0% above the no-stall p99, rising with stall rate (docs/calibration.md, what the split estimates). In one cell the body gave a false verdict in 0.10 of trials when B stalls 3x more than A: phi 0.9, sd 0%, 0.2 vs 0.6 stalls/s, R = 10 (episode power table; target 0.05, Monte Carlo SE about 0.03).
 - **The window rule drops normal requests.** Requests sent during an episode window are excluded from the body even when they were fast: 9.6% of samples at 0.2 stalls/s (docs/calibration.md).
-- **Library only.** There is no CLI and no HTTP target yet. You supply the request as an async closure.
+- **No CLI or HTTP target in the tailbench crate.** The tailbench crate has no CLI and no built-in HTTP target: you supply the request as an async closure. The CLI is phantom, the ground-truth server ([tailbench-phantom on crates.io](https://crates.io/crates/tailbench-phantom)). [`examples/real-server-freeze/driver`](examples/real-server-freeze/driver) shows tailbench's open-loop and closed-loop runners driving a real HTTP server (vLLM) through such a closure.
 
 ## Roadmap
 
