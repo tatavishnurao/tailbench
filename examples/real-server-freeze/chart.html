@@ -3,21 +3,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Real server freeze</title>
 <style>
-:root { --bg:#ffffff; --fg:#1b1b1b; --muted:#666666; --grid:#e4e4e4; --bar:#1f5fbf; --max:#1b1b1b; --exp:#1a7f37; --freeze:#d1242f; --row:#f5f5f5; }
-@media (prefers-color-scheme: dark) { :root { --bg:#16181b; --fg:#e8e8e8; --muted:#9a9a9a; --grid:#2e3236; --bar:#6ea8ff; --max:#e8e8e8; --exp:#4ac26b; --freeze:#ff6b6b; --row:#1f2226; } }
-body { background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; margin:0 auto; max-width:960px; padding:16px; }
+:root { --bg:#ffffff; --fg:#1b1b1b; --muted:#666666; --grid:#e4e4e4; --bar:#1f5fbf; --bar2:#7aa5e6; --max:#1b1b1b; --exp:#1a7f37; --freeze:#d1242f; --row:#f5f5f5; }
+@media (prefers-color-scheme: dark) { :root { --bg:#16181b; --fg:#e8e8e8; --muted:#9a9a9a; --grid:#2e3236; --bar:#6ea8ff; --bar2:#3b6db5; --max:#e8e8e8; --exp:#4ac26b; --freeze:#ff6b6b; --row:#1f2226; } }
+body { background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; margin:0 auto; max-width:1040px; padding:16px; }
 h1 { font-size:1.5rem; margin:.2em 0; }
 p.sub { color:var(--muted); margin:0 0 1em; }
 .wrap { overflow-x:auto; }
-svg { display:block; min-width:640px; }
+svg { display:block; }
 .grid { stroke:var(--grid); stroke-width:1; }
 .tick { fill:var(--muted); font-size:11px; }
 .label { fill:var(--fg); font-size:12px; }
-.note { fill:var(--muted); font-size:10px; }
-.p1 { fill:none; stroke:var(--fg); stroke-width:1.5; }
+.rl { fill:var(--muted); font-weight:600; }
 .bar { fill:var(--bar); }
+.bar.r2 { fill:var(--bar2); }
 .val { fill:var(--fg); font-size:11px; }
-.valin { fill:#fff; font-size:11px; }
 .max { fill:var(--max); stroke:var(--bg); stroke-width:1; }
 .exp { stroke:var(--exp); stroke-width:3; }
 .freeze { stroke:var(--freeze); stroke-width:2; stroke-dasharray:5 3; }
@@ -30,83 +29,113 @@ th:nth-child(3),td:nth-child(3),th:nth-child(6),td:nth-child(6),th:last-child,td
 tbody tr:nth-child(even) { background:var(--row); }
 </style></head><body>
 <h1>Real server freeze</h1>
-<p class="sub">NVIDIA GeForce RTX 4060 Laptop GPU, 8188 MiB, 617.42 · Qwen/Qwen2.5-0.5B-Instruct · vLLM 0.32.0 · freeze 2 s (SIGSTOP/SIGCONT, 8 s after the first request) · 10 req/s for 25 s · 2 repetitions per pass · bars are pass 2</p>
-<div class="wrap"><svg viewBox="0 0 900 416" width="900" height="416" role="img" aria-label="Reported p99 and max per tool, with the freeze length and expected p99">
-<line class="grid" x1="250.0" x2="250.0" y1="30" y2="388"/>
-<text class="tick" x="250.0" y="404" text-anchor="middle">0</text>
-<line class="grid" x1="343.6" x2="343.6" y1="30" y2="388"/>
-<text class="tick" x="343.6" y="404" text-anchor="middle">500</text>
-<line class="grid" x1="437.2" x2="437.2" y1="30" y2="388"/>
-<text class="tick" x="437.2" y="404" text-anchor="middle">1000</text>
-<line class="grid" x1="530.8" x2="530.8" y1="30" y2="388"/>
-<text class="tick" x="530.8" y="404" text-anchor="middle">1500</text>
-<line class="grid" x1="624.3" x2="624.3" y1="30" y2="388"/>
-<text class="tick" x="624.3" y="404" text-anchor="middle">2000</text>
-<line class="grid" x1="717.9" x2="717.9" y1="30" y2="388"/>
-<text class="tick" x="717.9" y="404" text-anchor="middle">2500</text>
-<line class="grid" x1="811.5" x2="811.5" y1="30" y2="388"/>
-<text class="tick" x="811.5" y="404" text-anchor="middle">3000</text>
-<text class="tick" x="240" y="404" text-anchor="end">milliseconds</text>
-<text class="label" x="240" y="48" text-anchor="end">A · tailbench open loop (rs-drive)</text>
-<circle class="p1" cx="628.2" cy="47" r="5"><title>pass 1 reported p99 2020 ms</title></circle>
-<rect class="bar" x="250" y="39" width="387.8" height="16" rx="2"><title>tailbench open loop (rs-drive): reported p99 2072 ms</title></rect>
-<text class="val" x="641.8" y="51" >2072</text>
-<path class="max" d="M671.0 38 l6 10 l-6 10 l-6 -10 z"><title>reported max 2249 ms</title></path>
-<line class="exp" x1="610.7" x2="610.7" y1="36" y2="60"><title>expected p99 1927 ms</title></line>
-<text class="label" x="240" y="86" text-anchor="end">B · tailbench closed loop (rs-drive)</text>
-<circle class="p1" cx="272.8" cy="85" r="5"><title>pass 1 reported p99 122 ms</title></circle>
-<rect class="bar" x="250" y="77" width="25.7" height="16" rx="2"><title>tailbench closed loop (rs-drive): reported p99 137 ms</title></rect>
-<text class="val" x="279.7" y="89" >137</text>
-<path class="max" d="M661.0 76 l6 10 l-6 10 l-6 -10 z"><title>reported max 2196 ms</title></path>
-<line class="exp" x1="268.4" x2="268.4" y1="74" y2="98"><title>expected p99 99 ms</title></line>
-<text class="label" x="240" y="124" text-anchor="end">C · oha -c 1</text>
-<circle class="p1" cx="273.6" cy="123" r="5"><title>pass 1 reported p99 126 ms</title></circle>
-<rect class="bar" x="250" y="115" width="27.0" height="16" rx="2"><title>oha -c 1: reported p99 144 ms</title></rect>
-<text class="val" x="281.0" y="127" >144</text>
-<path class="max" d="M648.4 114 l6 10 l-6 10 l-6 -10 z"><title>reported max 2129 ms</title></path>
-<line class="exp" x1="268.2" x2="268.2" y1="112" y2="136"><title>expected p99 97 ms</title></line>
-<text class="label" x="240" y="162" text-anchor="end">D · oha -c 1 --latency-correction</text>
-<circle class="p1" cx="675.0" cy="161" r="5"><title>pass 1 reported p99 2271 ms</title></circle>
-<rect class="bar" x="250" y="153" width="473.0" height="16" rx="2"><title>oha -c 1 --latency-correction: reported p99 2527 ms</title></rect>
-<text class="val" x="727.0" y="165" >2527</text>
-<path class="max" d="M850.0 152 l6 10 l-6 10 l-6 -10 z"><title>reported max 3206 ms</title></path>
-<line class="exp" x1="654.2" x2="654.2" y1="150" y2="174"><title>expected p99 2160 ms</title></line>
-<text class="label" x="240" y="200" text-anchor="end">C2 · oha -c 50</text>
-<text class="note" x="240" y="212" text-anchor="end">connection errors per rep: 19 / 0</text>
-<circle class="p1" cx="277.0" cy="199" r="5"><title>pass 1 reported p99 144 ms</title></circle>
-<rect class="bar" x="250" y="191" width="213.3" height="16" rx="2"><title>oha -c 50: reported p99 1140 ms</title></rect>
-<text class="val" x="467.3" y="203" >1140</text>
-<path class="max" d="M659.6 190 l6 10 l-6 10 l-6 -10 z"><title>reported max 2188 ms</title></path>
-<line class="exp" x1="610.7" x2="610.7" y1="188" y2="212"><title>expected p99 1927 ms</title></line>
-<text class="label" x="240" y="238" text-anchor="end">D2 · oha -c 50 --latency-correction</text>
-<text class="note" x="240" y="250" text-anchor="end">connection errors per rep: 19 / 20</text>
-<circle class="p1" cx="275.8" cy="237" r="5"><title>pass 1 reported p99 138 ms</title></circle>
-<rect class="bar" x="250" y="229" width="32.0" height="16" rx="2"><title>oha -c 50 --latency-correction: reported p99 171 ms</title></rect>
-<text class="val" x="286.0" y="241" >171</text>
-<path class="max" d="M649.3 228 l6 10 l-6 10 l-6 -10 z"><title>reported max 2133 ms</title></path>
-<line class="exp" x1="610.6" x2="610.6" y1="226" y2="250"><title>expected p99 1927 ms</title></line>
-<text class="label" x="240" y="276" text-anchor="end">E · vllm bench serve</text>
-<circle class="p1" cx="641.2" cy="275" r="5"><title>pass 1 reported p99 2090 ms</title></circle>
-<rect class="bar" x="250" y="267" width="389.5" height="16" rx="2"><title>vllm bench serve: reported p99 2081 ms</title></rect>
-<text class="val" x="643.5" y="279" >2081</text>
-<path class="max" d="M675.8 266 l6 10 l-6 10 l-6 -10 z"><title>reported max 2275 ms</title></path>
-<line class="exp" x1="612.2" x2="612.2" y1="264" y2="288"><title>expected p99 1935 ms</title></line>
-<text class="label" x="240" y="314" text-anchor="end">F · GuideLLM constant</text>
-<circle class="p1" cx="660.8" cy="313" r="5"><title>pass 1 reported p99 2195 ms</title></circle>
-<rect class="bar" x="250" y="305" width="418.8" height="16" rx="2"><title>GuideLLM constant: reported p99 2237 ms</title></rect>
-<text class="val" x="672.8" y="317" >2237</text>
-<path class="max" d="M769.8 304 l6 10 l-6 10 l-6 -10 z"><title>reported max 2777 ms</title></path>
-<line class="exp" x1="609.6" x2="609.6" y1="302" y2="326"><title>expected p99 1921 ms</title></line>
-<text class="label" x="240" y="352" text-anchor="end">G · AIPerf constant</text>
-<circle class="p1" cx="646.1" cy="351" r="5"><title>pass 1 reported p99 2116 ms</title></circle>
-<rect class="bar" x="250" y="343" width="399.8" height="16" rx="2"><title>AIPerf constant: reported p99 2136 ms</title></rect>
-<text class="val" x="653.8" y="355" >2136</text>
-<path class="max" d="M690.2 342 l6 10 l-6 10 l-6 -10 z"><title>reported max 2352 ms</title></path>
-<line class="exp" x1="610.4" x2="610.4" y1="340" y2="364"><title>expected p99 1925 ms</title></line>
-<line class="freeze" x1="624.3" x2="624.3" y1="30" y2="388"/>
-<text class="freezet" x="628.3" y="24">freeze 2000 ms</text>
+<p class="sub">NVIDIA GeForce RTX 4060 Laptop GPU, 8188 MiB, 617.42 · Qwen/Qwen2.5-0.5B-Instruct · vLLM 0.32.0 · freeze 2 s (SIGSTOP/SIGCONT, 8 s after the first request) · 10 req/s for 25 s · 2 repetitions per pass · chart: pass 2, each repetition</p>
+<div class="wrap"><svg viewBox="0 0 1000 453" width="1000" height="453" role="img" aria-label="Reported p99 and max of each repetition per tool, with the freeze length and expected p99">
+<line class="grid" x1="250.0" x2="250.0" y1="30" y2="427"/>
+<text class="tick" x="250.0" y="443" text-anchor="middle">0</text>
+<line class="grid" x1="308.8" x2="308.8" y1="30" y2="427"/>
+<text class="tick" x="308.8" y="443" text-anchor="middle">500</text>
+<line class="grid" x1="367.5" x2="367.5" y1="30" y2="427"/>
+<text class="tick" x="367.5" y="443" text-anchor="middle">1000</text>
+<line class="grid" x1="426.3" x2="426.3" y1="30" y2="427"/>
+<text class="tick" x="426.3" y="443" text-anchor="middle">1500</text>
+<line class="grid" x1="485.1" x2="485.1" y1="30" y2="427"/>
+<text class="tick" x="485.1" y="443" text-anchor="middle">2000</text>
+<line class="grid" x1="543.9" x2="543.9" y1="30" y2="427"/>
+<text class="tick" x="543.9" y="443" text-anchor="middle">2500</text>
+<line class="grid" x1="602.6" x2="602.6" y1="30" y2="427"/>
+<text class="tick" x="602.6" y="443" text-anchor="middle">3000</text>
+<line class="grid" x1="661.4" x2="661.4" y1="30" y2="427"/>
+<text class="tick" x="661.4" y="443" text-anchor="middle">3500</text>
+<line class="grid" x1="720.2" x2="720.2" y1="30" y2="427"/>
+<text class="tick" x="720.2" y="443" text-anchor="middle">4000</text>
+<text class="tick" x="240" y="443" text-anchor="end">milliseconds</text>
+<text class="tick" x="766" y="24">reported, ms</text>
+<text class="label" x="240" y="49" text-anchor="end">A · tailbench open loop (rs-drive)</text>
+<rect class="bar r1" x="250" y="36" width="239.4" height="11" rx="1.5"><title>tailbench open loop (rs-drive) rep 1: reported p99 2037 ms, max 2231 ms, expected p99 1927 ms</title></rect>
+<line class="exp" x1="476.5" x2="476.5" y1="34.5" y2="48.5"><title>tailbench open loop (rs-drive) rep 1: reported p99 2037 ms, max 2231 ms, expected p99 1927 ms</title></line>
+<path class="max" d="M512.2 36.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>tailbench open loop (rs-drive) rep 1: reported p99 2037 ms, max 2231 ms, expected p99 1927 ms</title></path>
+<text class="val" x="766" y="45.5"><tspan class="rl">r1</tspan> p99 2037 · max 2231</text>
+<rect class="bar r2" x="250" y="50" width="247.7" height="11" rx="1.5"><title>tailbench open loop (rs-drive) rep 2: reported p99 2107 ms, max 2268 ms, expected p99 1927 ms</title></rect>
+<line class="exp" x1="476.5" x2="476.5" y1="48.5" y2="62.5"><title>tailbench open loop (rs-drive) rep 2: reported p99 2107 ms, max 2268 ms, expected p99 1927 ms</title></line>
+<path class="max" d="M516.6 50.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>tailbench open loop (rs-drive) rep 2: reported p99 2107 ms, max 2268 ms, expected p99 1927 ms</title></path>
+<text class="val" x="766" y="59.5"><tspan class="rl">r2</tspan> p99 2107 · max 2268</text>
+<text class="label" x="240" y="92" text-anchor="end">B · tailbench closed loop (rs-drive)</text>
+<rect class="bar r1" x="250" y="79" width="12.3" height="11" rx="1.5"><title>tailbench closed loop (rs-drive) rep 1: reported p99 105 ms, max 2178 ms, expected p99 99 ms</title></rect>
+<line class="exp" x1="261.7" x2="261.7" y1="77.5" y2="91.5"><title>tailbench closed loop (rs-drive) rep 1: reported p99 105 ms, max 2178 ms, expected p99 99 ms</title></line>
+<path class="max" d="M506.0 79.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>tailbench closed loop (rs-drive) rep 1: reported p99 105 ms, max 2178 ms, expected p99 99 ms</title></path>
+<text class="val" x="766" y="88.5"><tspan class="rl">r1</tspan> p99 105 · max 2178</text>
+<rect class="bar r2" x="250" y="93" width="20.0" height="11" rx="1.5"><title>tailbench closed loop (rs-drive) rep 2: reported p99 170 ms, max 2214 ms, expected p99 98 ms</title></rect>
+<line class="exp" x1="261.5" x2="261.5" y1="91.5" y2="105.5"><title>tailbench closed loop (rs-drive) rep 2: reported p99 170 ms, max 2214 ms, expected p99 98 ms</title></line>
+<path class="max" d="M510.2 93.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>tailbench closed loop (rs-drive) rep 2: reported p99 170 ms, max 2214 ms, expected p99 98 ms</title></path>
+<text class="val" x="766" y="102.5"><tspan class="rl">r2</tspan> p99 170 · max 2214</text>
+<text class="label" x="240" y="135" text-anchor="end">C · oha -c 1</text>
+<rect class="bar r1" x="250" y="122" width="13.6" height="11" rx="1.5"><title>oha -c 1 rep 1: reported p99 116 ms, max 2165 ms, expected p99 101 ms</title></rect>
+<line class="exp" x1="261.9" x2="261.9" y1="120.5" y2="134.5"><title>oha -c 1 rep 1: reported p99 116 ms, max 2165 ms, expected p99 101 ms</title></line>
+<path class="max" d="M504.4 122.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>oha -c 1 rep 1: reported p99 116 ms, max 2165 ms, expected p99 101 ms</title></path>
+<text class="val" x="766" y="131.5"><tspan class="rl">r1</tspan> p99 116 · max 2165 · 0 conn. err.</text>
+<rect class="bar r2" x="250" y="136" width="20.4" height="11" rx="1.5"><title>oha -c 1 rep 2: reported p99 173 ms, max 2093 ms, expected p99 94 ms</title></rect>
+<line class="exp" x1="261.0" x2="261.0" y1="134.5" y2="148.5"><title>oha -c 1 rep 2: reported p99 173 ms, max 2093 ms, expected p99 94 ms</title></line>
+<path class="max" d="M496.0 136.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>oha -c 1 rep 2: reported p99 173 ms, max 2093 ms, expected p99 94 ms</title></path>
+<text class="val" x="766" y="145.5"><tspan class="rl">r2</tspan> p99 173 · max 2093 · 0 conn. err.</text>
+<text class="label" x="240" y="178" text-anchor="end">D · oha -c 1 --latency-correction</text>
+<rect class="bar r1" x="250" y="165" width="265.7" height="11" rx="1.5"><title>oha -c 1 --latency-correction rep 1: reported p99 2261 ms, max 2282 ms, expected p99 2172 ms</title></rect>
+<line class="exp" x1="505.3" x2="505.3" y1="163.5" y2="177.5"><title>oha -c 1 --latency-correction rep 1: reported p99 2261 ms, max 2282 ms, expected p99 2172 ms</title></line>
+<path class="max" d="M518.2 165.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>oha -c 1 --latency-correction rep 1: reported p99 2261 ms, max 2282 ms, expected p99 2172 ms</title></path>
+<text class="val" x="766" y="174.5"><tspan class="rl">r1</tspan> p99 2261 · max 2282 · 0 conn. err.</text>
+<rect class="bar r2" x="250" y="179" width="328.4" height="11" rx="1.5"><title>oha -c 1 --latency-correction rep 2: reported p99 2794 ms, max 4130 ms, expected p99 2147 ms</title></rect>
+<line class="exp" x1="502.4" x2="502.4" y1="177.5" y2="191.5"><title>oha -c 1 --latency-correction rep 2: reported p99 2794 ms, max 4130 ms, expected p99 2147 ms</title></line>
+<path class="max" d="M735.4 179.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>oha -c 1 --latency-correction rep 2: reported p99 2794 ms, max 4130 ms, expected p99 2147 ms</title></path>
+<text class="val" x="766" y="188.5"><tspan class="rl">r2</tspan> p99 2794 · max 4130 · 0 conn. err.</text>
+<text class="label" x="240" y="221" text-anchor="end">C2 · oha -c 50</text>
+<rect class="bar r1" x="250" y="208" width="21.0" height="11" rx="1.5"><title>oha -c 50 rep 1: reported p99 178 ms, max 2111 ms, expected p99 1932 ms</title></rect>
+<line class="exp" x1="477.1" x2="477.1" y1="206.5" y2="220.5"><title>oha -c 50 rep 1: reported p99 178 ms, max 2111 ms, expected p99 1932 ms</title></line>
+<path class="max" d="M498.1 208.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>oha -c 50 rep 1: reported p99 178 ms, max 2111 ms, expected p99 1932 ms</title></path>
+<text class="val" x="766" y="217.5"><tspan class="rl">r1</tspan> p99 178 · max 2111 · 19 conn. err.</text>
+<rect class="bar r2" x="250" y="222" width="246.9" height="11" rx="1.5"><title>oha -c 50 rep 2: reported p99 2101 ms, max 2266 ms, expected p99 1923 ms</title></rect>
+<line class="exp" x1="476.0" x2="476.0" y1="220.5" y2="234.5"><title>oha -c 50 rep 2: reported p99 2101 ms, max 2266 ms, expected p99 1923 ms</title></line>
+<path class="max" d="M516.3 222.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>oha -c 50 rep 2: reported p99 2101 ms, max 2266 ms, expected p99 1923 ms</title></path>
+<text class="val" x="766" y="231.5"><tspan class="rl">r2</tspan> p99 2101 · max 2266 · 0 conn. err.</text>
+<text class="label" x="240" y="264" text-anchor="end">D2 · oha -c 50 --latency-correction</text>
+<rect class="bar r1" x="250" y="251" width="21.5" height="11" rx="1.5"><title>oha -c 50 --latency-correction rep 1: reported p99 183 ms, max 2171 ms, expected p99 1930 ms</title></rect>
+<line class="exp" x1="476.9" x2="476.9" y1="249.5" y2="263.5"><title>oha -c 50 --latency-correction rep 1: reported p99 183 ms, max 2171 ms, expected p99 1930 ms</title></line>
+<path class="max" d="M505.2 251.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>oha -c 50 --latency-correction rep 1: reported p99 183 ms, max 2171 ms, expected p99 1930 ms</title></path>
+<text class="val" x="766" y="260.5"><tspan class="rl">r1</tspan> p99 183 · max 2171 · 19 conn. err.</text>
+<rect class="bar r2" x="250" y="265" width="18.7" height="11" rx="1.5"><title>oha -c 50 --latency-correction rep 2: reported p99 159 ms, max 2095 ms, expected p99 1923 ms</title></rect>
+<line class="exp" x1="476.0" x2="476.0" y1="263.5" y2="277.5"><title>oha -c 50 --latency-correction rep 2: reported p99 159 ms, max 2095 ms, expected p99 1923 ms</title></line>
+<path class="max" d="M496.3 265.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>oha -c 50 --latency-correction rep 2: reported p99 159 ms, max 2095 ms, expected p99 1923 ms</title></path>
+<text class="val" x="766" y="274.5"><tspan class="rl">r2</tspan> p99 159 · max 2095 · 20 conn. err.</text>
+<text class="label" x="240" y="307" text-anchor="end">E · vllm bench serve</text>
+<rect class="bar r1" x="250" y="294" width="245.0" height="11" rx="1.5"><title>vllm bench serve rep 1: reported p99 2084 ms, max 2307 ms, expected p99 1935 ms</title></rect>
+<line class="exp" x1="477.5" x2="477.5" y1="292.5" y2="306.5"><title>vllm bench serve rep 1: reported p99 2084 ms, max 2307 ms, expected p99 1935 ms</title></line>
+<path class="max" d="M521.2 294.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>vllm bench serve rep 1: reported p99 2084 ms, max 2307 ms, expected p99 1935 ms</title></path>
+<text class="val" x="766" y="303.5"><tspan class="rl">r1</tspan> p99 2084 · max 2307</text>
+<rect class="bar r2" x="250" y="308" width="244.2" height="11" rx="1.5"><title>vllm bench serve rep 2: reported p99 2077 ms, max 2243 ms, expected p99 1935 ms</title></rect>
+<line class="exp" x1="477.4" x2="477.4" y1="306.5" y2="320.5"><title>vllm bench serve rep 2: reported p99 2077 ms, max 2243 ms, expected p99 1935 ms</title></line>
+<path class="max" d="M513.6 308.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>vllm bench serve rep 2: reported p99 2077 ms, max 2243 ms, expected p99 1935 ms</title></path>
+<text class="val" x="766" y="317.5"><tspan class="rl">r2</tspan> p99 2077 · max 2243</text>
+<text class="label" x="240" y="350" text-anchor="end">F · GuideLLM constant</text>
+<rect class="bar r1" x="250" y="337" width="258.9" height="11" rx="1.5"><title>GuideLLM constant rep 1: reported p99 2203 ms, max 2445 ms, expected p99 1921 ms</title></rect>
+<line class="exp" x1="475.8" x2="475.8" y1="335.5" y2="349.5"><title>GuideLLM constant rep 1: reported p99 2203 ms, max 2445 ms, expected p99 1921 ms</title></line>
+<path class="max" d="M537.4 337.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>GuideLLM constant rep 1: reported p99 2203 ms, max 2445 ms, expected p99 1921 ms</title></path>
+<text class="val" x="766" y="346.5"><tspan class="rl">r1</tspan> p99 2203 · max 2445</text>
+<rect class="bar r2" x="250" y="351" width="267.0" height="11" rx="1.5"><title>GuideLLM constant rep 2: reported p99 2272 ms, max 3109 ms, expected p99 1921 ms</title></rect>
+<line class="exp" x1="475.8" x2="475.8" y1="349.5" y2="363.5"><title>GuideLLM constant rep 2: reported p99 2272 ms, max 3109 ms, expected p99 1921 ms</title></line>
+<path class="max" d="M615.4 351.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>GuideLLM constant rep 2: reported p99 2272 ms, max 3109 ms, expected p99 1921 ms</title></path>
+<text class="val" x="766" y="360.5"><tspan class="rl">r2</tspan> p99 2272 · max 3109</text>
+<text class="label" x="240" y="393" text-anchor="end">G · AIPerf constant</text>
+<rect class="bar r1" x="250" y="380" width="252.1" height="11" rx="1.5"><title>AIPerf constant rep 1: reported p99 2145 ms, max 2358 ms, expected p99 1921 ms</title></rect>
+<line class="exp" x1="475.9" x2="475.9" y1="378.5" y2="392.5"><title>AIPerf constant rep 1: reported p99 2145 ms, max 2358 ms, expected p99 1921 ms</title></line>
+<path class="max" d="M527.2 380.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>AIPerf constant rep 1: reported p99 2145 ms, max 2358 ms, expected p99 1921 ms</title></path>
+<text class="val" x="766" y="389.5"><tspan class="rl">r1</tspan> p99 2145 · max 2358</text>
+<rect class="bar r2" x="250" y="394" width="250.1" height="11" rx="1.5"><title>AIPerf constant rep 2: reported p99 2128 ms, max 2346 ms, expected p99 1929 ms</title></rect>
+<line class="exp" x1="476.8" x2="476.8" y1="392.5" y2="406.5"><title>AIPerf constant rep 2: reported p99 2128 ms, max 2346 ms, expected p99 1929 ms</title></line>
+<path class="max" d="M525.8 394.0 l4.5 5.5 l-4.5 5.5 l-4.5 -5.5 z"><title>AIPerf constant rep 2: reported p99 2128 ms, max 2346 ms, expected p99 1929 ms</title></path>
+<text class="val" x="766" y="403.5"><tspan class="rl">r2</tspan> p99 2128 · max 2346</text>
+<line class="freeze" x1="485.1" x2="485.1" y1="30" y2="427"/>
+<text class="freezet" x="489.1" y="24">freeze 2000 ms</text>
 </svg></div>
-<p class="legend"><b>bar</b> reported p99 (mean of the repetitions) · <b>◆</b> reported max · <b style="color:var(--exp)">|</b> expected p99, phase-averaged (no tool involved) · <b>○</b> the same tool's pass-1 p99 · <b style="color:var(--freeze)">- -</b> the 2000 ms freeze. Table: pass 2 first, then pass 1.</p>
+<p class="legend">Pass 2, nothing averaged: each configuration has one line per repetition, <b>r1</b> upper (darker bar) and <b>r2</b> lower (lighter bar). <b>bar</b> reported p99 · <b>◆</b> reported max · <b style="color:var(--exp)">|</b> that repetition's expected p99, phase-averaged (no tool involved) · <b style="color:var(--freeze)">- -</b> the 2000 ms freeze. The column on the right gives each repetition's p99 and max and, for oha, its connection errors. Pass 1 is in the table only. Table: pass 2 first, then pass 1.</p>
 <div class="wrap"><table>
 <thead><tr><th>pass</th><th>cfg</th><th>tool</th><th>rep</th><th>n ok</th><th>errors</th><th>p50 ms</th><th>p99 ms</th><th>max ms</th><th>exp. p99</th><th>exp. max</th><th>metric used</th></tr></thead>
 <tbody>
