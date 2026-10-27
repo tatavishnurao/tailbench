@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Real server freeze</title>
+<style>
+:root { --bg:#ffffff; --fg:#1b1b1b; --muted:#666666; --grid:#e4e4e4; --bar:#1f5fbf; --max:#1b1b1b; --exp:#1a7f37; --freeze:#d1242f; --row:#f5f5f5; }
+@media (prefers-color-scheme: dark) { :root { --bg:#16181b; --fg:#e8e8e8; --muted:#9a9a9a; --grid:#2e3236; --bar:#6ea8ff; --max:#e8e8e8; --exp:#4ac26b; --freeze:#ff6b6b; --row:#1f2226; } }
+body { background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,sans-serif; margin:0 auto; max-width:960px; padding:16px; }
+h1 { font-size:1.5rem; margin:.2em 0; }
+p.sub { color:var(--muted); margin:0 0 1em; }
+.wrap { overflow-x:auto; }
+svg { display:block; min-width:640px; }
+.grid { stroke:var(--grid); stroke-width:1; }
+.tick { fill:var(--muted); font-size:11px; }
+.label { fill:var(--fg); font-size:12px; }
+.note { fill:var(--muted); font-size:10px; }
+.p1 { fill:none; stroke:var(--fg); stroke-width:1.5; }
+.bar { fill:var(--bar); }
+.val { fill:var(--fg); font-size:11px; }
+.valin { fill:#fff; font-size:11px; }
+.max { fill:var(--max); stroke:var(--bg); stroke-width:1; }
+.exp { stroke:var(--exp); stroke-width:3; }
+.freeze { stroke:var(--freeze); stroke-width:2; stroke-dasharray:5 3; }
+.freezet { fill:var(--freeze); font-size:11px; }
+.legend { color:var(--muted); font-size:13px; margin:.5em 0 1.2em; }
+.legend b { color:var(--fg); }
+table { border-collapse:collapse; font-size:13px; width:100%; }
+th,td { text-align:right; padding:4px 8px; border-bottom:1px solid var(--grid); }
+th:nth-child(3),td:nth-child(3),th:nth-child(6),td:nth-child(6),th:last-child,td:last-child { text-align:left; }
+tbody tr:nth-child(even) { background:var(--row); }
+</style></head><body>
+<h1>Real server freeze</h1>
+<p class="sub">NVIDIA GeForce RTX 4060 Laptop GPU, 8188 MiB, 617.42 · Qwen/Qwen2.5-0.5B-Instruct · vLLM 0.32.0 · freeze 2 s (SIGSTOP/SIGCONT, 8 s after the first request) · 10 req/s for 25 s · 2 repetitions per pass · bars are pass 2</p>
+<div class="wrap"><svg viewBox="0 0 900 416" width="900" height="416" role="img" aria-label="Reported p99 and max per tool, with the freeze length and expected p99">
+<line class="grid" x1="250.0" x2="250.0" y1="30" y2="388"/>
+<text class="tick" x="250.0" y="404" text-anchor="middle">0</text>
+<line class="grid" x1="343.6" x2="343.6" y1="30" y2="388"/>
+<text class="tick" x="343.6" y="404" text-anchor="middle">500</text>
+<line class="grid" x1="437.2" x2="437.2" y1="30" y2="388"/>
+<text class="tick" x="437.2" y="404" text-anchor="middle">1000</text>
+<line class="grid" x1="530.8" x2="530.8" y1="30" y2="388"/>
+<text class="tick" x="530.8" y="404" text-anchor="middle">1500</text>
+<line class="grid" x1="624.3" x2="624.3" y1="30" y2="388"/>
+<text class="tick" x="624.3" y="404" text-anchor="middle">2000</text>
+<line class="grid" x1="717.9" x2="717.9" y1="30" y2="388"/>
+<text class="tick" x="717.9" y="404" text-anchor="middle">2500</text>
+<line class="grid" x1="811.5" x2="811.5" y1="30" y2="388"/>
+<text class="tick" x="811.5" y="404" text-anchor="middle">3000</text>
+<text class="tick" x="240" y="404" text-anchor="end">milliseconds</text>
+<text class="label" x="240" y="48" text-anchor="end">A · tailbench open loop (rs-drive)</text>
+<circle class="p1" cx="628.2" cy="47" r="5"><title>pass 1 reported p99 2020 ms</title></circle>
+<rect class="bar" x="250" y="39" width="387.8" height="16" rx="2"><title>tailbench open loop (rs-drive): reported p99 2072 ms</title></rect>
+<text class="val" x="641.8" y="51" >2072</text>
+<path class="max" d="M671.0 38 l6 10 l-6 10 l-6 -10 z"><title>reported max 2249 ms</title></path>
+<line class="exp" x1="610.7" x2="610.7" y1="36" y2="60"><title>expected p99 1927 ms</title></line>
+<text class="label" x="240" y="86" text-anchor="end">B · tailbench closed loop (rs-drive)</text>
+<circle class="p1" cx="272.8" cy="85" r="5"><title>pass 1 reported p99 122 ms</title></circle>
+<rect class="bar" x="250" y="77" width="25.7" height="16" rx="2"><title>tailbench closed loop (rs-drive): reported p99 137 ms</title></rect>
+<text class="val" x="279.7" y="89" >137</text>
+<path class="max" d="M661.0 76 l6 10 l-6 10 l-6 -10 z"><title>reported max 2196 ms</title></path>
+<line class="exp" x1="268.4" x2="268.4" y1="74" y2="98"><title>expected p99 99 ms</title></line>
+<text class="label" x="240" y="124" text-anchor="end">C · oha -c 1</text>
+<circle class="p1" cx="273.6" cy="123" r="5"><title>pass 1 reported p99 126 ms</title></circle>
+<rect class="bar" x="250" y="115" width="27.0" height="16" rx="2"><title>oha -c 1: reported p99 144 ms</title></rect>
+<text class="val" x="281.0" y="127" >144</text>
+<path class="max" d="M648.4 114 l6 10 l-6 10 l-6 -10 z"><title>reported max 2129 ms</title></path>
+<line class="exp" x1="268.2" x2="268.2" y1="112" y2="136"><title>expected p99 97 ms</title></line>
+<text class="label" x="240" y="162" text-anchor="end">D · oha -c 1 --latency-correction</text>
+<circle class="p1" cx="675.0" cy="161" r="5"><title>pass 1 reported p99 2271 ms</title></circle>
+<rect class="bar" x="250" y="153" width="473.0" height="16" rx="2"><title>oha -c 1 --latency-correction: reported p99 2527 ms</title></rect>
+<text class="val" x="727.0" y="165" >2527</text>
+<path class="max" d="M850.0 152 l6 10 l-6 10 l-6 -10 z"><title>reported max 3206 ms</title></path>
+<line class="exp" x1="654.2" x2="654.2" y1="150" y2="174"><title>expected p99 2160 ms</title></line>
+<text class="label" x="240" y="200" text-anchor="end">C2 · oha -c 50</text>
+<text class="note" x="240" y="212" text-anchor="end">connection errors per rep: 19 / 0</text>
+<circle class="p1" cx="277.0" cy="199" r="5"><title>pass 1 reported p99 144 ms</title></circle>
+<rect class="bar" x="250" y="191" width="213.3" height="16" rx="2"><title>oha -c 50: reported p99 1140 ms</title></rect>
+<text class="val" x="467.3" y="203" >1140</text>
+<path class="max" d="M659.6 190 l6 10 l-6 10 l-6 -10 z"><title>reported max 2188 ms</title></path>
+<line class="exp" x1="610.7" x2="610.7" y1="188" y2="212"><title>expected p99 1927 ms</title></line>
+<text class="label" x="240" y="238" text-anchor="end">D2 · oha -c 50 --latency-correction</text>
+<text class="note" x="240" y="250" text-anchor="end">connection errors per rep: 19 / 20</text>
+<circle class="p1" cx="275.8" cy="237" r="5"><title>pass 1 reported p99 138 ms</title></circle>
+<rect class="bar" x="250" y="229" width="32.0" height="16" rx="2"><title>oha -c 50 --latency-correction: reported p99 171 ms</title></rect>
+<text class="val" x="286.0" y="241" >171</text>
+<path class="max" d="M649.3 228 l6 10 l-6 10 l-6 -10 z"><title>reported max 2133 ms</title></path>
+<line class="exp" x1="610.6" x2="610.6" y1="226" y2="250"><title>expected p99 1927 ms</title></line>
+<text class="label" x="240" y="276" text-anchor="end">E · vllm bench serve</text>
+<circle class="p1" cx="641.2" cy="275" r="5"><title>pass 1 reported p99 2090 ms</title></circle>
+<rect class="bar" x="250" y="267" width="389.5" height="16" rx="2"><title>vllm bench serve: reported p99 2081 ms</title></rect>
+<text class="val" x="643.5" y="279" >2081</text>
+<path class="max" d="M675.8 266 l6 10 l-6 10 l-6 -10 z"><title>reported max 2275 ms</title></path>
+<line class="exp" x1="612.2" x2="612.2" y1="264" y2="288"><title>expected p99 1935 ms</title></line>
+<text class="label" x="240" y="314" text-anchor="end">F · GuideLLM constant</text>
+<circle class="p1" cx="660.8" cy="313" r="5"><title>pass 1 reported p99 2195 ms</title></circle>
+<rect class="bar" x="250" y="305" width="418.8" height="16" rx="2"><title>GuideLLM constant: reported p99 2237 ms</title></rect>
+<text class="val" x="672.8" y="317" >2237</text>
+<path class="max" d="M769.8 304 l6 10 l-6 10 l-6 -10 z"><title>reported max 2777 ms</title></path>
+<line class="exp" x1="609.6" x2="609.6" y1="302" y2="326"><title>expected p99 1921 ms</title></line>
+<text class="label" x="240" y="352" text-anchor="end">G · AIPerf constant</text>
+<circle class="p1" cx="646.1" cy="351" r="5"><title>pass 1 reported p99 2116 ms</title></circle>
+<rect class="bar" x="250" y="343" width="399.8" height="16" rx="2"><title>AIPerf constant: reported p99 2136 ms</title></rect>
+<text class="val" x="653.8" y="355" >2136</text>
+<path class="max" d="M690.2 342 l6 10 l-6 10 l-6 -10 z"><title>reported max 2352 ms</title></path>
+<line class="exp" x1="610.4" x2="610.4" y1="340" y2="364"><title>expected p99 1925 ms</title></line>
+<line class="freeze" x1="624.3" x2="624.3" y1="30" y2="388"/>
+<text class="freezet" x="628.3" y="24">freeze 2000 ms</text>
+</svg></div>
+<p class="legend"><b>bar</b> reported p99 (mean of the repetitions) · <b>◆</b> reported max · <b style="color:var(--exp)">|</b> expected p99, phase-averaged (no tool involved) · <b>○</b> the same tool's pass-1 p99 · <b style="color:var(--freeze)">- -</b> the 2000 ms freeze. Table: pass 2 first, then pass 1.</p>
+<div class="wrap"><table>
+<thead><tr><th>pass</th><th>cfg</th><th>tool</th><th>rep</th><th>n ok</th><th>errors</th><th>p50 ms</th><th>p99 ms</th><th>max ms</th><th>exp. p99</th><th>exp. max</th><th>metric used</th></tr></thead>
+<tbody>
+<tr><td>2</td><td>A</td><td>tailbench open loop (rs-drive)</td><td>1</td><td>250</td><td>0</td><td>88.3</td><td>2036.7</td><td>2230.8</td><td>1927.3</td><td>2127.3</td><td>open_loop latency = t_done - t_intended</td></tr>
+<tr><td>2</td><td>B</td><td>tailbench closed loop (rs-drive)</td><td>1</td><td>250</td><td>0</td><td>92.3</td><td>104.6</td><td>2178.0</td><td>99.2</td><td>2185.7</td><td>closed_loop latency = t_done - t_sent</td></tr>
+<tr><td>2</td><td>C</td><td>oha -c 1</td><td>1</td><td>227</td><td>0 conn, 1 deadline</td><td>99.1</td><td>115.5</td><td>2164.6</td><td>101.1</td><td>2184.9</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>2</td><td>D</td><td>oha -c 1 --latency-correction</td><td>1</td><td>227</td><td>0 conn, 1 deadline</td><td>2049.6</td><td>2260.8</td><td>2281.6</td><td>2172.3</td><td>2179.6</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>2</td><td>C2</td><td>oha -c 50</td><td>1</td><td>230</td><td>19 conn, 3 deadline</td><td>105.8</td><td>178.2</td><td>2111.1</td><td>1931.9</td><td>2131.9</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>2</td><td>D2</td><td>oha -c 50 --latency-correction</td><td>1</td><td>230</td><td>19 conn, 3 deadline</td><td>102.4</td><td>182.7</td><td>2171.2</td><td>1930.3</td><td>2130.3</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>2</td><td>E</td><td>vllm bench serve</td><td>1</td><td>250</td><td>0</td><td>98.3</td><td>2084.3</td><td>2307.5</td><td>1935.0</td><td>2135.0</td><td>E2EL: p50_e2el_ms, p99_e2el_ms, p100_e2el_ms</td></tr>
+<tr><td>2</td><td>F</td><td>GuideLLM constant</td><td>1</td><td>250</td><td>0</td><td>103.5</td><td>2203.0</td><td>2445.4</td><td>1921.0</td><td>2121.0</td><td>metrics.request_latency.successful: percentiles.p50, percentiles.p99, max</td></tr>
+<tr><td>2</td><td>G</td><td>AIPerf constant</td><td>1</td><td>249</td><td>0</td><td>95.4</td><td>2145.0</td><td>2358.0</td><td>1921.4</td><td>2121.4</td><td>request_latency: p50, p99, max</td></tr>
+<tr><td>2</td><td>A</td><td>tailbench open loop (rs-drive)</td><td>2</td><td>250</td><td>0</td><td>101.6</td><td>2106.9</td><td>2268.1</td><td>1927.1</td><td>2127.1</td><td>open_loop latency = t_done - t_intended</td></tr>
+<tr><td>2</td><td>B</td><td>tailbench closed loop (rs-drive)</td><td>2</td><td>250</td><td>0</td><td>100.6</td><td>169.9</td><td>2213.8</td><td>97.8</td><td>2181.8</td><td>closed_loop latency = t_done - t_sent</td></tr>
+<tr><td>2</td><td>C</td><td>oha -c 1</td><td>2</td><td>218</td><td>0 conn, 1 deadline</td><td>97.5</td><td>173.3</td><td>2093.1</td><td>93.8</td><td>2176.8</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>2</td><td>D</td><td>oha -c 1 --latency-correction</td><td>2</td><td>208</td><td>0 conn, 1 deadline</td><td>2007.1</td><td>2794.0</td><td>4129.8</td><td>2147.0</td><td>2171.5</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>2</td><td>C2</td><td>oha -c 50</td><td>2</td><td>249</td><td>0 conn, 3 deadline</td><td>100.0</td><td>2100.9</td><td>2265.8</td><td>1922.7</td><td>2122.7</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>2</td><td>D2</td><td>oha -c 50 --latency-correction</td><td>2</td><td>229</td><td>20 conn, 3 deadline</td><td>100.8</td><td>159.2</td><td>2095.5</td><td>1922.8</td><td>2122.8</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>2</td><td>E</td><td>vllm bench serve</td><td>2</td><td>250</td><td>0</td><td>102.3</td><td>2077.4</td><td>2242.8</td><td>1934.8</td><td>2134.8</td><td>E2EL: p50_e2el_ms, p99_e2el_ms, p100_e2el_ms</td></tr>
+<tr><td>2</td><td>F</td><td>GuideLLM constant</td><td>2</td><td>251</td><td>0</td><td>96.5</td><td>2271.8</td><td>3108.7</td><td>1921.3</td><td>2121.3</td><td>metrics.request_latency.successful: percentiles.p50, percentiles.p99, max</td></tr>
+<tr><td>2</td><td>G</td><td>AIPerf constant</td><td>2</td><td>249</td><td>0</td><td>94.8</td><td>2127.6</td><td>2346.2</td><td>1929.2</td><td>2129.2</td><td>request_latency: p50, p99, max</td></tr>
+<tr><td>1</td><td>A</td><td>tailbench open loop (rs-drive)</td><td>1</td><td>250</td><td>0</td><td>81.2</td><td>2085.3</td><td>2229.7</td><td>1919.1</td><td>2119.1</td><td>open_loop latency = t_done - t_intended</td></tr>
+<tr><td>1</td><td>B</td><td>tailbench closed loop (rs-drive)</td><td>1</td><td>250</td><td>0</td><td>80.2</td><td>108.9</td><td>2149.7</td><td>86.2</td><td>2168.5</td><td>closed_loop latency = t_done - t_sent</td></tr>
+<tr><td>1</td><td>C</td><td>oha -c 1</td><td>1</td><td>250</td><td>0 conn, 1 deadline</td><td>81.6</td><td>130.3</td><td>2087.6</td><td>86.2</td><td>2169.6</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>1</td><td>D</td><td>oha -c 1 --latency-correction</td><td>1</td><td>250</td><td>0 conn, 0 deadline</td><td>285.9</td><td>2210.7</td><td>2225.5</td><td>2140.8</td><td>2168.4</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>1</td><td>C2</td><td>oha -c 50</td><td>1</td><td>230</td><td>20 conn, 2 deadline</td><td>86.1</td><td>107.5</td><td>187.3</td><td>1921.0</td><td>2121.0</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>1</td><td>D2</td><td>oha -c 50 --latency-correction</td><td>1</td><td>230</td><td>20 conn, 1 deadline</td><td>88.4</td><td>101.5</td><td>167.8</td><td>1918.8</td><td>2118.8</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>1</td><td>E</td><td>vllm bench serve</td><td>1</td><td>250</td><td>0</td><td>97.5</td><td>2075.5</td><td>2283.6</td><td>1919.4</td><td>2119.4</td><td>E2EL: p50_e2el_ms, p99_e2el_ms, p100_e2el_ms</td></tr>
+<tr><td>1</td><td>F</td><td>GuideLLM constant</td><td>1</td><td>251</td><td>0</td><td>94.1</td><td>2194.5</td><td>2382.3</td><td>1920.0</td><td>2120.0</td><td>metrics.request_latency.successful: percentiles.p50, percentiles.p99, max</td></tr>
+<tr><td>1</td><td>G</td><td>AIPerf constant</td><td>1</td><td>249</td><td>0</td><td>96.1</td><td>2075.0</td><td>2222.7</td><td>1919.2</td><td>2119.2</td><td>request_latency: p50, p99, max</td></tr>
+<tr><td>1</td><td>A</td><td>tailbench open loop (rs-drive)</td><td>2</td><td>250</td><td>1</td><td>96.3</td><td>1955.7</td><td>2245.7</td><td>1920.4</td><td>2120.4</td><td>open_loop latency = t_done - t_intended</td></tr>
+<tr><td>1</td><td>B</td><td>tailbench closed loop (rs-drive)</td><td>2</td><td>250</td><td>0</td><td>95.8</td><td>134.8</td><td>2130.6</td><td>86.2</td><td>2169.4</td><td>closed_loop latency = t_done - t_sent</td></tr>
+<tr><td>1</td><td>C</td><td>oha -c 1</td><td>2</td><td>230</td><td>0 conn, 1 deadline</td><td>98.7</td><td>122.1</td><td>2156.0</td><td>86.2</td><td>2168.5</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>1</td><td>D</td><td>oha -c 1 --latency-correction</td><td>2</td><td>230</td><td>0 conn, 1 deadline</td><td>2009.4</td><td>2330.7</td><td>2334.9</td><td>2141.0</td><td>2168.7</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>1</td><td>C2</td><td>oha -c 50</td><td>2</td><td>230</td><td>19 conn, 5 deadline</td><td>105.9</td><td>180.6</td><td>2168.6</td><td>1919.8</td><td>2119.8</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>1</td><td>D2</td><td>oha -c 50 --latency-correction</td><td>2</td><td>230</td><td>19 conn, 3 deadline</td><td>105.0</td><td>173.8</td><td>2107.1</td><td>1919.0</td><td>2119.0</td><td>latencyPercentiles p50/p99, summary.slowest</td></tr>
+<tr><td>1</td><td>E</td><td>vllm bench serve</td><td>2</td><td>250</td><td>0</td><td>105.7</td><td>2104.4</td><td>2267.3</td><td>1918.9</td><td>2118.9</td><td>E2EL: p50_e2el_ms, p99_e2el_ms, p100_e2el_ms</td></tr>
+<tr><td>1</td><td>F</td><td>GuideLLM constant</td><td>2</td><td>250</td><td>0</td><td>96.6</td><td>2194.6</td><td>2294.5</td><td>1919.0</td><td>2119.0</td><td>metrics.request_latency.successful: percentiles.p50, percentiles.p99, max</td></tr>
+<tr><td>1</td><td>G</td><td>AIPerf constant</td><td>2</td><td>249</td><td>0</td><td>107.3</td><td>2157.5</td><td>2363.7</td><td>1919.3</td><td>2119.3</td><td>request_latency: p50, p99, max</td></tr>
+</tbody></table></div>
+</body></html>

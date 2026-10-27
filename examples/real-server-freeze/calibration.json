@@ -1,0 +1,8 @@
+{
+  "s0_ms": 91.36,
+  "s0_source": "STEP 0, five sequential baseline requests: 91.1, 91.1, 91.7, 92.3, 90.6 ms (mean)",
+  "freeze_s": 2.001,
+  "r_ms": 82.3,
+  "r_source": "STEP 0, three freezes of 2.001 s (STOP to CONT): the request sent just after STOP took 2174, 2181 and 2169 ms (mean 2174.7). r = 2174.7 - 2001 - s0 = 82.3 ms",
+  "step0_in_flight_ms": [2174, 2181, 2169]
+}
