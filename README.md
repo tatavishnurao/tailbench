@@ -3,9 +3,36 @@
 [![CI](https://github.com/tatavishnurao/tailbench/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tatavishnurao/tailbench/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+**A Rust latency harness that audits its own numbers, and other load tools' numbers, against a server that logs the truth.**
+
+When a server freezes, most benchmark loops freeze with it and report a clean p99. Against a fake server frozen for 500 ms, a naive client reported **p99 = 4.58 ms**; users actually waited **459 ms**. tailbench's open loop reported **438 ms** ([`phantom demo`](phantom/README.md#see-it)).
+
+<!-- Demo: drop the openscreen recording here (GIF or MP4, 20–30 s). -->
+
+- **Open loop, timed from the intended send**, so coordinated omission cannot hide a stall.
+- **phantom**, a fake OpenAI-compatible server that logs per-request and per-token ground truth, used to audit [oha, GuideLLM and vLLM bench serve](#findings).
+- **Verdicts that can refuse.** `compare` says *slower*, *faster*, *inconclusive* or *refused*, with [calibrated](docs/calibration.md) false-verdict rates.
+- **A provenance manifest written before the first request**: git SHA, dirty state, kernel, CPU, build profile.
+- **Checked on a real GPU**: a 2 s `SIGSTOP` on vLLM serving Qwen2.5-0.5B on an RTX 4060 ([real-server freeze](examples/real-server-freeze/README.md)).
+
 status: 0.1.0, the first release; the API may change before 1.0.
 
-A latency harness that audits its own numbers, and other tools' numbers against a server that logs the truth.
+## See it in 12 seconds
+
+```sh
+cargo install --locked tailbench-phantom
+phantom demo
+```
+
+```text
+100 req/s for 6 s against 1 ms service, server frozen 2.0–2.5 s:
+
+  p99                      your tool reports  users waited
+  1/2 naive client                   4.58 ms        459 ms  ✗ under by 100×
+  2/2 tailbench open loop             438 ms        437 ms  ✓ matches the truth
+```
+
+To audit your own load tool, run `phantom --live` and point the tool at it ([how](phantom/README.md#see-it)).
 
 ## Install
 
